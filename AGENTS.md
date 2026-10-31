@@ -15,6 +15,7 @@
 * Components (`src/` folders) depend one way: main → cli → web, smb → policy → store → shared; `web/` and `policy/` never import `smb/`.
 * Untrusted input and secrets are mapped in [SECURITY.md](SECURITY.md); every new parser of untrusted input gets a fuzz target (`src/shared/fuzz.zig`) and a row there.
 * CI: `.github/workflows/ci.yml` (Fedora, Alpine, macOS; type checks; fuzzing).
+* Specifications used are copied to `docs/references/` and indexed in [REFERENCES.md](REFERENCES.md); add new ones there.
 * Only external library: system libsqlite3, through hand-written `extern` declarations.
 
 ## Decisions

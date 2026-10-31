@@ -32,6 +32,7 @@ First version.
 - CLI output redirected to a file no longer overwrites itself (stdout is written as a stream).
 
 ### Added
+- [REFERENCES.md](REFERENCES.md) indexes the specifications behind zsmbd (Microsoft Open Specifications, RFCs, and NIST papers), with copies in `docs/references/`.
 - `zsmbd --version`; the server logs its version at startup.
 - [SECURITY.md](SECURITY.md): trust boundaries, their guards and tests, secrets, a review checklist, and known gaps.
 - Fuzz targets for SMB file commands, NTLM, SPNEGO, DCE/RPC, UTF-16, path normalization, wildcards, the text configuration and users files, and the web cookie and query parsers, on a shared harness that also runs under `zig build test --fuzz`.
