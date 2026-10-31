@@ -485,11 +485,13 @@ loop (`serve`, `handleFrame`, `processChain`) handles framing, compound
 chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, and dispatch to
 `files.zig`; NEGOTIATE and TREE_CONNECT are in `handshake.zig`. Anything
 before NEGOTIATE, a second NEGOTIATE, or a NEGOTIATE inside a compound
-closes the connection. SESSION_SETUP, signature verification, and
-decryption are still to be written; until then they fail closed:
-SESSION_SETUP gets `STATUS_NOT_SUPPORTED`, transform frames close the
-connection, and requests on signing or encrypting sessions get
-`STATUS_ACCESS_DENIED`. Threading rules for the handler are in section 9.
+closes the connection. Requests on signing sessions, and requests flagged
+signed, must carry a valid AES-CMAC signature (`signatureValid`, constant-time
+compare; sessions without a key never verify), or they get
+`STATUS_ACCESS_DENIED`. SESSION_SETUP and decryption are still to be written;
+until then they fail closed: SESSION_SETUP gets `STATUS_NOT_SUPPORTED`,
+transform frames close the connection, and requests on encrypting sessions
+get `STATUS_ACCESS_DENIED`. Threading rules for the handler are in section 9.
 
 Request processing per frame:
 
@@ -974,7 +976,7 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 | Admin JSON API | Written; exercised with curl. |
 | `nthash_wasm` | Written; unit-tested natively, and checked in a browser against server-side hashing. |
 | `smb/server.zig` | Written; compiled and exercised through the `files.zig` tests. |
-| `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch), unit-tested and fuzzed; SESSION_SETUP, signature verification, and decryption are missing and fail closed. |
+| `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch) and signature verification, unit-tested and fuzzed; SESSION_SETUP and decryption are missing and fail closed. |
 | `smb/handshake.zig` | NEGOTIATE, the SMB1 upgrade, and TREE_CONNECT, unit-tested and fuzzed; not yet tried with real clients. |
 | `smb/files.zig` | Written and unit-tested; not yet driven by real clients. |
 | `web.Live` over `server.Server` | Not started. |
@@ -982,8 +984,7 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 
 Planned order of work:
 
-1. Finish the handshake (section 7.4): SESSION_SETUP, signature
-   verification, and decryption.
+1. Finish the handshake (section 7.4): SESSION_SETUP and decryption.
 2. Start the SMB listener from `serve` and connect `web.Live`.
 3. Finish the browser UI.
 4. Run interoperability tests against Windows, macOS, and Linux clients.

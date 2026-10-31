@@ -122,8 +122,8 @@ pub const Notify = struct {
 /// The connection core that `state.zig` and `files.zig` rely on: identity,
 /// reference counting, the open-handle table, pending CHANGE_NOTIFYs, and the
 /// framed, signed or sealed write path. The request loop is `serve`;
-/// NEGOTIATE and TREE_CONNECT are in handshake.zig; SESSION_SETUP, signature
-/// checks, and decryption are still to be written (ARCHITECTURE.md 7.2).
+/// NEGOTIATE and TREE_CONNECT are in handshake.zig; SESSION_SETUP and
+/// decryption are still to be written (ARCHITECTURE.md 7.2).
 pub const Conn = struct {
     gpa: Allocator,
     srv: *Server,
@@ -547,12 +547,13 @@ fn responseHeader(out: *Buf, req: []const u8, credits: u16) !void {
     try out.zeros(16); // Signature
 }
 
-/// Signature verification is not written yet, so it fails closed: requests
-/// on signing sessions, and requests flagged signed, are refused.
+/// Whether `msg` (one message of a chain, through its padding) carries the
+/// session's AES-CMAC signature (MS-SMB2 3.1.5.1). Sessions without a key
+/// (anonymous, or still in SESSION_SETUP) never verify.
 fn signatureValid(s: *const Session, msg: []const u8) bool {
-    _ = s;
-    _ = msg;
-    return false;
+    if (!s.hasKey()) return false;
+    const sig = crypto.cmacSigZeroed(&s.signing_key, msg);
+    return std.crypto.timing_safe.eql([16]u8, sig, msg[48..64].*);
 }
 
 fn handle(c: *Conn, cmd: Command, msg: []const u8, chain: *Chain, out: *Buf) !Result {
@@ -857,7 +858,7 @@ test "echo chain: credits, linking, and padding" {
     try testing.expectError(error.BadMessageId, processChain(t.conn, f[0..68], &out));
 }
 
-test "sessions, trees, logoff, and the fail-closed signature check" {
+test "sessions, trees, logoff, and the signature check" {
     var t: TestConn = undefined;
     try t.init();
     defer t.deinit();
@@ -871,25 +872,60 @@ test "sessions, trees, logoff, and the fail-closed signature check" {
     _ = try processChain(t.conn, &m, &out);
     try testing.expectEqual(Status.user_session_deleted, statusAt(&out, 0));
 
-    // A signing session is refused until verification exists.
+    // A signing session refuses unsigned and wrongly signed requests.
     const s = try t.addSession(true);
+    s.signing_key = @splat(0x5A);
     out.clear();
     testHeader(&m, .tree_disconnect, 1, 0, 0);
     wire.put64(&m, 40, 7);
-    wire.put32(&m, 36, 3);
+    wire.put32(&m, 36, 9);
     _ = try processChain(t.conn, &m, &out);
     try testing.expectEqual(Status.access_denied, statusAt(&out, 0));
+    out.clear();
+    testHeader(&m, .tree_disconnect, 2, 0, 0);
+    wire.put64(&m, 40, 7);
+    wire.put32(&m, 36, 9);
+    signMessage(&m, @splat(0x5B));
+    _ = try processChain(t.conn, &m, &out);
+    try testing.expectEqual(Status.access_denied, statusAt(&out, 0));
+    // Correctly signed, it reaches the handler (tree 9 does not exist).
+    out.clear();
+    testHeader(&m, .tree_disconnect, 3, 0, 0);
+    wire.put64(&m, 40, 7);
+    wire.put32(&m, 36, 9);
+    signMessage(&m, s.signing_key);
+    _ = try processChain(t.conn, &m, &out);
+    try testing.expectEqual(Status.network_name_deleted, statusAt(&out, 0));
+    // A tampered byte breaks the signature.
+    out.clear();
+    testHeader(&m, .tree_disconnect, 4, 0, 0);
+    wire.put64(&m, 40, 7);
+    wire.put32(&m, 36, 9);
+    signMessage(&m, s.signing_key);
+    m[hdr] ^= 1;
+    _ = try processChain(t.conn, &m, &out);
+    try testing.expectEqual(Status.access_denied, statusAt(&out, 0));
+    // An anonymous session has no key, so a signed request is refused.
+    s.anonymous = true;
+    out.clear();
+    testHeader(&m, .tree_disconnect, 5, 0, 0);
+    wire.put64(&m, 40, 7);
+    wire.put32(&m, 36, 9);
+    signMessage(&m, s.signing_key);
+    _ = try processChain(t.conn, &m, &out);
+    try testing.expectEqual(Status.access_denied, statusAt(&out, 0));
+    s.anonymous = false;
 
     s.sign = false;
     out.clear();
-    testHeader(&m, .tree_disconnect, 2, 0, 0);
+    testHeader(&m, .tree_disconnect, 6, 0, 0);
     wire.put64(&m, 40, 7);
     wire.put32(&m, 36, 9);
     _ = try processChain(t.conn, &m, &out);
     try testing.expectEqual(Status.network_name_deleted, statusAt(&out, 0));
 
     out.clear();
-    testHeader(&m, .tree_disconnect, 3, 0, 0);
+    testHeader(&m, .tree_disconnect, 7, 0, 0);
     wire.put64(&m, 40, 7);
     wire.put32(&m, 36, 3);
     _ = try processChain(t.conn, &m, &out);
@@ -897,7 +933,7 @@ test "sessions, trees, logoff, and the fail-closed signature check" {
     try testing.expectEqual(@as(u32, 0), s.trees.count());
 
     out.clear();
-    testHeader(&m, .logoff, 4, 0, 0);
+    testHeader(&m, .logoff, 8, 0, 0);
     wire.put64(&m, 40, 7);
     _ = try processChain(t.conn, &m, &out);
     try testing.expectEqual(Status.success, statusAt(&out, 0));
@@ -905,13 +941,13 @@ test "sessions, trees, logoff, and the fail-closed signature check" {
 
     // SESSION_SETUP answers NOT_SUPPORTED for now.
     out.clear();
-    testHeader(&m, .session_setup, 5, 0, 0);
+    testHeader(&m, .session_setup, 9, 0, 0);
     _ = try processChain(t.conn, &m, &out);
     try testing.expectEqual(Status.not_supported, statusAt(&out, 0));
 
     // A second NEGOTIATE ends the connection.
     out.clear();
-    testHeader(&m, .negotiate, 6, 0, 0);
+    testHeader(&m, .negotiate, 10, 0, 0);
     try testing.expectError(error.Renegotiate, processChain(t.conn, &m, &out));
 }
 

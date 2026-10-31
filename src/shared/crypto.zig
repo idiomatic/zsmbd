@@ -143,6 +143,18 @@ pub fn cmacSig(key: *const [16]u8, msg: []const u8) [16]u8 {
     return out;
 }
 
+/// AES-CMAC of `msg` with bytes 48..64 (the SMB2 header's Signature field)
+/// taken as zero, without copying the message. `msg` is at least 64 bytes.
+pub fn cmacSigZeroed(key: *const [16]u8, msg: []const u8) [16]u8 {
+    var m = CmacAes128.init(key);
+    m.update(msg[0..48]);
+    m.update(&@as([16]u8, @splat(0)));
+    m.update(msg[64..]);
+    var out: [16]u8 = undefined;
+    m.final(&out);
+    return out;
+}
+
 // ---------------------------------------------------------------- AES-128-CCM (16-byte tag)
 
 pub const ccm_nonce_len = 11;
@@ -266,6 +278,17 @@ test "md4 vectors" {
     try std.testing.expectEqualSlices(u8, &hex("d79e1c308aa5bbcdeea8ed63df412da9"), &out);
     const nt = try ntHash(std.testing.allocator, "Password");
     try std.testing.expectEqualSlices(u8, &hex("a4f49c406510bdcab6824ee7c30fd852"), &nt);
+}
+
+test "cmac: RFC 4493 vector, and the zeroed-signature variant" {
+    const key = hex("2b7e151628aed2a6abf7158809cf4f3c");
+    const msg = hex("6bc1bee22e409f96e93d7e117393172a");
+    try std.testing.expectEqualSlices(u8, &hex("070a16b46b4d4144f79bdd9dd04a287c"), &cmacSig(&key, &msg));
+    var m: [100]u8 = undefined;
+    for (&m, 0..) |*b, i| b.* = @intCast(i);
+    const got = cmacSigZeroed(&key, &m);
+    @memset(m[48..64], 0);
+    try std.testing.expectEqualSlices(u8, &cmacSig(&key, &m), &got);
 }
 
 test "ccm roundtrip" {

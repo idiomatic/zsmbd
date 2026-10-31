@@ -19,7 +19,7 @@ issue.
 | 8 | Admin HTTP API | web pages in the admin's browser; local users | `X-Zsmbd: 1` on every POST, PUT, and DELETE; SameSite=Strict HttpOnly cookie; no CORS; 64 KiB body cap; 750 ms delay after a failed login | `fuzz: cookie and query parsing` (parsers only; the handlers have no automated tests yet) |
 | 9 | Text configuration and users files | local users who can write them | `textconf.parseConf`, `textusers.parseUsers`; a broken file keeps the last good contents and blocks writes | `fuzz: configuration parsing and editing`, `fuzz: users file parsing` |
 | 10 | Validation of admin input | admins, the CLI | `policy/auth.zig`: `validateUserName`, `validateShareName`, `validateSharePath`, `validateComment`, `normalizeSetting` | `validation` |
-| 11 | SMB frames and compound chains | anyone on the network | `conn.readFrame` (4 MiB + 64 KiB cap), `conn.nextInChain` (alignment and bounds), `Credits` (message-ID window), `conn.smb1OffersSmb2`; unverified signatures and plain frames on encrypting sessions fail closed | `conn.zig` unit tests, `fuzz: frames, compound chains, and credits` |
+| 11 | SMB frames and compound chains | anyone on the network | `conn.readFrame` (4 MiB + 64 KiB cap), `conn.nextInChain` (alignment and bounds), `Credits` (message-ID window), `conn.smb1OffersSmb2`; bad or missing AES-CMAC signatures (`conn.signatureValid`) and plain frames on encrypting sessions fail closed | `conn.zig` unit tests, `fuzz: frames, compound chains, and credits` |
 | 12 | NEGOTIATE and TREE_CONNECT | anyone on the network (NEGOTIATE); SMB sessions (TREE_CONNECT) | `handshake.negotiate` (bounds-checked contexts, SHA-512 required, one of each context), `handshake.treeConnect` and `shareName` (path syntax, share lookup, `realpath`, anonymous rules, 256 trees per session) | `handshake.zig` unit tests, `fuzz: NEGOTIATE and TREE_CONNECT` |
 
 ## Secrets
@@ -69,9 +69,9 @@ Fuzzing found, and these were fixed:
 - **No `Host` header check.** A DNS-rebinding page can reach the admin API as
   same-origin. It has no session cookie for its host name, but it can try
   passwords at the login delay.
-- **SESSION_SETUP is not written** (`smb/conn.zig`): it, signature
-  verification, and decryption are missing and fail closed, and the signing
-  and encryption code lacks known-answer tests.
+- **SESSION_SETUP is not written** (`smb/conn.zig`): it and decryption are
+  missing and fail closed, and only AES-CMAC has a known-answer test; the
+  SMB2 signing and encryption paths lack them.
 - **Host-side races.** A local process could swap a directory for a symlink
   between resolution and open; byte-range locks are advisory among SMB
   clients only.
