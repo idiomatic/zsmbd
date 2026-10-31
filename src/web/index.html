@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zsmbd admin</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #5d6677;
+    --line: #d8dce3; --accent: #2457c5; --accent-text: #ffffff;
+    --ok: #1d7a46; --warn: #8a5a00; --err: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14171c; --panel: #1d2128; --text: #e6e9ee; --muted: #9aa3b2;
+      --line: #333a45; --accent: #7aa2ff; --accent-text: #0d1220;
+      --ok: #5fcf8f; --warn: #e6b450; --err: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; justify-content: space-between;
+           padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { margin: 0; font-size: 17px; }
+  main { max-width: 520px; margin: 24px auto; padding: 0 16px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+            padding: 16px 20px 20px; margin-bottom: 16px; }
+  h2 { margin: 0 0 4px; font-size: 16px; }
+  p.note { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+  label { display: block; margin: 12px 0 4px; font-size: 13px; color: var(--muted); }
+  input { width: 100%; padding: 8px 10px; font: inherit; color: var(--text);
+          background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+  button { margin-top: 16px; padding: 8px 16px; font: inherit; cursor: pointer;
+           border: 1px solid var(--accent); border-radius: 6px;
+           background: var(--accent); color: var(--accent-text); }
+  button.plain { margin: 0; background: transparent; color: var(--accent); }
+  .msg { margin-top: 12px; font-size: 14px; white-space: pre-wrap; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
+  .meter { margin-top: 6px; font-size: 13px; color: var(--muted); }
+  .bar { height: 6px; margin-bottom: 4px; border-radius: 3px; background: var(--line); overflow: hidden; }
+  .bar span { display: block; height: 100%; width: 0; background: var(--muted); transition: width .15s; }
+  .bar span.weak { background: var(--err); } .bar span.fair { background: var(--warn); } .bar span.strong { background: var(--ok); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>zsmbd admin</h1>
+  <span id="who" hidden><span id="who-name"></span> <button class="plain" id="logout">Sign out</button></span>
+</header>
+<main>
+  <section id="login-view">
+    <h2>Sign in</h2>
+    <p class="note">Admin and hybrid users sign in with their web password.</p>
+    <form id="login-form">
+      <label for="login-user">User name</label>
+      <input id="login-user" autocomplete="username" required>
+      <label for="login-pw">Web password</label>
+      <input id="login-pw" type="password" autocomplete="current-password" required>
+      <button type="submit">Sign in</button>
+      <div class="msg" id="login-msg"></div>
+    </form>
+  </section>
+
+  <section id="smb-view" hidden>
+    <h2>Set SMB password</h2>
+    <p class="note" id="hash-mode">Checking browser support for local hashing…</p>
+    <form id="smb-form">
+      <label for="smb-user">User name</label>
+      <input id="smb-user" autocomplete="off" required>
+      <label for="smb-pw">New SMB password</label>
+      <input id="smb-pw" type="password" autocomplete="new-password" required aria-describedby="smb-strength">
+      <div class="meter"><div class="bar"><span id="smb-bar"></span></div><span id="smb-strength" aria-live="polite"></span></div>
+      <label for="smb-pw2">Repeat it</label>
+      <input id="smb-pw2" type="password" autocomplete="new-password" required>
+      <button type="submit">Set SMB password</button>
+      <div class="msg" id="smb-msg"></div>
+    </form>
+  </section>
+
+  <p class="note">The rest of the admin console is not built yet; the JSON API is served under /api/.</p>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+
+async function api(method, path, body) {
+  const r = await fetch(path, {
+    method,
+    headers: { "content-type": "application/json", "x-zsmbd": "1" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+function show(el, text, kind) {
+  el.textContent = text;
+  el.className = "msg " + (kind || "");
+}
+
+// NT hash (MD4 of the UTF-16LE password) from the server's own Zig code,
+// compiled to WebAssembly. Null when the browser can't run it, in which case
+// the server hashes the password instead.
+let hasher = null;
+
+function ntHashWith(e, password) {
+  const utf8 = new TextEncoder().encode(password);
+  const mem = new Uint8Array(e.memory.buffer);
+  const inPtr = e.input_ptr();
+  mem.set(utf8, inPtr);
+  utf8.fill(0);
+  if (e.nt_hash(utf8.length) !== 0) return null;
+  const out = new Uint8Array(e.memory.buffer, e.output_ptr(), 16);
+  const hex = Array.from(out, (b) => b.toString(16).padStart(2, "0")).join("");
+  out.fill(0);
+  return hex;
+}
+
+// Strength from the server's own estimator (src/strength.zig) in the same
+// WebAssembly module: bits in the low 16 bits, level (0-2) above them.
+const levels = ["weak", "fair", "strong"];
+function strengthWith(e, password) {
+  const utf8 = new TextEncoder().encode(password);
+  if (utf8.length > 1024) return null;
+  new Uint8Array(e.memory.buffer).set(utf8, e.input_ptr());
+  utf8.fill(0);
+  const r = e.strength(utf8.length);
+  return { bits: r & 0xffff, level: levels[r >>> 16] };
+}
+
+function updateMeter() {
+  const pw = $("smb-pw").value;
+  const bar = $("smb-bar"), label = $("smb-strength");
+  const est = hasher && pw ? strengthWith(hasher, pw) : null;
+  if (!pw) { bar.style.width = "0"; bar.className = ""; label.textContent = ""; return; }
+  if (!est) { bar.style.width = "0"; label.textContent = "Strength: not available in this browser"; return; }
+  bar.className = est.level;
+  bar.style.width = Math.min(100, Math.max(8, est.bits / 0.8)) + "%";
+  label.textContent = "Strength: " + est.level + " (about " + est.bits + " bits)" +
+    (est.level === "weak" ? ". A longer passphrase is much harder to guess." : "");
+}
+
+async function loadHasher() {
+  try {
+    const bytes = await (await fetch("/nthash.wasm")).arrayBuffer();
+    const { instance } = await WebAssembly.instantiate(bytes);
+    // Known-answer test: the NT hash of "password".
+    if (ntHashWith(instance.exports, "password") !== "8846f7eaee8fb117ad06bdd830b7586c") throw new Error("self-test failed");
+    hasher = instance.exports;
+    show($("hash-mode"), "The password is hashed in this browser; only its NT hash is sent.", "note ok");
+  } catch (e) {
+    hasher = null;
+    show($("hash-mode"), "This browser can't hash locally (" + e.message + "); the password will be sent to the server, which hashes it.", "note warn");
+  }
+}
+
+async function signedIn(user) {
+  $("who-name").textContent = user;
+  $("who").hidden = false;
+  $("login-view").hidden = true;
+  $("smb-view").hidden = false;
+  $("smb-user").value = user;
+  await loadHasher();
+}
+
+function signedOut() {
+  $("who").hidden = true;
+  $("login-view").hidden = false;
+  $("smb-view").hidden = true;
+}
+
+$("login-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  try {
+    const me = await api("POST", "/api/login", { user: $("login-user").value, password: $("login-pw").value });
+    $("login-pw").value = "";
+    show($("login-msg"), "");
+    await signedIn(me.user);
+  } catch (e) {
+    show($("login-msg"), e.message, "err");
+  }
+});
+
+$("logout").addEventListener("click", async () => {
+  await api("POST", "/api/logout").catch(() => {});
+  signedOut();
+});
+
+$("smb-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const msg = $("smb-msg");
+  const pw = $("smb-pw").value;
+  if (pw !== $("smb-pw2").value) return show(msg, "The passwords don't match.", "err");
+  const body = { name: $("smb-user").value };
+  const hash = hasher ? ntHashWith(hasher, pw) : null;
+  if (hash) body.nt_hash = hash; else body.password = pw;
+  try {
+    const r = await api("PUT", "/api/users", body);
+    $("smb-pw").value = $("smb-pw2").value = "";
+    updateMeter();
+    const how = hash ? "hashed in the browser" : "hashed by the server";
+    const warnings = r.warnings || [];
+    show(msg, "SMB password set (" + how + ")." + warnings.map((w) => "\nWarning: " + w).join(""), warnings.length ? "warn" : "ok");
+  } catch (e) {
+    show(msg, e.message, "err");
+  }
+});
+
+$("smb-pw").addEventListener("input", updateMeter);
+
+api("GET", "/api/me").then((me) => signedIn(me.user), signedOut);
+</script>
+</body>
+</html>

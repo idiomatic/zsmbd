@@ -1,0 +1,87 @@
+# Builds and tests zsmbd on its supported hosts: Fedora and Alpine Linux
+# (x86_64 and aarch64) and macOS, plus Linux type checks and a short
+# coverage-guided fuzz run. See SECURITY.md.
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1" # weekly, for a longer fuzz run
+
+env:
+  ZIG_VERSION: 0.17.0
+
+jobs:
+  fedora:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    container: fedora:latest
+    steps:
+      - run: dnf install -y --setopt=install_weak_deps=False sqlite-devel tar xz git
+      - uses: actions/checkout@v4
+      - name: Install Zig
+        run: |
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /opt
+          echo "/opt/zig-$(uname -m)-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+      - run: zig build test --summary all
+      - run: zig build
+
+  alpine:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      # JavaScript actions can't run in Alpine containers, so run it directly.
+      - name: Build and test on Alpine
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e ZIG_VERSION alpine:latest sh -euc '
+            apk add --no-cache sqlite-dev curl tar xz
+            curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /opt
+            export PATH="/opt/zig-$(uname -m)-linux-$ZIG_VERSION:$PATH"
+            zig build test --summary all
+            zig build'
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig
+        run: |
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-aarch64-macos-$ZIG_VERSION.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-aarch64-macos-$ZIG_VERSION" >> "$GITHUB_PATH"
+      - run: zig build test --summary all
+      - run: zig build
+      - name: Linux type checks
+        run: |
+          zig build check -Dtarget=x86_64-linux-gnu
+          zig build check -Dtarget=aarch64-linux-gnu
+          zig build check -Dtarget=x86_64-macos
+
+  fuzz:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - run: dnf install -y --setopt=install_weak_deps=False sqlite-devel tar xz git
+      - uses: actions/checkout@v4
+      - name: Install Zig
+        run: |
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /opt
+          echo "/opt/zig-$(uname -m)-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+      # The fuzzer needs .zig-cache/tmp, which the plain test run creates.
+      - run: zig build test
+      - name: Coverage-guided fuzzing
+        run: zig build test --fuzz=${{ github.event_name == 'schedule' && '20M' || '500K' }}
+      - name: Keep crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: .zig-cache/f/
+          if-no-files-found: ignore

@@ -1,0 +1,64 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const sqlite_prefix = b.option([]const u8, "sqlite-prefix", "Installation prefix of libsqlite3 (contains lib/)");
+
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    if (sqlite_prefix) |p| mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ p, "lib" }) });
+    mod.linkSystemLibrary("sqlite3", .{});
+
+    // NT hash compiled to WebAssembly for the admin web page, embedded in the
+    // binary as the "nthash_wasm" module (`bytes`).
+    const wasm = b.addExecutable(.{
+        .name = "nthash",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/nthash_wasm.zig"),
+            .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
+            .optimize = .ReleaseSmall,
+        }),
+    });
+    wasm.entry = .disabled;
+    wasm.rdynamic = true;
+    const wasm_files = b.addWriteFiles();
+    _ = wasm_files.addCopyFile(wasm.getEmittedBin(), "nthash.wasm");
+    const wasm_mod = b.createModule(.{
+        .root_source_file = wasm_files.add("nthash_embed.zig", "pub const bytes = @embedFile(\"nthash.wasm\");\n"),
+    });
+    mod.addImport("nthash_wasm", wasm_mod);
+
+    const exe = b.addExecutable(.{ .name = "zsmbd", .root_module = mod });
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.addPassthruArgs();
+    const run_step = b.step("run", "Run zsmbd");
+    run_step.dependOn(&run_cmd.step);
+
+    const tests = b.addTest(.{ .root_module = mod });
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // Compile-only check for other targets (no linking, so no sqlite needed):
+    //   zig build check -Dtarget=x86_64-linux-gnu
+    const check_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    check_mod.addImport("nthash_wasm", wasm_mod);
+    const check_obj = b.addExecutable(.{ .name = "zsmbd-check", .root_module = check_mod });
+    const check_step = b.step("check", "Type-check without linking");
+    check_step.dependOn(&check_obj.step);
+    // The tests reach modules that main does not use yet (files.zig).
+    const check_tests = b.addTest(.{ .root_module = check_mod });
+    check_step.dependOn(&check_tests.step);
+}
