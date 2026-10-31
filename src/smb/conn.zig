@@ -431,7 +431,10 @@ pub fn serve(c: *Conn) void {
     var out = Buf.init(c.gpa);
     defer out.deinit();
     while (true) {
-        const frame = readFrame(&r.interface, c.gpa) catch return;
+        const frame = readFrame(&r.interface, c.gpa) catch |e| {
+            if (e != error.EndOfStream) c.srv.log(c.id, "smb", "dropped while reading: {s}", .{@errorName(e)});
+            return;
+        };
         defer c.gpa.free(frame);
         _ = c.srv.stats.bytes_in.fetchAdd(frame.len + 4, .monotonic);
         out.clear();
@@ -441,7 +444,10 @@ pub fn serve(c: *Conn) void {
         };
         if (out.len() > 0) {
             const sid = if (reply.seal) |x| x.session_id else 0;
-            c.writeFrame(out.items(), sid, if (reply.seal) |x| x.key else null) catch return;
+            c.writeFrame(out.items(), sid, if (reply.seal) |x| x.key else null) catch |e| {
+                c.srv.log(c.id, "smb", "dropped while writing: {s}", .{@errorName(e)});
+                return;
+            };
         }
         if (!reply.keep) return;
     }
@@ -550,7 +556,7 @@ fn walkChain(c: *Conn, frame: []const u8, out: *Buf, enc_sid: ?u64) !bool {
             if (msg.len != frame.len) return error.Malformed;
         } else if (!negotiated) return error.NotNegotiated;
         if (!c.credits.consume(wire.get64(msg, 24), wire.get16(msg, 6))) return error.BadMessageId;
-        const granted = c.credits.grant(wire.get16(msg, 18));
+        const granted = c.credits.grant(wire.get16(msg, 14)); // CreditRequest
 
         one.clear();
         try responseHeader(&one, msg, granted);
@@ -574,7 +580,10 @@ fn walkChain(c: *Conn, frame: []const u8, out: *Buf, enc_sid: ?u64) !bool {
         if (res.preauth) |s| handshake.hashInto(&s.preauth, one.items());
         chain.status = res.status;
         chain.first = false;
-        if (res.disconnect) keep = false;
+        if (res.disconnect) {
+            keep = false;
+            c.srv.log(c.id, "smb", "closing after {s}: {s}", .{ std.enums.tagName(Command, cmd) orelse "unknown", Status.name(res.status) });
+        }
 
         try out.alignTo(8);
         // A sealed chain is authenticated by the cipher, not signed.
@@ -799,7 +808,7 @@ pub fn testHeader(b: []u8, cmd: Command, msg_id: u64, next: u32, flags: u32) voi
     @memcpy(b[0..4], &proto.protocol_id);
     wire.put16(b, 4, hdr);
     wire.put16(b, 12, @intFromEnum(cmd));
-    wire.put16(b, 18, 1);
+    wire.put16(b, 14, 1); // CreditRequest
     wire.put32(b, 16, flags);
     wire.put32(b, 20, next);
     wire.put64(b, 24, msg_id);
@@ -904,7 +913,7 @@ test "echo chain: credits, linking, and padding" {
     defer t.deinit();
     var f: [72 + 68]u8 = @splat(0);
     testHeader(f[0..], .echo, 0, 72, 0);
-    wire.put16(&f, 18, 5); // request 5 credits
+    wire.put16(&f, 14, 5); // request 5 credits
     wire.put16(&f, hdr, 4);
     testHeader(f[72..], .echo, 1, 0, 0);
     wire.put16(&f, 72 + hdr, 4);
@@ -1036,7 +1045,7 @@ test "related requests inherit the session and stop after a failure" {
     wire.put64(&f, 40, 7);
     wire.put32(&f, 36, 9);
     testHeader(f[72..], .logoff, 2, 0, proto.Flags.related_operations);
-    wire.put16(&f, 18, 1);
+    wire.put16(&f, 14, 1);
     t.conn.credits.high = 3;
     out.clear();
     _ = try processChain(t.conn, &f, &out);

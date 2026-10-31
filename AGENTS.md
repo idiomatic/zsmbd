@@ -10,6 +10,7 @@
 
 ## Build
 * `zig build` makes `zsmbd`; `zig build test` runs the unit tests.
+* Local databases, logs, and test shares go in `var/` (git-ignored), e.g. `--db var/zsmbd.db`.
 * Version: semantic, in `build.zig.zon` only (code reads `build_options.version`); releases get a CHANGELOG.md section and a `vX.Y.Z` tag.
 * `zig build check -Dtarget=x86_64-linux-gnu` (and `aarch64-linux-gnu`) type-checks main and the tests for Linux.
 * Components (`src/` folders) depend one way: main → cli → web, smb → policy → store → shared; `web/` and `policy/` never import `smb/`.

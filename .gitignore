@@ -4,3 +4,4 @@ zig-out/
 *.db
 *~
 AGENTS?*.md
+var/

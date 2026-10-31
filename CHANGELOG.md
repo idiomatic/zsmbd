@@ -8,6 +8,8 @@ the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
 ### Added
 - SMB request loop (`conn.serve`): frame reading with the 4 MiB + 64 KiB limit, compound chains (related requests inherit the session, tree, and file ID, and fail after a failed predecessor), the credit window with per-payload charges, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL of pending CHANGE_NOTIFY requests, and dispatch to the file commands.
 - SESSION_SETUP (`handshake.sessionSetup`): SPNEGO or raw NTLMSSP with NTLMv2, the per-session preauth hash, 3.1.1 key derivation, mechListMIC checks, a signed final response, anonymous sessions, `signing_required` and `encrypt` policy, and at most 64 sessions per connection; binding and reauthentication are refused.
+- Fixed: credit requests were read from the wrong header offset, so every response granted one credit and macOS could not send compound requests (it gave up after TREE_CONNECT).
+- SMB connections log why they end: a read or write failure, or a request that closes the connection.
 - `serve` runs the SMB listener (`--smb ADDR:PORT`, default `0.0.0.0:445`), one thread per connection; it fails clearly when the port can't be bound.
 - Decryption (`conn.handleFrame`): transform frames are checked, decrypted with AES-128-GCM or AES-128-CCM, and answered sealed; any failure closes the connection, and every unrelated request inside must name the transform's session.
 - Signature verification (`conn.signatureValid`): requests on signing sessions, or flagged signed, need a valid AES-CMAC signature, compared in constant time; anonymous and unfinished sessions never verify.
