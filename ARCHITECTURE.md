@@ -26,7 +26,7 @@ Microsoft's SMB2/3 protocol specification.
 | Goal | Consequence for the design |
 |---|---|
 | Fewest configuration options | Every setting has a working default. No configuration file is needed. The command line takes only a store location (a database path, or a directory of plain-text files) and a web listen address. Four settings exist in total, edited from the web UI, the CLI, or the text file. |
-| SMB 3.0 as the baseline | Dialects 2.0.2, 2.1, 3.0, 3.0.2, and 3.1.1 are negotiated; 3.0 is the minimum that must work fully. SMB1 is never spoken. |
+| SMB 3.1.1 as the minimum | No older dialect is negotiated, so there is one signing algorithm, one key derivation, and preauthentication integrity on every connection. Windows 10 and later, macOS, and Linux all speak it; Windows 8.1 and older, and embedded clients limited to 2.x or 3.0, cannot connect. SMB1 is never spoken. |
 | Modern clients | Signing is required by default because Windows 11 24H2 refuses unsigned sessions with non-domain servers. NTLMv2 is the only accepted authentication. |
 | Linux and macOS hosts | File access goes through a thin POSIX layer (`vfs.zig`) with small per-OS branches (`statx` on Linux, `statfs` layout on Darwin). |
 | Pure Zig | No C sources and no `translate-c`. The one external library, the system `libsqlite3`, is bound with hand-written `extern` declarations. Cryptography missing from Zig's standard library (MD4, RC4, AES-CCM, the SP 800-108 KDF) is implemented in Zig. |
@@ -515,28 +515,31 @@ queued; clients retry.
 
 ### 7.3 NEGOTIATE
 
-The server picks the highest dialect both sides support, from 2.0.2 up to
-3.1.1. It advertises `large_mtu` and, for 3.x, `encryption`; it never
+The server picks the highest dialect, 3.1.1 or later, that both sides
+support (today only 3.1.1 exists); a NEGOTIATE that offers none gets
+`STATUS_NOT_SUPPORTED` and the connection closes. It advertises
+`large_mtu` and `encryption`; it never
 advertises leasing, multichannel, persistent handles, or DFS. The security
 buffer carries the SPNEGO `NegTokenInit` offering only NTLMSSP, with the
 conventional `not_defined_in_RFC4178@please_ignore` hint that Windows
 expects.
 
-For 3.1.1, the negotiate contexts are processed as follows:
+The negotiate contexts are processed as follows:
 
-- **Preauthentication integrity:** SHA-512 only. The connection's running
+- **Preauthentication integrity:** required, SHA-512 only; a request
+  without it gets `STATUS_INVALID_PARAMETER`. The connection's running
   hash covers the NEGOTIATE request and response; each session continues it
   through its SESSION_SETUP exchange. The final value is the KDF context for
   that session's keys, which binds the keys to the exact negotiation and
   defeats downgrade attacks.
 - **Encryption:** the server chooses AES-128-GCM if offered, otherwise
-  AES-128-CCM. The 256-bit ciphers are not offered.
+  AES-128-CCM. The 256-bit ciphers are not offered. With no cipher in
+  common, the session is unencrypted, and refused when `encrypt` is on.
 - **Signing:** AES-CMAC.
 - **Compression, RDMA, and transport** contexts are ignored.
 
-For 3.0 and 3.0.2, which lack preauthentication integrity, the server answers
-`FSCTL_VALIDATE_NEGOTIATE_INFO` on a signed IOCTL, so clients can detect a
-tampered NEGOTIATE. Windows disconnects servers that get this wrong.
+`FSCTL_VALIDATE_NEGOTIATE_INFO` drops the connection, as MS-SMB2
+3.3.5.15.12 requires for 3.1.1.
 
 ### 7.4 Authentication: SESSION_SETUP
 
@@ -572,14 +575,13 @@ client                                        server
 Key derivation (MS-SMB2 3.1.4.2), all with `crypto.kdf` (HMAC-SHA256 counter
 mode, 128-bit output):
 
-| Key | SMB 3.0 / 3.0.2 label, context | SMB 3.1.1 label, context |
+| Key | Label | Context |
 |---|---|---|
-| Signing | `SMB2AESCMAC`, `SmbSign` | `SMBSigningKey`, preauth hash |
-| Server → client encryption | `SMB2AESCCM`, `ServerOut` | `SMBS2CCipherKey`, preauth hash |
-| Client → server decryption | `SMB2AESCCM`, `ServerIn ` | `SMBC2SCipherKey`, preauth hash |
+| Signing | `SMBSigningKey` | preauth hash |
+| Server → client encryption | `SMBS2CCipherKey` | preauth hash |
+| Client → server decryption | `SMBC2SCipherKey` | preauth hash |
 
-SMB 2.x signs with HMAC-SHA256 using the session key directly; 3.x signs with
-AES-CMAC (`crypto.cmacSig`). Encryption uses AES-CCM (`crypto.ccmEncrypt`,
+Signing uses AES-CMAC (`crypto.cmacSig`). Encryption uses AES-CCM (`crypto.ccmEncrypt`,
 with SMB's 11-byte nonce, implemented in Zig because `std` only offers other
 nonce sizes) or `std`'s AES-128-GCM. Each encrypted message uses a fresh
 random nonce; the AEAD's associated data is the transform header from the
@@ -587,9 +589,8 @@ nonce onward.
 
 Policy from settings: `signing_required` sets the NEGOTIATE security mode and
 makes the server reject unsigned requests on authenticated sessions.
-`encrypt` sets `SMB2_SESSION_FLAG_ENCRYPT_DATA` on every 3.x session, so all
-traffic after SESSION_SETUP must be encrypted; 2.x clients are refused when
-it is on.
+`encrypt` sets `SMB2_SESSION_FLAG_ENCRYPT_DATA` on every session, so all
+traffic after SESSION_SETUP must be encrypted.
 
 ### 7.5 TREE_CONNECT
 
@@ -618,7 +619,7 @@ The contract with the handler:
 - `dispatch` appends the response body, or the standard error body, and
   returns a `Reply`: the status, the file ID that CREATE opened (for related
   requests), a `Notify` to queue when the status is `STATUS_PENDING`, and
-  whether to drop the connection (a failed VALIDATE_NEGOTIATE_INFO).
+  whether to drop the connection (any VALIDATE_NEGOTIATE_INFO).
 - A file ID of all ones means "the previous related request's file". A file
   ID that is unknown, or belongs to another session or tree, gets
   `STATUS_FILE_CLOSED`.
@@ -923,7 +924,7 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
   runs per push and 20M weekly, keeping crashing inputs as artifacts.
 - Interoperability testing, once the handler exists, uses the real clients:
   Windows 11 Explorer and `net use`; macOS Finder and `mount_smbfs`; Linux
-  `mount -t cifs` (with `vers=3.0` and `vers=3.1.1`) and `smbclient`.
+  `mount -t cifs` (with `vers=3.1.1`) and `smbclient`.
 
 ---
 

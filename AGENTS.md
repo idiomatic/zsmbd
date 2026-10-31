@@ -1,7 +1,7 @@
 # zsmbd
 
 ## Requirements
-* A network file server daemon implementing SMB 3.0, with the fewest configuration options.
+* A network file server daemon implementing SMB 3.1.1 or later, with the fewest configuration options.
 * Hosts: recent Linux and macOS. Clients: recent Linux, Windows, and macOS.
 * Embedded admin web server: settings, shares (names and directory paths), user credentials, and live activity.
 * All code in Zig 0.17.0 or later; this is non-negotiable.
@@ -19,7 +19,7 @@
 * Only external library: system libsqlite3, through hand-written `extern` declarations.
 
 ## Decisions
-* SMB 2.0.2 through 3.1.1; signing required by default.
+* SMB 3.1.1 or later (no older dialect); signing required by default.
 * Authentication: SPNEGO with NTLMv2 only; no Kerberos.
 * Not supported: oplocks and leases, multichannel, DFS, and named streams.
 * Shares are confined to their real path: `..` and stream names are rejected, symlinks are followed only inside the share, and lookups fall back to case-insensitive matching.

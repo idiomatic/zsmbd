@@ -19,7 +19,7 @@ The specifications that shaped zsmbd, with local copies in [docs/references](doc
 | [MS-SPNG]: SPNEGO Extension | [MS-SPNG.pdf](docs/references/MS-SPNG.pdf) | Windows SPNEGO behavior (`smb/auth/spnego.zig`) |
 | RFC 4178: SPNEGO | [rfc4178.txt](docs/references/rfc4178.txt) | NegTokenInit, NegTokenResp, and mechListMIC (`smb/auth/spnego.zig`) |
 | RFC 1320: MD4 | [rfc1320.txt](docs/references/rfc1320.txt) | MD4 for NT hashes (`shared/crypto.zig`) |
-| RFC 2104: HMAC | [rfc2104.txt](docs/references/rfc2104.txt) | HMAC-MD5 (NTLMv2) and HMAC-SHA256 (SMB 2.x signing, KDF) |
+| RFC 2104: HMAC | [rfc2104.txt](docs/references/rfc2104.txt) | HMAC-MD5 (NTLMv2) and HMAC-SHA256 (KDF) |
 
 ## Cryptography
 

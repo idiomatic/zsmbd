@@ -232,10 +232,7 @@ pub const Conn = struct {
             const f = wire.get32(msg, 16) | proto.Flags.signed;
             wire.put32(msg, 16, f);
             @memset(msg[48..64], 0);
-            const sig = if (c.neg.dialect >= proto.Dialect.smb300)
-                crypto.cmacSig(&signing_key, msg)
-            else
-                crypto.hmacSha256Sig(&signing_key, msg);
+            const sig = crypto.cmacSig(&signing_key, msg);
             @memcpy(msg[48..64], &sig);
         }
         const io = c.srv.io;

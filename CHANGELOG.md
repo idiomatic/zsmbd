@@ -14,6 +14,7 @@ First version.
 - Fixed: editing `zsmbd.conf` had no effect when a key appeared twice in a section or a setting also appeared in a `[global]` section.
 
 ### Changed
+- SMB 3.1.1 is the minimum dialect: 2.0.2, 2.1, 3.0, and 3.0.2 are no longer negotiated, preauthentication integrity is required, and HMAC-SHA256 signing, the 3.0 key labels, and the VALIDATE_NEGOTIATE_INFO check are gone. Windows 8.1 and Server 2012 R2 and older, old Samba clients, and embedded clients limited to 2.x or 3.0 can no longer connect.
 - Source tree regrouped into components: `store/` (the `Db` facade, record types, SQLite, and the text files; `db.zig` split three ways), `policy/` (`auth.zig`, `strength.zig`), `shared/` (`crypto.zig`, `wire.zig`), `smb/server.zig` (was `state.zig`), `smb/auth/` (NTLM and SPNEGO), and `cli.zig` (the commands, out of `main.zig`). `policy/` and `web/` no longer import anything from `smb/`.
 - The plain-text store is split into `textfile.zig` (shared file handling), `textconf.zig`, and `textusers.zig`.
 - Share paths and comments may not contain control characters.

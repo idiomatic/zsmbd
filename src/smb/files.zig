@@ -57,19 +57,12 @@ pub const FileId = struct {
     }
 };
 
-/// What NEGOTIATE settled, kept by the connection; VALIDATE_NEGOTIATE_INFO
-/// compares the client's claim against it.
+/// What NEGOTIATE settled, kept by the connection.
 pub const Negotiated = struct {
+    /// 0 until NEGOTIATE succeeds, then 3.1.1 or later.
     dialect: u16 = 0,
     cipher: u16 = proto.Cipher.aes128_ccm,
-    server_caps: u32 = 0,
-    server_security_mode: u16 = 0,
-    server_guid: [16]u8 = @splat(0),
-    client_caps: u32 = 0,
-    client_security_mode: u16 = 0,
     client_guid: [16]u8 = @splat(0),
-    client_dialects: [16]u16 = @splat(0),
-    client_dialect_count: u8 = 0,
 };
 
 /// A connection's open handles, keyed by volatile file ID. Only the
@@ -1351,7 +1344,8 @@ fn ioctl(ctx: *Ctx, msg: []const u8, b: []const u8, out: *Buf) !Reply {
     const base = out.len();
     var r: Reply = st(Status.success);
     switch (code) {
-        Fsctl.validate_negotiate_info => r = try validateNegotiate(ctx, input, max_out, out),
+        // MS-SMB2 3.3.5.15.12: on 3.1.1 the server drops the connection.
+        Fsctl.validate_negotiate_info => return .{ .status = Status.access_denied, .disconnect = true },
         Fsctl.pipe_transceive => {
             const o = lookup(ctx, b, 8) orelse return st(Status.file_closed);
             const pipe = o.pipe orelse return st(Status.invalid_device_request);
@@ -1380,27 +1374,6 @@ fn ioctl(ctx: *Ctx, msg: []const u8, b: []const u8, out: *Buf) !Reply {
     }
     out.set32(hdr + 36, @intCast(out.len() - base));
     return r;
-}
-
-fn validateNegotiate(ctx: *Ctx, input: []const u8, max_out: u32, out: *Buf) !Reply {
-    const neg = &ctx.conn.neg;
-    if (neg.dialect == proto.Dialect.smb311) return .{ .status = Status.access_denied, .disconnect = true };
-    if (input.len < 24 or max_out < 24) return st(Status.invalid_parameter);
-    const count = wire.get16(input, 22);
-    const dialects = try wire.slice(input, 24, @as(usize, count) * 2);
-    var ok = wire.get32(input, 0) == neg.client_caps and
-        std.mem.eql(u8, input[4..20], &neg.client_guid) and
-        wire.get16(input, 20) == neg.client_security_mode and
-        count == neg.client_dialect_count;
-    if (ok) for (neg.client_dialects[0..neg.client_dialect_count], 0..) |d, i| {
-        if (wire.get16(dialects, i * 2) != d) ok = false;
-    };
-    if (!ok) return .{ .status = Status.access_denied, .disconnect = true };
-    try out.u32_(neg.server_caps);
-    try out.bytes(&neg.server_guid);
-    try out.u16_(neg.server_security_mode);
-    try out.u16_(neg.dialect);
-    return st(Status.success);
 }
 
 fn copyChunk(ctx: *Ctx, dst: *Open, input: []const u8, need_read: bool, out: *Buf) !Reply {

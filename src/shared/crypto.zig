@@ -137,12 +137,6 @@ pub fn kdf(key: []const u8, label: []const u8, context: []const u8) [16]u8 {
     return out[0..16].*;
 }
 
-pub fn hmacSha256Sig(key: []const u8, msg: []const u8) [16]u8 {
-    var out: [32]u8 = undefined;
-    HmacSha256.create(&out, msg, key);
-    return out[0..16].*;
-}
-
 pub fn cmacSig(key: *const [16]u8, msg: []const u8) [16]u8 {
     var out: [16]u8 = undefined;
     CmacAes128.create(&out, msg, key);

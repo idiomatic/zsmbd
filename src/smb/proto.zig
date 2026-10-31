@@ -29,10 +29,6 @@ pub const Command = enum(u16) {
 };
 
 pub const Dialect = struct {
-    pub const smb202: u16 = 0x0202;
-    pub const smb210: u16 = 0x0210;
-    pub const smb300: u16 = 0x0300;
-    pub const smb302: u16 = 0x0302;
     pub const smb311: u16 = 0x0311;
     pub const wildcard: u16 = 0x02FF;
 };
