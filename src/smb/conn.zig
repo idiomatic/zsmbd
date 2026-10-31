@@ -122,8 +122,8 @@ pub const Notify = struct {
 /// The connection core that `state.zig` and `files.zig` rely on: identity,
 /// reference counting, the open-handle table, pending CHANGE_NOTIFYs, and the
 /// framed, signed or sealed write path. The request loop is `serve`;
-/// NEGOTIATE and TREE_CONNECT are in handshake.zig; SESSION_SETUP and
-/// decryption are still to be written (ARCHITECTURE.md 7.2).
+/// NEGOTIATE, SESSION_SETUP, and TREE_CONNECT are in handshake.zig;
+/// decryption is still to be written (ARCHITECTURE.md 7.2).
 pub const Conn = struct {
     gpa: Allocator,
     srv: *Server,
@@ -459,6 +459,10 @@ const Result = struct {
     status: u32,
     /// The session whose key signs the response.
     session: ?*Session = null,
+    /// Sign even though the session does not (the final SESSION_SETUP).
+    sign: bool = false,
+    /// The session whose preauth hash takes the finished response.
+    preauth: ?*Session = null,
     notify: ?Notify = null,
     disconnect: bool = false,
 };
@@ -510,12 +514,13 @@ pub fn processChain(c: *Conn, frame: []const u8, out: *Buf) !bool {
         if (res.status != Status.success and res.status != Status.pending and one.len() == hdr) try files.errorBody(&one);
         wire.put32(one.items(), 8, res.status);
         if (cmd == .negotiate and res.status == Status.success) handshake.hashResponse(c, one.items());
+        if (res.preauth) |s| handshake.hashInto(&s.preauth, one.items());
         chain.status = res.status;
         chain.first = false;
         if (res.disconnect) keep = false;
 
         try out.alignTo(8);
-        const key: ?[16]u8 = if (res.session) |s| (if (s.sign) s.signing_key else null) else null;
+        const key: ?[16]u8 = if (res.session) |s| (if (s.sign or res.sign) s.signing_key else null) else null;
         try spans.append(c.gpa, .{ .start = out.len(), .len = one.len(), .key = key });
         try out.bytes(one.items());
         if (!keep) break;
@@ -568,8 +573,10 @@ fn handle(c: *Conn, cmd: Command, msg: []const u8, chain: *Chain, out: *Buf) !Re
             try out.u16_(0);
             return .{ .status = Status.success };
         },
-        // SESSION_SETUP is not written yet.
-        .session_setup => return .{ .status = Status.not_supported },
+        .session_setup => {
+            const o = try handshake.sessionSetup(c, msg, chain.first and wire.get32(msg, 20) == 0, out);
+            return .{ .status = o.status, .session = o.session, .sign = o.sign, .preauth = if (o.hash) o.session else null };
+        },
         else => {},
     }
 
@@ -939,11 +946,11 @@ test "sessions, trees, logoff, and the signature check" {
     try testing.expectEqual(Status.success, statusAt(&out, 0));
     try testing.expectEqual(@as(u32, 0), t.conn.sessions.count());
 
-    // SESSION_SETUP answers NOT_SUPPORTED for now.
+    // A SESSION_SETUP too short for its body is refused.
     out.clear();
     testHeader(&m, .session_setup, 9, 0, 0);
     _ = try processChain(t.conn, &m, &out);
-    try testing.expectEqual(Status.not_supported, statusAt(&out, 0));
+    try testing.expectEqual(Status.invalid_parameter, statusAt(&out, 0));
 
     // A second NEGOTIATE ends the connection.
     out.clear();

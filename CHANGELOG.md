@@ -6,7 +6,8 @@ the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
 ## Unreleased
 
 ### Added
-- SMB request loop (`conn.serve`): frame reading with the 4 MiB + 64 KiB limit, compound chains (related requests inherit the session, tree, and file ID, and fail after a failed predecessor), the credit window with per-payload charges, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL of pending CHANGE_NOTIFY requests, and dispatch to the file commands. SESSION_SETUP and decryption are not written yet and fail closed.
+- SMB request loop (`conn.serve`): frame reading with the 4 MiB + 64 KiB limit, compound chains (related requests inherit the session, tree, and file ID, and fail after a failed predecessor), the credit window with per-payload charges, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL of pending CHANGE_NOTIFY requests, and dispatch to the file commands. Decryption is not written yet and fails closed.
+- SESSION_SETUP (`handshake.sessionSetup`): SPNEGO or raw NTLMSSP with NTLMv2, the per-session preauth hash, 3.1.1 key derivation, mechListMIC checks, a signed final response, anonymous sessions, `signing_required` and `encrypt` policy, and at most 64 sessions per connection; binding and reauthentication are refused.
 - Signature verification (`conn.signatureValid`): requests on signing sessions, or flagged signed, need a valid AES-CMAC signature, compared in constant time; anonymous and unfinished sessions never verify.
 - NEGOTIATE (`smb/handshake.zig`): 3.1.1 only, with the preauthentication hash (SHA-512 required), AES-128-GCM or AES-128-CCM by context, AES-CMAC signing, and the SMB1 upgrade through the wildcard dialect.
 - TREE_CONNECT: share lookup with `realpath`, synthesized `IPC$`, read-only maximal access, guest rules for anonymous sessions, and at most 256 trees per session.

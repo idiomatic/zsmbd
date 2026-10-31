@@ -164,6 +164,14 @@ fn field(msg: []const u8, off: usize) ![]const u8 {
 
 pub const LookupError = error{ NoSuchUser, OutOfMemory };
 
+/// The user name (UTF-8) of an AUTHENTICATE message, for logging; null when
+/// the message is malformed. The caller frees the result.
+pub fn userName(gpa: Allocator, msg: []const u8) ?[]u8 {
+    if (msg.len < 64 or !std.mem.eql(u8, msg[0..8], "NTLMSSP\x00") or wire.get32(msg, 8) != 3) return null;
+    const raw = field(msg, 36) catch return null;
+    return wire.utf16ToUtf8(gpa, raw) catch null;
+}
+
 /// `lookup` receives the user name (UTF-8) and returns the 16-byte NT hash.
 pub fn authenticate(
     s: *Server,

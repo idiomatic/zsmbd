@@ -483,15 +483,14 @@ write mutex). Each `Notify` copies its session's signing and encryption keys,
 so another thread can complete it without touching the session. The request
 loop (`serve`, `handleFrame`, `processChain`) handles framing, compound
 chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, and dispatch to
-`files.zig`; NEGOTIATE and TREE_CONNECT are in `handshake.zig`. Anything
+`files.zig`; NEGOTIATE, SESSION_SETUP, and TREE_CONNECT are in `handshake.zig`. Anything
 before NEGOTIATE, a second NEGOTIATE, or a NEGOTIATE inside a compound
 closes the connection. Requests on signing sessions, and requests flagged
 signed, must carry a valid AES-CMAC signature (`signatureValid`, constant-time
 compare; sessions without a key never verify), or they get
-`STATUS_ACCESS_DENIED`. SESSION_SETUP and decryption are still to be written;
-until then they fail closed: SESSION_SETUP gets `STATUS_NOT_SUPPORTED`,
-transform frames close the connection, and requests on encrypting sessions
-get `STATUS_ACCESS_DENIED`. Threading rules for the handler are in section 9.
+`STATUS_ACCESS_DENIED`. Decryption is still to be written; until then it
+fails closed: transform frames close the connection, and requests on
+encrypting sessions get `STATUS_ACCESS_DENIED`. Threading rules for the handler are in section 9.
 
 Request processing per frame:
 
@@ -595,9 +594,22 @@ client                                        server
   connect only to `IPC$` and to shares marked `guest_ok`, and it cannot sign,
   so it is refused when signing is required unless it touches only `IPC$`.
 - Admins have no SMB password and fail like unknown users.
-- Every failure increments `logon_failures` and is logged with the client
-  address and user name, but the response never says whether the user or the
-  password was wrong.
+- Every failure increments `logon_failures` and is logged with the
+  connection and user name, but the response never says whether the user or
+  the password was wrong. A failed exchange removes its session.
+- `handshake.sessionSetup` drives the exchange. A request with session ID 0
+  starts a session (at most 64 per connection, finished or not) whose preauth
+  hash starts from the connection's; each request, and each
+  `MORE_PROCESSING_REQUIRED` response, extends it, and keys are derived after
+  the final request. SESSION_SETUP must be alone in its frame (else
+  `STATUS_INVALID_PARAMETER`). An empty token gets the server's
+  `NegTokenInit`; an optimistic token for another mechanism gets a
+  `NegTokenResp` naming NTLMSSP. A client mechListMIC must verify, and the
+  reply then carries the server's. The final response is signed for
+  non-anonymous sessions.
+- Not supported: binding (`STATUS_REQUEST_NOT_ACCEPTED`), reauthentication
+  of a valid session (`STATUS_REQUEST_NOT_ACCEPTED`), and
+  `PreviousSessionId` (ignored).
 
 Key derivation (MS-SMB2 3.1.4.2), all with `crypto.kdf` (HMAC-SHA256 counter
 mode, 128-bit output):
@@ -615,7 +627,8 @@ random nonce; the AEAD's associated data is the transform header from the
 nonce onward.
 
 Policy from settings: `signing_required` sets the NEGOTIATE security mode and
-makes the server reject unsigned requests on authenticated sessions.
+makes the server reject unsigned requests on authenticated sessions; a client
+whose SESSION_SETUP security mode requires signing gets a signing session too.
 `encrypt` sets `SMB2_SESSION_FLAG_ENCRYPT_DATA` on every session, so all
 traffic after SESSION_SETUP must be encrypted.
 
@@ -976,15 +989,15 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 | Admin JSON API | Written; exercised with curl. |
 | `nthash_wasm` | Written; unit-tested natively, and checked in a browser against server-side hashing. |
 | `smb/server.zig` | Written; compiled and exercised through the `files.zig` tests. |
-| `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch) and signature verification, unit-tested and fuzzed; SESSION_SETUP and decryption are missing and fail closed. |
-| `smb/handshake.zig` | NEGOTIATE, the SMB1 upgrade, and TREE_CONNECT, unit-tested and fuzzed; not yet tried with real clients. |
+| `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch) and signature verification, unit-tested and fuzzed; decryption is missing and fails closed. |
+| `smb/handshake.zig` | NEGOTIATE, the SMB1 upgrade, SESSION_SETUP, and TREE_CONNECT, unit-tested (SESSION_SETUP against an in-test NTLMv2 client) and fuzzed; not yet tried with real clients. |
 | `smb/files.zig` | Written and unit-tested; not yet driven by real clients. |
 | `web.Live` over `server.Server` | Not started. |
 | `web/index.html` | Sign-in and SMB password form; the rest is still to come. |
 
 Planned order of work:
 
-1. Finish the handshake (section 7.4): SESSION_SETUP and decryption.
+1. Finish the handshake: decryption (section 7.2).
 2. Start the SMB listener from `serve` and connect `web.Live`.
 3. Finish the browser UI.
 4. Run interoperability tests against Windows, macOS, and Linux clients.

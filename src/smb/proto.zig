@@ -81,6 +81,11 @@ pub const SigningAlg = struct {
     pub const aes_gmac: u16 = 2;
 };
 
+/// SESSION_SETUP request Flags.
+pub const SetupFlags = struct {
+    pub const binding: u8 = 0x01;
+};
+
 pub const SessionFlags = struct {
     pub const is_guest: u16 = 0x0001;
     pub const is_null: u16 = 0x0002;
