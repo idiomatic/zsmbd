@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+All notable changes to zsmbd. Versions follow [Semantic Versioning](https://semver.org/);
+the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
+
+## 0.1.0 (2026-10-31)
+
+First version.
 
 ### Security
 - Fixed: an RPC request whose auth length exceeded its fragment crashed the server (integer overflow), and fragments without the last flag could grow memory without limit (now capped at 64 KiB).
@@ -27,6 +32,7 @@
 - CLI output redirected to a file no longer overwrites itself (stdout is written as a stream).
 
 ### Added
+- `zsmbd --version`; the server logs its version at startup.
 - [SECURITY.md](SECURITY.md): trust boundaries, their guards and tests, secrets, a review checklist, and known gaps.
 - Fuzz targets for SMB file commands, NTLM, SPNEGO, DCE/RPC, UTF-16, path normalization, wildcards, the text configuration and users files, and the web cookie and query parsers, on a shared harness that also runs under `zig build test --fuzz`.
 - CI workflow: Fedora and Alpine (x86_64, aarch64) and macOS builds and tests, Linux type checks, and fuzzing.

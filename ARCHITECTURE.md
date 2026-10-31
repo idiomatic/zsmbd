@@ -894,6 +894,8 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 ## 12. Build and test
 
 - `zig build` produces `zig-out/bin/zsmbd`; `zig build run -- …` runs it.
+  The version comes from `build.zig.zon` alone and reaches the code as
+  `@import("build_options").version` (`zsmbd --version`, the startup log).
   The build first compiles `src/nthash_wasm.zig` to WebAssembly and embeds
   it in the binary.
 - `zig build test` runs the unit tests: MD4 and AES-CCM test vectors (CCM is

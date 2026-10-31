@@ -11,6 +11,7 @@ const strength = @import("policy/strength.zig");
 
 pub const usage =
     \\usage: zsmbd [--db PATH] [--config FILE] [--users FILE] <command>
+    \\       zsmbd --version
     \\
     \\  serve [--web ADDR:PORT]          run the server (default web UI 127.0.0.1:8445)
     \\  user list

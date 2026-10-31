@@ -6,6 +6,7 @@ const Db = @import("store/store.zig").Db;
 const auth = @import("policy/auth.zig");
 const cli = @import("cli.zig");
 const usage = cli.usage;
+pub const version = @import("build_options").version;
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -31,6 +32,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--users") and i + 1 < args.len) {
             i += 1;
             loc.users = args[i];
+        } else if (std.mem.eql(u8, args[i], "--version")) {
+            try out.print("zsmbd {s}\n", .{version});
+            return;
         } else if (std.mem.eql(u8, args[i], "--help")) {
             try out.writeAll(usage);
             return;

@@ -14,6 +14,12 @@ pub fn build(b: *std.Build) void {
     if (sqlite_prefix) |p| mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ p, "lib" }) });
     mod.linkSystemLibrary("sqlite3", .{});
 
+    // The version has one source, build.zig.zon; the code reads it as
+    // @import("build_options").version.
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    mod.addOptions("build_options", options);
+
     // NT hash compiled to WebAssembly for the admin web page, embedded in the
     // binary as the "nthash_wasm" module (`bytes`).
     const wasm = b.addExecutable(.{
@@ -55,6 +61,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     check_mod.addImport("nthash_wasm", wasm_mod);
+    check_mod.addOptions("build_options", options);
     const check_obj = b.addExecutable(.{ .name = "zsmbd-check", .root_module = check_mod });
     const check_step = b.step("check", "Type-check without linking");
     check_step.dependOn(&check_obj.step);

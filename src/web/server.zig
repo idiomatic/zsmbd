@@ -66,7 +66,7 @@ pub const Admin = struct {
     pub fn serve(a: *Admin, addr: net.IpAddress) !void {
         var listener = try addr.listen(a.io, .{ .reuse_address = true });
         defer listener.deinit(a.io);
-        std.log.info("admin web UI on http://{f}/", .{addr});
+        std.log.info("zsmbd {s}: admin web UI on http://{f}/", .{ @import("build_options").version, addr });
         while (true) {
             const stream = listener.accept(a.io) catch |e| {
                 std.log.warn("admin accept: {s}", .{@errorName(e)});
