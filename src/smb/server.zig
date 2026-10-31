@@ -157,6 +157,36 @@ pub const Server = struct {
         if (srv.event_count < srv.events.len) srv.event_count += 1;
     }
 
+    /// Accept SMB clients on `listener` until it fails, one thread per
+    /// connection. Each `Conn` releases itself when its client leaves.
+    pub fn acceptLoop(srv: *Server, listener: *Io.net.Server) void {
+        while (true) {
+            const stream = listener.accept(srv.io) catch |e| {
+                std.log.warn("smb accept: {s}", .{@errorName(e)});
+                continue;
+            };
+            srv.startConn(stream) catch |e| {
+                std.log.warn("smb connection not started: {s}", .{@errorName(e)});
+                stream.close(srv.io);
+            };
+        }
+    }
+
+    fn startConn(srv: *Server, stream: Io.net.Stream) !void {
+        const c = try srv.gpa.create(Conn);
+        c.* = .{ .gpa = srv.gpa, .srv = srv, .id = srv.newId(), .stream = stream };
+        srv.addConn(c) catch |e| {
+            srv.gpa.destroy(c);
+            return e;
+        };
+        const t = std.Thread.spawn(.{}, conn_mod.serve, .{c}) catch |e| {
+            srv.removeConn(c);
+            srv.gpa.destroy(c);
+            return e;
+        };
+        t.detach();
+    }
+
     pub fn addConn(srv: *Server, c: *Conn) !void {
         srv.lock();
         defer srv.unlock();

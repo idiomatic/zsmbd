@@ -7,13 +7,16 @@ const Db = @import("store/store.zig").Db;
 const db_mod = @import("store/store.zig");
 const auth = @import("policy/auth.zig");
 const web = @import("web/server.zig");
+const smb_server = @import("smb/server.zig");
 const strength = @import("policy/strength.zig");
 
 pub const usage =
     \\usage: zsmbd [--db PATH] [--config FILE] [--users FILE] <command>
     \\       zsmbd --version
     \\
-    \\  serve [--web ADDR:PORT]          run the server (default web UI 127.0.0.1:8445)
+    \\  serve [--smb ADDR:PORT] [--web ADDR:PORT]
+    \\                                   run the server (defaults: SMB 0.0.0.0:445,
+    \\                                   web UI 127.0.0.1:8445)
     \\  user list
     \\  user add NAME [--role ROLE]      ROLE: client (default), admin, or hybrid
     \\  user passwd NAME [--web]         --web: a hybrid's web password
@@ -221,10 +224,17 @@ fn getCmd(c: *Cli) !void {
 
 fn serve(c: *Cli) !void {
     var web_addr: []const u8 = "127.0.0.1:8445";
+    var smb_addr: []const u8 = "0.0.0.0:445";
     while (c.next()) |opt| {
-        if (std.mem.eql(u8, opt, "--web")) web_addr = try c.need() else return error.Usage;
+        if (std.mem.eql(u8, opt, "--web"))
+            web_addr = try c.need()
+        else if (std.mem.eql(u8, opt, "--smb"))
+            smb_addr = try c.need()
+        else
+            return error.Usage;
     }
     const addr = try parseAddr(web_addr);
+    const saddr = try parseAddr(smb_addr);
 
     var pw_buf: [16]u8 = undefined;
     if (try auth.bootstrap(c.gpa, c.io, c.db, &pw_buf)) |pw| {
@@ -238,10 +248,26 @@ fn serve(c: *Cli) !void {
         , .{ pw, web_addr });
     }
 
-    // The SMB listener is started here once the connection handler exists
-    // (src/smb/conn.zig); until then only the admin server runs and the
-    // activity view reports the SMB service as not running.
-    std.log.warn("SMB service not available in this build (connection handler missing)", .{});
+    var guid: [16]u8 = undefined;
+    c.io.random(&guid);
+    var srv: smb_server.Server = .{
+        .gpa = c.gpa,
+        .io = c.io,
+        .db = c.db,
+        .guid = guid,
+        .start_ms = Io.Clock.real.now(c.io).toMilliseconds(),
+        .smb_port = saddr.getPort(),
+        .cfg = .{ .server_name = &.{}, .workgroup = &.{}, .signing_required = true, .encrypt = false },
+    };
+    try srv.loadConfig();
+    var listener = saddr.listen(c.io, .{ .reuse_address = true }) catch |e| {
+        std.log.err("cannot listen for SMB on {s}: {s} (port 445 may need root; try --smb 0.0.0.0:4450)", .{ smb_addr, @errorName(e) });
+        return e;
+    };
+    defer listener.deinit(c.io);
+    std.log.info("zsmbd: SMB on {s} as {s}", .{ smb_addr, srv.cfg.server_name });
+    const smb_thread = try std.Thread.spawn(.{}, smb_server.Server.acceptLoop, .{ &srv, &listener });
+    smb_thread.detach();
 
     var admin: web.Admin = .{ .gpa = c.gpa, .io = c.io, .db = c.db };
     try admin.serve(addr);

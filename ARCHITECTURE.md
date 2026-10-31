@@ -81,8 +81,10 @@ client fallback.
   zsmbd user|share|get|set ──► cli ──► policy/auth ──► store   (separate process)
 ```
 
-One process hosts two listeners. Each accepted connection, SMB or HTTP, gets
-its own detached OS thread. The threads share three things: the store
+One process hosts two listeners: SMB (`--smb`, default `0.0.0.0:445`) and
+the admin web server (`--web`). `serve` binds the SMB port first and fails
+if it cannot, then runs `Server.acceptLoop` on its own thread. Each accepted
+connection, SMB or HTTP, gets its own detached OS thread. The threads share three things: the store
 (`store.Db`: SQLite or plain-text files), the in-memory server state (`server.Server`), and the
 `std.Io` instance from `std.process.Init`, which is thread-safe.
 
@@ -853,9 +855,9 @@ a context pointer and three function pointers.
 - `reload` re-reads settings after a save.
 
 The defaults report `"smb_running": false`, which lets the admin server run,
-and be tested, before the SMB side exists. When the connection handler lands,
-`serve` will create the `server.Server`, start the SMB listener, and point
-`Live` at functions that, under the server lock, walk `conns` (each with its
+and be tested, without the SMB side. `serve` now creates the
+`server.Server` and starts the SMB listener but still leaves `Live` at its
+defaults; it is to point `Live` at functions that, under the server lock, walk `conns` (each with its
 sessions, trees, and opens), copy the event ring, and read the counters;
 call `Server.kick`, which shuts the socket down so the connection's own
 thread tears it down; and call `Server.loadConfig`.
@@ -994,7 +996,7 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 | `db`, `auth`, CLI | Written and unit-tested. |
 | Admin JSON API | Written; exercised with curl. |
 | `nthash_wasm` | Written; unit-tested natively, and checked in a browser against server-side hashing. |
-| `smb/server.zig` | Written; compiled and exercised through the `files.zig` tests. |
+| `smb/server.zig` | Written; exercised through the `files.zig` tests. `serve` runs its accept loop, checked with a raw NEGOTIATE over TCP. |
 | `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch), signature verification, and decryption, unit-tested and fuzzed; not yet tried with real clients. |
 | `smb/handshake.zig` | NEGOTIATE, the SMB1 upgrade, SESSION_SETUP, and TREE_CONNECT, unit-tested (SESSION_SETUP against an in-test NTLMv2 client) and fuzzed; not yet tried with real clients. |
 | `smb/files.zig` | Written and unit-tested; not yet driven by real clients. |
@@ -1003,6 +1005,7 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 
 Planned order of work:
 
-1. Start the SMB listener from `serve` and connect `web.Live`.
-2. Finish the browser UI.
-3. Run interoperability tests against Windows, macOS, and Linux clients.
+1. Run interoperability tests against Windows, macOS, and Linux clients.
+2. Connect `web.Live` (activity, kick, and settings reload; until then a
+   settings change needs a restart).
+3. Finish the browser UI.

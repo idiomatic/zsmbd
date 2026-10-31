@@ -28,10 +28,10 @@
 * Hybrid users have separate passwords and get a hygiene warning on every change, and a stronger one when the two passwords match.
 * Password strength is reported, never enforced; only empty passwords are refused.
 * SMB passwords cross the network only from the CLI (stdin) or the web console, which hashes them in the browser with WebAssembly and falls back to server hashing.
-* CLI: `serve [--web ADDR:PORT]`, `user list|add [--role R]|passwd [--web]|role NAME R|del`, `share list|add|del`, `get`, `set KEY VALUE`, and `--db PATH`, `--config FILE`, and `--users FILE` for all; passwords come from stdin, one per line, SMB first.
+* CLI: `serve [--smb ADDR:PORT] [--web ADDR:PORT]`, `user list|add [--role R]|passwd [--web]|role NAME R|del`, `share list|add|del`, `get`, `set KEY VALUE`, and `--db PATH`, `--config FILE`, and `--users FILE` for all; passwords come from stdin, one per line, SMB first.
 * First run creates admin-role user `admin` with a random web password, printed once.
 * Web console: admin and hybrid users only; session cookie; every POST, PUT, and DELETE must send `X-Zsmbd: 1`; no CORS.
 * The last web console admin user can't be deleted nor demoted to client.
 
 ## Status
-* See [ARCHITECTURE.md](ARCHITECTURE.md) section 13. Next: start the SMB listener from `serve` and connect `web.Live`.
+* See [ARCHITECTURE.md](ARCHITECTURE.md) section 13. Next: interoperability tests with real clients, then `web.Live`.
