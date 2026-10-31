@@ -122,8 +122,8 @@ pub const Notify = struct {
 /// The connection core that `state.zig` and `files.zig` rely on: identity,
 /// reference counting, the open-handle table, pending CHANGE_NOTIFYs, and the
 /// framed, signed or sealed write path. The request loop is `serve`;
-/// NEGOTIATE, SESSION_SETUP, and TREE_CONNECT are in handshake.zig;
-/// decryption is still to be written (ARCHITECTURE.md 7.2).
+/// NEGOTIATE, SESSION_SETUP, and TREE_CONNECT are in handshake.zig
+/// (ARCHITECTURE.md 7.2).
 pub const Conn = struct {
     gpa: Allocator,
     srv: *Server,
@@ -246,27 +246,13 @@ pub const Conn = struct {
     pub fn writeFrame(c: *Conn, msg: []const u8, session_id: u64, enc_key: ?[16]u8) !void {
         const io = c.srv.io;
         var frame: [4]u8 = undefined;
-        var th: [52]u8 = undefined;
+        var th: [transform_size]u8 = undefined;
         var sealed: []u8 = &.{};
         defer c.gpa.free(sealed);
         var body: []const u8 = msg;
         if (enc_key) |key| {
             sealed = try c.gpa.alloc(u8, msg.len);
-            @memcpy(th[0..4], &proto.transform_id);
-            @memset(th[20..36], 0);
-            io.random(th[20..32]);
-            const gcm = c.neg.cipher == proto.Cipher.aes128_gcm;
-            if (!gcm) @memset(th[20 + crypto.ccm_nonce_len .. 32], 0);
-            wire.put32(&th, 36, @intCast(msg.len));
-            wire.put16(&th, 40, 0);
-            wire.put16(&th, 42, 1); // Encrypted
-            wire.put64(&th, 44, session_id);
-            var tag: [16]u8 = undefined;
-            if (gcm)
-                Aes128Gcm.encrypt(sealed, &tag, msg, th[20..52], th[20..32].*, key)
-            else
-                crypto.ccmEncrypt(sealed, &tag, msg, th[20..52], th[20..][0..crypto.ccm_nonce_len], key);
-            @memcpy(th[4..20], &tag);
+            seal(io, c.neg.cipher, key, session_id, msg, &th, sealed);
             body = sealed;
         }
         const total = body.len + (if (enc_key != null) th.len else 0);
@@ -283,6 +269,38 @@ pub const Conn = struct {
         _ = c.srv.stats.bytes_out.fetchAdd(total + 4, .monotonic);
     }
 };
+
+pub const transform_size = 52;
+
+/// Encrypt `msg` into `sealed` (the same length) and fill the transform
+/// header `th`, with a fresh random nonce (MS-SMB2 3.1.4.3).
+pub fn seal(io: Io, cipher: u16, key: [16]u8, session_id: u64, msg: []const u8, th: *[transform_size]u8, sealed: []u8) void {
+    @memcpy(th[0..4], &proto.transform_id);
+    @memset(th[20..36], 0);
+    const gcm = cipher == proto.Cipher.aes128_gcm;
+    io.random(th[20..][0..if (gcm) 12 else crypto.ccm_nonce_len]);
+    wire.put32(th, 36, @intCast(msg.len));
+    wire.put16(th, 40, 0);
+    wire.put16(th, 42, 1); // Encrypted
+    wire.put64(th, 44, session_id);
+    var tag: [16]u8 = undefined;
+    if (gcm)
+        Aes128Gcm.encrypt(sealed, &tag, msg, th[20..52], th[20..32].*, key)
+    else
+        crypto.ccmEncrypt(sealed, &tag, msg, th[20..52], th[20..][0..crypto.ccm_nonce_len], key);
+    @memcpy(th[4..20], &tag);
+}
+
+/// Decrypt and authenticate the payload of a transform frame whose header
+/// has been checked into `plain` (`frame.len - transform_size` bytes).
+pub fn unseal(cipher: u16, key: [16]u8, frame: []const u8, plain: []u8) error{AuthenticationFailed}!void {
+    const th = frame[0..transform_size];
+    const tag = th[4..20].*;
+    if (cipher == proto.Cipher.aes128_gcm)
+        try Aes128Gcm.decrypt(plain, frame[transform_size..], tag, th[20..52], th[20..32].*, key)
+    else
+        try crypto.ccmDecrypt(plain, frame[transform_size..], tag, th[20..52], th[20..][0..crypto.ccm_nonce_len], key);
+}
 
 /// Sign one message in place with AES-CMAC and set the signed flag.
 pub fn signMessage(msg: []u8, signing_key: [16]u8) void {
@@ -417,34 +435,66 @@ pub fn serve(c: *Conn) void {
         defer c.gpa.free(frame);
         _ = c.srv.stats.bytes_in.fetchAdd(frame.len + 4, .monotonic);
         out.clear();
-        const keep = handleFrame(c, frame, &out) catch |e| {
+        const reply = handleFrame(c, frame, &out) catch |e| {
             c.srv.log(c.id, "smb", "dropped: {s}", .{@errorName(e)});
             return;
         };
-        if (out.len() > 0) c.writeFrame(out.items(), 0, null) catch return;
-        if (!keep) return;
+        if (out.len() > 0) {
+            const sid = if (reply.seal) |x| x.session_id else 0;
+            c.writeFrame(out.items(), sid, if (reply.seal) |x| x.key else null) catch return;
+        }
+        if (!reply.keep) return;
     }
 }
 
+/// How to send the answer to one frame.
+pub const Reply = struct {
+    /// False when the connection must close after sending.
+    keep: bool,
+    /// Seal the answer: the request was encrypted. The key is a copy, since
+    /// the chain may have logged the session off.
+    seal: ?Seal = null,
+};
+
+pub const Seal = struct { session_id: u64, key: [16]u8 };
+
 /// Answer one frame into `out` (left empty when there is nothing to send).
-/// Returns false when the connection must close after sending.
-pub fn handleFrame(c: *Conn, frame: []const u8, out: *Buf) !bool {
+pub fn handleFrame(c: *Conn, frame: []const u8, out: *Buf) !Reply {
     if (frame.len < 4) return error.Malformed;
     if (std.mem.eql(u8, frame[0..4], &proto.transform_id)) {
-        // Decryption is not written yet, so encrypted traffic ends the connection.
-        return error.EncryptionUnsupported;
+        if (c.neg.dialect != proto.Dialect.smb311) return error.NotNegotiated;
+        const s = try transformSession(c, frame);
+        const plain = try c.gpa.alloc(u8, frame.len - transform_size);
+        defer c.gpa.free(plain);
+        unseal(c.neg.cipher, s.dec_key, frame, plain) catch return error.DecryptionFailed;
+        const sealed: Seal = .{ .session_id = s.id, .key = s.enc_key };
+        return .{ .keep = try walkChain(c, plain, out, s.id), .seal = sealed };
     }
     if (std.mem.eql(u8, frame[0..4], &proto.smb1_id)) {
         // Only as the first frame, and only to upgrade to SMB2.
         if (c.neg.dialect != 0 or !smb1OffersSmb2(frame)) return error.Smb1;
         try handshake.wildcardResponse(c, out);
-        return true;
+        return .{ .keep = true };
     }
-    return processChain(c, frame, out);
+    return .{ .keep = try processChain(c, frame, out) };
+}
+
+/// Check a transform header (MS-SMB2 3.3.5.2.1.1) and return the session
+/// whose key decrypts it. Every failure closes the connection.
+fn transformSession(c: *Conn, frame: []const u8) !*Session {
+    if (frame.len < transform_size + hdr) return error.Malformed;
+    if (wire.get32(frame, 36) != frame.len - transform_size) return error.Malformed;
+    if (wire.get16(frame, 42) != 1) return error.Malformed; // Encrypted
+    if (c.neg.cipher == 0) return error.NoCipher;
+    const s = c.sessions.get(wire.get64(frame, 44)) orelse return error.UnknownSession;
+    if (!s.hasKey()) return error.UnknownSession;
+    return s;
 }
 
 /// What a compound chain carries from one related request to the next.
 const Chain = struct {
+    /// The chain arrived encrypted, so it needs no signatures.
+    encrypted: bool = false,
     first: bool = true,
     session: ?*Session = null,
     tree: ?*Tree = null,
@@ -467,14 +517,20 @@ const Result = struct {
     disconnect: bool = false,
 };
 
-/// Walk a compound chain, answering each request into `out`. Returns false
-/// when the connection must close after sending.
+/// Walk a plain compound chain, answering each request into `out`. Returns
+/// false when the connection must close after sending.
 pub fn processChain(c: *Conn, frame: []const u8, out: *Buf) !bool {
+    return walkChain(c, frame, out, null);
+}
+
+/// Walk a chain; `enc_sid` is the transform header's session for a
+/// decrypted one, which every unrelated request in it must name.
+fn walkChain(c: *Conn, frame: []const u8, out: *Buf, enc_sid: ?u64) !bool {
     var spans: std.ArrayList(Span) = .empty;
     defer spans.deinit(c.gpa);
     var one = Buf.init(c.gpa);
     defer one.deinit();
-    var chain: Chain = .{};
+    var chain: Chain = .{ .encrypted = enc_sid != null };
     var keep = true;
     var off: usize = 0;
     while (try nextInChain(frame, off)) |msg| : (off += msg.len) {
@@ -482,8 +538,9 @@ pub fn processChain(c: *Conn, frame: []const u8, out: *Buf) !bool {
         const cmd: Command = @enumFromInt(wire.get16(msg, 12));
         const flags = wire.get32(msg, 16);
         if (flags & proto.Flags.server_to_redir != 0) return error.Malformed;
+        if (enc_sid) |sid| if (flags & proto.Flags.related_operations == 0 and wire.get64(msg, 40) != sid) return error.SessionMismatch;
         if (cmd == .cancel) {
-            cancel(c, msg);
+            cancel(c, msg, chain.encrypted);
             continue;
         }
         // NEGOTIATE comes first, alone in its frame, and only once.
@@ -520,7 +577,8 @@ pub fn processChain(c: *Conn, frame: []const u8, out: *Buf) !bool {
         if (res.disconnect) keep = false;
 
         try out.alignTo(8);
-        const key: ?[16]u8 = if (res.session) |s| (if (s.sign or res.sign) s.signing_key else null) else null;
+        // A sealed chain is authenticated by the cipher, not signed.
+        const key: ?[16]u8 = if (chain.encrypted) null else if (res.session) |s| (if (s.sign or res.sign) s.signing_key else null) else null;
         try spans.append(c.gpa, .{ .start = out.len(), .len = one.len(), .key = key });
         try out.bytes(one.items());
         if (!keep) break;
@@ -585,10 +643,8 @@ fn handle(c: *Conn, cmd: Command, msg: []const u8, chain: *Chain, out: *Buf) !Re
     chain.session = s;
     if (s.state != .valid) return .{ .status = Status.user_session_deleted };
     const flagged = wire.get32(msg, 16) & proto.Flags.signed != 0;
-    if ((s.sign or flagged) and !signatureValid(s, msg)) return .{ .status = Status.access_denied };
-    // A plain frame on an encrypting session (decryption is not written, so
-    // every frame here is plain).
-    if (s.encrypt) return .{ .status = Status.access_denied, .session = s };
+    if (!chain.encrypted and (s.sign or flagged) and !signatureValid(s, msg)) return .{ .status = Status.access_denied };
+    if (s.encrypt and !chain.encrypted) return .{ .status = Status.access_denied, .session = s };
 
     if (cmd == .logoff) {
         logoff(c, s);
@@ -625,11 +681,14 @@ fn handle(c: *Conn, cmd: Command, msg: []const u8, chain: *Chain, out: *Buf) !Re
 
 /// CANCEL: complete the matching pending CHANGE_NOTIFY with STATUS_CANCELLED.
 /// CANCEL has no response of its own, so anything unmatched is ignored.
-fn cancel(c: *Conn, msg: []const u8) void {
+fn cancel(c: *Conn, msg: []const u8, encrypted: bool) void {
     const sid = wire.get64(msg, 40);
     const s = c.sessions.get(sid) orelse return;
-    const flagged = wire.get32(msg, 16) & proto.Flags.signed != 0;
-    if ((s.sign or flagged) and !signatureValid(s, msg)) return;
+    if (!encrypted) {
+        const flagged = wire.get32(msg, 16) & proto.Flags.signed != 0;
+        if ((s.sign or flagged) and !signatureValid(s, msg)) return;
+        if (s.encrypt) return;
+    }
     const is_async = wire.get32(msg, 16) & proto.Flags.async_command != 0;
     c.finishNotifies(.{ .cancel = .{
         .session_id = sid,
@@ -988,6 +1047,114 @@ test "related requests inherit the session and stop after a failure" {
     try testing.expectEqual(@as(u32, 1), t.conn.sessions.count());
 }
 
+/// `msg` sealed in a transform frame for session `sid`.
+fn sealFrame(cipher: u16, key: [16]u8, sid: u64, msg: []const u8) ![]u8 {
+    const f = try testing.allocator.alloc(u8, transform_size + msg.len);
+    seal(testing.io, cipher, key, sid, msg, f[0..transform_size], f[transform_size..]);
+    return f;
+}
+
+test "seal and unseal round-trip with both ciphers" {
+    const msg = "open the pod bay doors, hal";
+    for ([_]u16{ proto.Cipher.aes128_gcm, proto.Cipher.aes128_ccm }) |cipher| {
+        const f = try sealFrame(cipher, @splat(9), 7, msg);
+        defer testing.allocator.free(f);
+        try testing.expectEqual(@as(u64, 7), wire.get64(f, 44));
+        try testing.expectEqual(@as(u32, msg.len), wire.get32(f, 36));
+        var p: [msg.len]u8 = undefined;
+        try unseal(cipher, @splat(9), f, &p);
+        try testing.expectEqualStrings(msg, &p);
+        try testing.expectError(error.AuthenticationFailed, unseal(cipher, @splat(8), f, &p));
+        f[44] ^= 1; // the header is associated data
+        try testing.expectError(error.AuthenticationFailed, unseal(cipher, @splat(9), f, &p));
+    }
+}
+
+test "encrypted requests: decryption, sealed replies, and refusals" {
+    var t: TestConn = undefined;
+    try t.init();
+    defer t.deinit();
+    const s = try t.addSession(false);
+    s.encrypt = true;
+    s.dec_key = @splat(1);
+    s.enc_key = @splat(2);
+    t.conn.neg.cipher = proto.Cipher.aes128_ccm;
+    var out = Buf.init(testing.allocator);
+    defer out.deinit();
+    var m: [hdr + 4]u8 = @splat(0);
+    var id: u64 = 0;
+
+    // A plain request on an encrypting session is refused.
+    testHeader(&m, .tree_disconnect, id, 0, 0);
+    wire.put64(&m, 40, 7);
+    wire.put32(&m, 36, 9);
+    _ = try handleFrame(t.conn, &m, &out);
+    id += 1;
+    try testing.expectEqual(Status.access_denied, statusAt(&out, 0));
+
+    // Sealed with the client's key, it reaches the handler, and the reply
+    // is to be sealed with the server's key, unsigned.
+    for ([_]u16{ proto.Cipher.aes128_ccm, proto.Cipher.aes128_gcm }) |cipher| {
+        t.conn.neg.cipher = cipher;
+        out.clear();
+        testHeader(&m, .tree_disconnect, id, 0, 0);
+        wire.put64(&m, 40, 7);
+        wire.put32(&m, 36, 9);
+        const f = try sealFrame(cipher, s.dec_key, 7, &m);
+        defer testing.allocator.free(f);
+        const r = try handleFrame(t.conn, f, &out);
+        id += 1;
+        try testing.expect(r.keep);
+        try testing.expectEqual(@as(u64, 7), r.seal.?.session_id);
+        try testing.expectEqualSlices(u8, &s.enc_key, &r.seal.?.key);
+        try testing.expectEqual(Status.network_name_deleted, statusAt(&out, 0));
+        try testing.expect(wire.get32(out.items(), 16) & proto.Flags.signed == 0);
+    }
+
+    // Tampering, a wrong key, an unknown session, a size mismatch, a request
+    // naming another session, and no cipher each close the connection.
+    testHeader(&m, .tree_disconnect, id, 0, 0);
+    wire.put64(&m, 40, 7);
+    wire.put32(&m, 36, 9);
+    const good = try sealFrame(t.conn.neg.cipher, s.dec_key, 7, &m);
+    defer testing.allocator.free(good);
+    const f = try testing.allocator.dupe(u8, good);
+    defer testing.allocator.free(f);
+    f[transform_size + 5] ^= 1;
+    try testing.expectError(error.DecryptionFailed, handleFrame(t.conn, f, &out));
+    const wrong = try sealFrame(t.conn.neg.cipher, s.enc_key, 7, &m);
+    defer testing.allocator.free(wrong);
+    try testing.expectError(error.DecryptionFailed, handleFrame(t.conn, wrong, &out));
+    @memcpy(f, good);
+    wire.put64(f, 44, 8);
+    try testing.expectError(error.UnknownSession, handleFrame(t.conn, f, &out));
+    @memcpy(f, good);
+    wire.put32(f, 36, m.len - 1);
+    try testing.expectError(error.Malformed, handleFrame(t.conn, f, &out));
+    wire.put64(&m, 40, 8);
+    const other = try sealFrame(t.conn.neg.cipher, s.dec_key, 7, &m);
+    defer testing.allocator.free(other);
+    try testing.expectError(error.SessionMismatch, handleFrame(t.conn, other, &out));
+    const saved = t.conn.neg.cipher;
+    t.conn.neg.cipher = 0;
+    try testing.expectError(error.NoCipher, handleFrame(t.conn, good, &out));
+    t.conn.neg.cipher = saved;
+    s.anonymous = true;
+    try testing.expectError(error.UnknownSession, handleFrame(t.conn, good, &out));
+    s.anonymous = false;
+
+    // An encrypted LOGOFF frees the session, and the reply keeps its key.
+    out.clear();
+    testHeader(&m, .logoff, id, 0, 0);
+    wire.put64(&m, 40, 7);
+    const lo = try sealFrame(t.conn.neg.cipher, s.dec_key, 7, &m);
+    defer testing.allocator.free(lo);
+    const r = try handleFrame(t.conn, lo, &out);
+    try testing.expectEqual(Status.success, statusAt(&out, 0));
+    try testing.expectEqual(@as(u32, 0), t.conn.sessions.count());
+    try testing.expectEqualSlices(u8, &@as([16]u8, @splat(2)), &r.seal.?.key);
+}
+
 test "fuzz: frames, compound chains, and credits" {
     var t: TestConn = undefined;
     try t.init();
@@ -1010,11 +1177,14 @@ test "fuzz: frames, compound chains, and credits" {
     @memcpy(smb1[0..5], "\xFFSMB\x72");
     wire.put16(&smb1, 33, 11);
     @memcpy(smb1[35..], "\x02SMB 2.???\x00");
-    const seeds = [_][]const u8{ &echo2, &td_logoff, &cancel_msg, &smb1 };
+    const sealed = try sealFrame(proto.Cipher.aes128_gcm, @splat(1), 7, &echo2);
+    defer testing.allocator.free(sealed);
+    const seeds = [_][]const u8{ &echo2, &td_logoff, &cancel_msg, &smb1, sealed };
 
     try @import("../shared/fuzz.zig").run(&t, struct {
         fn one(tc: *TestConn, in: []const u8) !void {
-            if (tc.conn.sessions.count() == 0) _ = try tc.addSession(false);
+            if (tc.conn.sessions.count() == 0) (try tc.addSession(false)).dec_key = @splat(1);
+            tc.conn.neg.cipher = proto.Cipher.aes128_gcm;
             tc.conn.credits = .{ .high = Credits.window };
             var out = Buf.init(testing.allocator);
             defer out.deinit();

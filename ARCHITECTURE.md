@@ -449,7 +449,7 @@ little-endian output buffer with reserve-then-patch offsets, and UTF-8 ⇄
 UTF-16LE conversion that replaces invalid sequences with U+FFFD instead of
 failing. Everything above the socket works on UTF-8.
 
-### 7.2 Connection handler (`conn.zig`, partly written)
+### 7.2 Connection handler (`conn.zig`)
 
 The handler owns one TCP connection from accept to close. Its data model is
 defined:
@@ -488,9 +488,15 @@ before NEGOTIATE, a second NEGOTIATE, or a NEGOTIATE inside a compound
 closes the connection. Requests on signing sessions, and requests flagged
 signed, must carry a valid AES-CMAC signature (`signatureValid`, constant-time
 compare; sessions without a key never verify), or they get
-`STATUS_ACCESS_DENIED`. Decryption is still to be written; until then it
-fails closed: transform frames close the connection, and requests on
-encrypting sessions get `STATUS_ACCESS_DENIED`. Threading rules for the handler are in section 9.
+`STATUS_ACCESS_DENIED`. A transform frame (`transformSession`, `unseal`)
+must name a session with keys, give `OriginalMessageSize` equal to its
+payload, flag AES encryption, and arrive after a cipher was negotiated; it
+is decrypted with the session's decryption key, and every unrelated request
+inside must name the same session. Any failure closes the connection. A
+decrypted chain skips signature checks and is answered sealed with a copy of
+the session's encryption key (`Reply.seal`), even if the chain logged off.
+Plain requests on encrypting sessions get `STATUS_ACCESS_DENIED`; CANCEL is
+ignored. Threading rules for the handler are in section 9.
 
 Request processing per frame:
 
@@ -989,7 +995,7 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 | Admin JSON API | Written; exercised with curl. |
 | `nthash_wasm` | Written; unit-tested natively, and checked in a browser against server-side hashing. |
 | `smb/server.zig` | Written; compiled and exercised through the `files.zig` tests. |
-| `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch) and signature verification, unit-tested and fuzzed; decryption is missing and fails closed. |
+| `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch), signature verification, and decryption, unit-tested and fuzzed; not yet tried with real clients. |
 | `smb/handshake.zig` | NEGOTIATE, the SMB1 upgrade, SESSION_SETUP, and TREE_CONNECT, unit-tested (SESSION_SETUP against an in-test NTLMv2 client) and fuzzed; not yet tried with real clients. |
 | `smb/files.zig` | Written and unit-tested; not yet driven by real clients. |
 | `web.Live` over `server.Server` | Not started. |
@@ -997,7 +1003,6 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 
 Planned order of work:
 
-1. Finish the handshake: decryption (section 7.2).
-2. Start the SMB listener from `serve` and connect `web.Live`.
-3. Finish the browser UI.
-4. Run interoperability tests against Windows, macOS, and Linux clients.
+1. Start the SMB listener from `serve` and connect `web.Live`.
+2. Finish the browser UI.
+3. Run interoperability tests against Windows, macOS, and Linux clients.

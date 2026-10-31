@@ -661,7 +661,7 @@ test "an SMB1 NEGOTIATE upgrades through the wildcard dialect" {
     @memcpy(smb1[0..5], "\xFFSMB\x72");
     wire.put16(&smb1, 33, 11);
     @memcpy(smb1[35..], "\x02SMB 2.???\x00");
-    try testing.expect(try conn_mod.handleFrame(t.conn, &smb1, &out));
+    try testing.expect((try conn_mod.handleFrame(t.conn, &smb1, &out)).keep);
     try testing.expectEqual(proto.Dialect.wildcard, wire.get16(out.items(), hdr + 4));
     try testing.expectEqual(@as(u16, 1), wire.get16(out.items(), 14)); // credits
     // A second SMB1 frame is refused; the SMB2 NEGOTIATE uses message ID 1.
