@@ -79,6 +79,7 @@ test {
     _ = @import("smb/vfs.zig");
     _ = @import("smb/files.zig");
     _ = @import("smb/conn.zig");
+    _ = @import("smb/handshake.zig");
     _ = @import("shared/crypto.zig");
     _ = @import("shared/wire.zig");
     _ = @import("nthash_wasm.zig");

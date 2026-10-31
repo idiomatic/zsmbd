@@ -120,7 +120,8 @@ src/
     strength.zig       password strength estimate (informs, never enforces)
   smb/
     server.zig         process-wide SMB state: connections, nodes, events
-    conn.zig           one client connection (data model and Conn core so far)
+    conn.zig           one client connection: framing, chains, credits, dispatch
+    handshake.zig      NEGOTIATE (and the SMB1 upgrade), TREE_CONNECT
     files.zig          file commands: CREATE … SET_INFO
     vfs.zig            POSIX file access confined to a share root
     rpc.zig            DCE/RPC srvsvc pipe: NetrShareEnum, NetrShareGetInfo
@@ -377,7 +378,7 @@ reach. It compiles against the `Conn` core and is exercised by the
 
 | Field | Purpose |
 |---|---|
-| `cfg: Config` | Snapshot of the four settings, refreshed by `loadConfig`. Connections copy it (`configCopy`) at NEGOTIATE and SESSION_SETUP so a reload never changes rules mid-handshake. |
+| `cfg: Config` | Snapshot of the four settings, refreshed by `loadConfig`. NEGOTIATE and TREE_CONNECT read it under the lock; SESSION_SETUP uses the signing rule the NEGOTIATE response promised (`Negotiated.signing_required`) so a reload never changes rules mid-handshake. |
 | `guid`, `start_ms` | Server GUID and start time, reported in NEGOTIATE responses. |
 | `conns` | Registry of live connections, for the monitor, kicking, and change notification. |
 | `nodes` | Open-file table keyed by `(st_dev, st_ino)`; see below. |
@@ -482,10 +483,12 @@ write mutex). Each `Notify` copies its session's signing and encryption keys,
 so another thread can complete it without touching the session. The request
 loop (`serve`, `handleFrame`, `processChain`) handles framing, compound
 chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, and dispatch to
-`files.zig`. NEGOTIATE, SESSION_SETUP, TREE_CONNECT, signature verification,
-and decryption are still to be written; until then they fail closed: the
-handshake commands get `STATUS_NOT_SUPPORTED`, transform and SMB1 frames
-close the connection, and requests on signing or encrypting sessions get
+`files.zig`; NEGOTIATE and TREE_CONNECT are in `handshake.zig`. Anything
+before NEGOTIATE, a second NEGOTIATE, or a NEGOTIATE inside a compound
+closes the connection. SESSION_SETUP, signature verification, and
+decryption are still to be written; until then they fail closed:
+SESSION_SETUP gets `STATUS_NOT_SUPPORTED`, transform frames close the
+connection, and requests on signing or encrypting sessions get
 `STATUS_ACCESS_DENIED`. Threading rules for the handler are in section 9.
 
 Request processing per frame:
@@ -529,26 +532,36 @@ queued; clients retry.
 
 The server picks the highest dialect, 3.1.1 or later, that both sides
 support (today only 3.1.1 exists); a NEGOTIATE that offers none gets
-`STATUS_NOT_SUPPORTED` and the connection closes. It advertises
-`large_mtu` and `encryption`; it never
-advertises leasing, multichannel, persistent handles, or DFS. The security
+`STATUS_NOT_SUPPORTED` and the connection closes. It advertises only
+`large_mtu` (encryption is negotiated by context in 3.1.1); it never
+advertises leasing, multichannel, persistent handles, or DFS. Read, write,
+and transact sizes are 4 MiB. The security
 buffer carries the SPNEGO `NegTokenInit` offering only NTLMSSP, with the
 conventional `not_defined_in_RFC4178@please_ignore` hint that Windows
 expects.
 
 The negotiate contexts are processed as follows:
 
-- **Preauthentication integrity:** required, SHA-512 only; a request
-  without it gets `STATUS_INVALID_PARAMETER`. The connection's running
+- **Preauthentication integrity:** exactly one context is required (else
+  `STATUS_INVALID_PARAMETER`), and it must offer SHA-512 (else
+  `STATUS_SMB_NO_PREAUTH_INTEGRITY_HASH_OVERLAP`). The response carries a
+  32-byte random salt. The connection's running
   hash covers the NEGOTIATE request and response; each session continues it
   through its SESSION_SETUP exchange. The final value is the KDF context for
   that session's keys, which binds the keys to the exact negotiation and
   defeats downgrade attacks.
 - **Encryption:** the server chooses AES-128-GCM if offered, otherwise
   AES-128-CCM. The 256-bit ciphers are not offered. With no cipher in
-  common, the session is unencrypted, and refused when `encrypt` is on.
-- **Signing:** AES-CMAC.
-- **Compression, RDMA, and transport** contexts are ignored.
+  common, the response names cipher 0, the session is unencrypted, and it
+  is refused when `encrypt` is on.
+- **Signing:** AES-CMAC, whatever the client lists.
+- **Compression, RDMA, transport, and netname** contexts are ignored. A
+  repeated encryption, signing, compression, or RDMA context gets
+  `STATUS_INVALID_PARAMETER`.
+
+An SMB1 NEGOTIATE offering `SMB 2.???`, as the first frame only, gets an
+SMB2 NEGOTIATE response for the wildcard dialect with one credit; the
+client's SMB2 NEGOTIATE then uses message ID 1.
 
 `FSCTL_VALIDATE_NEGOTIATE_INFO` drops the connection, as MS-SMB2
 3.3.5.15.12 requires for 3.1.1.
@@ -606,14 +619,20 @@ traffic after SESSION_SETUP must be encrypted.
 
 ### 7.5 TREE_CONNECT
 
-The path `\\server\share` is split, and the share name is looked up in the
-database (case-insensitively) at connect time, so share edits take effect for
+The path `\\server\share` is split; the server part is not checked, and the
+share part must be 1 to 80 characters without `\ / : * ? " < > |` or control
+characters (else `STATUS_BAD_NETWORK_NAME`). The share is looked up in the
+store (case-insensitively) at connect time, so share edits take effect for
 new connections without a restart. `IPC$` is synthesized, never stored. The
-share's path is resolved with `realpath`, and that canonical root is what all
-later path checks compare against. The tree's maximal access is all file
-rights, or read and execute only for read-only shares and `IPC$`; CREATE
-grants never exceed it. Shares get `no_caching` flags (consistent with having
-no oplocks) and `encrypt_data` when encryption is required.
+share's path is resolved with `realpath` and must be a directory (else
+`STATUS_BAD_NETWORK_NAME`, logged); that canonical root is what all later
+path checks compare against. An anonymous session reaches `IPC$`, and other
+shares only when they are `guest_ok` and signing is not required
+(`STATUS_ACCESS_DENIED`). A session holds at most 256 trees. The tree's
+maximal access is all file rights, or read and execute only for read-only
+shares and `IPC$`; CREATE grants never exceed it. Shares get `no_caching`
+flags (consistent with having no oplocks) and `encrypt_data` when
+encryption is required.
 
 ### 7.6 File operations: `files.zig`
 
@@ -923,9 +942,12 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
   temporary directory (create dispositions,
   reads and writes, listings, share modes, delete-on-close, rename, locks,
   information classes, read-only shares, path escapes, and server-side copy),
-  and the request loop (frame limits, compound linking and padding, the
+  the request loop (frame limits, compound linking and padding, the
   credit window and charges, related-request rules, LOGOFF and
-  TREE_DISCONNECT, and the fail-closed signature check).
+  TREE_DISCONNECT, and the fail-closed signature check), and the handshake
+  (NEGOTIATE contexts, refusals, and the preauth hash; the SMB1 upgrade;
+  TREE_CONNECT for shares, `IPC$`, read-only shares, and anonymous
+  sessions).
 - Fuzz targets (`src/shared/fuzz.zig`) cover every parser of untrusted
   input listed in [SECURITY.md](SECURITY.md). `zig build test` runs each on
   its seeds plus 400 deterministic mutations per seed; `zig build test
@@ -952,15 +974,16 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 | Admin JSON API | Written; exercised with curl. |
 | `nthash_wasm` | Written; unit-tested natively, and checked in a browser against server-side hashing. |
 | `smb/server.zig` | Written; compiled and exercised through the `files.zig` tests. |
-| `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch), unit-tested and fuzzed; NEGOTIATE, SESSION_SETUP, TREE_CONNECT, signature verification, and decryption are missing and fail closed. |
+| `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch), unit-tested and fuzzed; SESSION_SETUP, signature verification, and decryption are missing and fail closed. |
+| `smb/handshake.zig` | NEGOTIATE, the SMB1 upgrade, and TREE_CONNECT, unit-tested and fuzzed; not yet tried with real clients. |
 | `smb/files.zig` | Written and unit-tested; not yet driven by real clients. |
 | `web.Live` over `server.Server` | Not started. |
 | `web/index.html` | Sign-in and SMB password form; the rest is still to come. |
 
 Planned order of work:
 
-1. Finish `conn.zig` (section 7.2): NEGOTIATE (with the SMB1 upgrade),
-   TREE_CONNECT, then SESSION_SETUP, signature verification, and decryption.
+1. Finish the handshake (section 7.4): SESSION_SETUP, signature
+   verification, and decryption.
 2. Start the SMB listener from `serve` and connect `web.Live`.
 3. Finish the browser UI.
 4. Run interoperability tests against Windows, macOS, and Linux clients.

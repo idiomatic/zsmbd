@@ -34,4 +34,4 @@
 * The last web console admin user can't be deleted nor demoted to client.
 
 ## Status
-* See [ARCHITECTURE.md](ARCHITECTURE.md) section 13. Next: the handshake in `src/smb/conn.zig` (NEGOTIATE, TREE_CONNECT, SESSION_SETUP, signature verification, decryption).
+* See [ARCHITECTURE.md](ARCHITECTURE.md) section 13. Next: SESSION_SETUP, signature verification, and decryption (`src/smb/handshake.zig`, `src/smb/conn.zig`).

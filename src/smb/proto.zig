@@ -332,6 +332,7 @@ pub const Status = struct {
     pub const not_found: u32 = 0xC0000225;
     pub const not_a_reparse_point: u32 = 0xC0000275;
     pub const network_session_expired: u32 = 0xC000035C;
+    pub const no_preauth_integrity_hash_overlap: u32 = 0xC05D0000;
 
     pub fn name(s: u32) []const u8 {
         return switch (s) {
@@ -344,6 +345,7 @@ pub const Status = struct {
             info_length_mismatch => "INFO_LENGTH_MISMATCH",
             invalid_handle => "INVALID_HANDLE",
             invalid_parameter => "INVALID_PARAMETER",
+            no_preauth_integrity_hash_overlap => "SMB_NO_PREAUTH_INTEGRITY_HASH_OVERLAP",
             no_such_file => "NO_SUCH_FILE",
             invalid_device_request => "INVALID_DEVICE_REQUEST",
             end_of_file => "END_OF_FILE",

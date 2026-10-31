@@ -6,7 +6,9 @@ the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
 ## Unreleased
 
 ### Added
-- SMB request loop (`conn.serve`): frame reading with the 4 MiB + 64 KiB limit, compound chains (related requests inherit the session, tree, and file ID, and fail after a failed predecessor), the credit window with per-payload charges, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL of pending CHANGE_NOTIFY requests, and dispatch to the file commands. NEGOTIATE, SESSION_SETUP, TREE_CONNECT, signature verification, and decryption are not written yet and fail closed.
+- SMB request loop (`conn.serve`): frame reading with the 4 MiB + 64 KiB limit, compound chains (related requests inherit the session, tree, and file ID, and fail after a failed predecessor), the credit window with per-payload charges, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL of pending CHANGE_NOTIFY requests, and dispatch to the file commands. SESSION_SETUP, signature verification, and decryption are not written yet and fail closed.
+- NEGOTIATE (`smb/handshake.zig`): 3.1.1 only, with the preauthentication hash (SHA-512 required), AES-128-GCM or AES-128-CCM by context, AES-CMAC signing, and the SMB1 upgrade through the wildcard dialect.
+- TREE_CONNECT: share lookup with `realpath`, synthesized `IPC$`, read-only maximal access, guest rules for anonymous sessions, and at most 256 trees per session.
 
 ### Changed
 - SMB 3.1.1 is the minimum dialect: 2.0.2, 2.1, 3.0, and 3.0.2 are no longer negotiated, preauthentication integrity is required, and HMAC-SHA256 signing, the 3.0 key labels, and the VALIDATE_NEGOTIATE_INFO check are gone. Windows 8.1 and Server 2012 R2 and older, old Samba clients, and embedded clients limited to 2.x or 3.0 can no longer connect.

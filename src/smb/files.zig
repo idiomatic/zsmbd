@@ -59,10 +59,20 @@ pub const FileId = struct {
 
 /// What NEGOTIATE settled, kept by the connection.
 pub const Negotiated = struct {
-    /// 0 until NEGOTIATE succeeds, then 3.1.1 or later.
+    /// 0 before NEGOTIATE, the wildcard after an SMB1 upgrade, then 3.1.1
+    /// or later.
     dialect: u16 = 0,
-    cipher: u16 = proto.Cipher.aes128_ccm,
+    /// 0 when the client offered no cipher the server supports.
+    cipher: u16 = 0,
+    signing_alg: u16 = proto.SigningAlg.aes_cmac,
+    /// What the NEGOTIATE response promised, whatever later reloads say.
+    signing_required: bool = false,
     client_guid: [16]u8 = @splat(0),
+    client_caps: u32 = 0,
+    client_security_mode: u16 = 0,
+    /// SHA-512 over the NEGOTIATE request and response; each session
+    /// continues it through SESSION_SETUP.
+    preauth: [64]u8 = @splat(0),
 };
 
 /// A connection's open handles, keyed by volatile file ID. Only the

@@ -17,6 +17,7 @@ const crypto = @import("../shared/crypto.zig");
 const ntlm = @import("auth/ntlm.zig");
 const spnego = @import("auth/spnego.zig");
 const files = @import("files.zig");
+const handshake = @import("handshake.zig");
 const rpc = @import("rpc.zig");
 const vfs = @import("vfs.zig");
 const state = @import("server.zig");
@@ -43,6 +44,7 @@ pub const Session = struct {
     encrypt: bool = false,
     preauth: [64]u8 = @splat(0),
     trees: std.AutoHashMapUnmanaged(u32, *Tree) = .empty,
+    next_tree_id: u32 = 1,
     created_ms: i64,
 
     pub fn hasKey(s: *const Session) bool {
@@ -120,8 +122,8 @@ pub const Notify = struct {
 /// The connection core that `state.zig` and `files.zig` rely on: identity,
 /// reference counting, the open-handle table, pending CHANGE_NOTIFYs, and the
 /// framed, signed or sealed write path. The request loop is `serve`;
-/// NEGOTIATE, SESSION_SETUP, TREE_CONNECT, signature checks, and decryption
-/// are still to be written (ARCHITECTURE.md section 7.2).
+/// NEGOTIATE and TREE_CONNECT are in handshake.zig; SESSION_SETUP, signature
+/// checks, and decryption are still to be written (ARCHITECTURE.md 7.2).
 pub const Conn = struct {
     gpa: Allocator,
     srv: *Server,
@@ -433,8 +435,10 @@ pub fn handleFrame(c: *Conn, frame: []const u8, out: *Buf) !bool {
         return error.EncryptionUnsupported;
     }
     if (std.mem.eql(u8, frame[0..4], &proto.smb1_id)) {
-        // The wildcard NEGOTIATE response belongs to the handshake, not yet written.
-        return if (smb1OffersSmb2(frame)) error.HandshakeUnsupported else error.Smb1;
+        // Only as the first frame, and only to upgrade to SMB2.
+        if (c.neg.dialect != 0 or !smb1OffersSmb2(frame)) return error.Smb1;
+        try handshake.wildcardResponse(c, out);
+        return true;
     }
     return processChain(c, frame, out);
 }
@@ -478,12 +482,21 @@ pub fn processChain(c: *Conn, frame: []const u8, out: *Buf) !bool {
             cancel(c, msg);
             continue;
         }
+        // NEGOTIATE comes first, alone in its frame, and only once.
+        const negotiated = c.neg.dialect == proto.Dialect.smb311;
+        if (cmd == .negotiate) {
+            if (negotiated) return error.Renegotiate;
+            if (msg.len != frame.len) return error.Malformed;
+        } else if (!negotiated) return error.NotNegotiated;
         if (!c.credits.consume(wire.get64(msg, 24), wire.get16(msg, 6))) return error.BadMessageId;
         const granted = c.credits.grant(wire.get16(msg, 18));
 
         one.clear();
         try responseHeader(&one, msg, granted);
-        var res = handle(c, cmd, msg, &chain, &one) catch |e| Result{ .status = vfs.status(e) };
+        var res = if (cmd == .negotiate) blk: {
+            const n = try handshake.negotiate(c, msg, &one);
+            break :blk Result{ .status = n.status, .disconnect = n.disconnect };
+        } else handle(c, cmd, msg, &chain, &one) catch |e| Result{ .status = vfs.status(e) };
         if (res.notify) |n| {
             if (c.queueNotify(n)) |async_id| {
                 wire.put32(one.items(), 16, wire.get32(one.items(), 16) | proto.Flags.async_command);
@@ -496,6 +509,7 @@ pub fn processChain(c: *Conn, frame: []const u8, out: *Buf) !bool {
         }
         if (res.status != Status.success and res.status != Status.pending and one.len() == hdr) try files.errorBody(&one);
         wire.put32(one.items(), 8, res.status);
+        if (cmd == .negotiate and res.status == Status.success) handshake.hashResponse(c, one.items());
         chain.status = res.status;
         chain.first = false;
         if (res.disconnect) keep = false;
@@ -553,8 +567,8 @@ fn handle(c: *Conn, cmd: Command, msg: []const u8, chain: *Chain, out: *Buf) !Re
             try out.u16_(0);
             return .{ .status = Status.success };
         },
-        // The handshake is not written yet.
-        .negotiate, .session_setup, .tree_connect => return .{ .status = Status.not_supported },
+        // SESSION_SETUP is not written yet.
+        .session_setup => return .{ .status = Status.not_supported },
         else => {},
     }
 
@@ -574,6 +588,12 @@ fn handle(c: *Conn, cmd: Command, msg: []const u8, chain: *Chain, out: *Buf) !Re
         try out.u16_(4);
         try out.u16_(0);
         return .{ .status = Status.success };
+    }
+
+    if (cmd == .tree_connect) {
+        const r = try handshake.treeConnect(c, s, msg, out);
+        if (r.tree) |t| chain.tree = t;
+        return .{ .status = r.status, .session = s };
     }
 
     const t = if (related) chain.tree orelse return .{ .status = Status.invalid_parameter, .session = s } else s.trees.get(wire.get32(msg, 36)) orelse
@@ -707,7 +727,7 @@ test "readFrame enforces the length limit" {
     try testing.expectError(error.EndOfStream, readFrame(&r, testing.allocator));
 }
 
-fn testHeader(b: []u8, cmd: Command, msg_id: u64, next: u32, flags: u32) void {
+pub fn testHeader(b: []u8, cmd: Command, msg_id: u64, next: u32, flags: u32) void {
     @memset(b[0..hdr], 0);
     @memcpy(b[0..4], &proto.protocol_id);
     wire.put16(b, 4, hdr);
@@ -749,12 +769,12 @@ test "smb1OffersSmb2" {
     try testing.expect(!smb1OffersSmb2(&f));
 }
 
-const TestConn = struct {
+pub const TestConn = struct {
     db: db_mod.Db,
     srv: Server,
     conn: *Conn,
 
-    fn init(t: *TestConn) !void {
+    pub fn init(t: *TestConn) !void {
         const gpa = testing.allocator;
         t.db = try db_mod.Db.open(testing.io, ":memory:");
         t.srv = .{
@@ -768,9 +788,10 @@ const TestConn = struct {
         };
         t.conn = try gpa.create(Conn);
         t.conn.* = .{ .gpa = gpa, .srv = &t.srv, .id = 1, .stream = undefined };
+        t.conn.neg.dialect = proto.Dialect.smb311;
     }
 
-    fn deinit(t: *TestConn) void {
+    pub fn deinit(t: *TestConn) void {
         const gpa = testing.allocator;
         const c = t.conn;
         files.closeAll(c, null, null);
@@ -786,7 +807,7 @@ const TestConn = struct {
     }
 
     /// A valid, unsigned session 7 with tree 3 on `IPC$`.
-    fn addSession(t: *TestConn, sign: bool) !*Session {
+    pub fn addSession(t: *TestConn, sign: bool) !*Session {
         const gpa = testing.allocator;
         const s = try gpa.create(Session);
         s.* = .{ .id = 7, .state = .valid, .sign = sign, .created_ms = 0 };
@@ -806,7 +827,7 @@ const TestConn = struct {
     }
 };
 
-fn statusAt(out: *const Buf, off: usize) u32 {
+pub fn statusAt(out: *const Buf, off: usize) u32 {
     return wire.get32(out.items(), off + 8);
 }
 
@@ -882,11 +903,16 @@ test "sessions, trees, logoff, and the fail-closed signature check" {
     try testing.expectEqual(Status.success, statusAt(&out, 0));
     try testing.expectEqual(@as(u32, 0), t.conn.sessions.count());
 
-    // The handshake answers NOT_SUPPORTED for now.
+    // SESSION_SETUP answers NOT_SUPPORTED for now.
     out.clear();
-    testHeader(&m, .negotiate, 5, 0, 0);
+    testHeader(&m, .session_setup, 5, 0, 0);
     _ = try processChain(t.conn, &m, &out);
     try testing.expectEqual(Status.not_supported, statusAt(&out, 0));
+
+    // A second NEGOTIATE ends the connection.
+    out.clear();
+    testHeader(&m, .negotiate, 6, 0, 0);
+    try testing.expectError(error.Renegotiate, processChain(t.conn, &m, &out));
 }
 
 test "related requests inherit the session and stop after a failure" {
