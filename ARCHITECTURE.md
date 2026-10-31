@@ -480,8 +480,13 @@ pending-notify queue (`queueNotify`, `cleanupNotifies`), and the write path
 (`writeMessage`: sign, seal in a transform header, frame, and write under the
 write mutex). Each `Notify` copies its session's signing and encryption keys,
 so another thread can complete it without touching the session. The request
-loop, NEGOTIATE, SESSION_SETUP, TREE_CONNECT, LOGOFF, ECHO, and CANCEL are
-still to be written. Threading rules for the handler are in section 9.
+loop (`serve`, `handleFrame`, `processChain`) handles framing, compound
+chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, and dispatch to
+`files.zig`. NEGOTIATE, SESSION_SETUP, TREE_CONNECT, signature verification,
+and decryption are still to be written; until then they fail closed: the
+handshake commands get `STATUS_NOT_SUPPORTED`, transform and SMB1 frames
+close the connection, and requests on signing or encrypting sessions get
+`STATUS_ACCESS_DENIED`. Threading rules for the handler are in section 9.
 
 Request processing per frame:
 
@@ -502,9 +507,16 @@ Request processing per frame:
 5. Sign each response, concatenate the chain, encrypt it as one transform
    when needed, and write it under the connection's write mutex.
 
-Credits: the server grants enough credits to keep a pipeline of large reads
-and writes flowing (it advertises `large_mtu`), charges multi-credit requests
-by payload size, and rejects message IDs outside the granted window.
+Credits (`Credits`): each response grants what the request asked for (at
+least one), keeping at most 8192 message IDs outstanding. A request spends
+`max(CreditCharge, 1)` consecutive IDs; an ID outside the window or already
+spent closes the connection, and a charge below one per 64 KiB of payload
+gets `STATUS_INVALID_PARAMETER`. CANCEL spends no ID.
+
+Compound chains: each message must be 8-byte aligned and inside the frame.
+A related request inherits the previous one's session, tree, and file ID; it
+is invalid first in a chain, and it fails with its predecessor's status.
+Responses are padded to 8 bytes, linked, and then each is signed.
 
 Asynchronous operations: only CHANGE_NOTIFY goes asynchronous. It gets an
 interim `STATUS_PENDING` response with an async ID; CANCEL, CLOSE of the
@@ -910,7 +922,10 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
   mode, outside edits, and broken files), and the file commands against a
   temporary directory (create dispositions,
   reads and writes, listings, share modes, delete-on-close, rename, locks,
-  information classes, read-only shares, path escapes, and server-side copy).
+  information classes, read-only shares, path escapes, and server-side copy),
+  and the request loop (frame limits, compound linking and padding, the
+  credit window and charges, related-request rules, LOGOFF and
+  TREE_DISCONNECT, and the fail-closed signature check).
 - Fuzz targets (`src/shared/fuzz.zig`) cover every parser of untrusted
   input listed in [SECURITY.md](SECURITY.md). `zig build test` runs each on
   its seeds plus 400 deterministic mutations per seed; `zig build test
@@ -937,16 +952,15 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 | Admin JSON API | Written; exercised with curl. |
 | `nthash_wasm` | Written; unit-tested natively, and checked in a browser against server-side hashing. |
 | `smb/server.zig` | Written; compiled and exercised through the `files.zig` tests. |
-| `smb/conn.zig` | Data model and `Conn` core (references, opens, notify queue, signed and sealed writes); the request loop and handshake are missing. |
+| `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch), unit-tested and fuzzed; NEGOTIATE, SESSION_SETUP, TREE_CONNECT, signature verification, and decryption are missing and fail closed. |
 | `smb/files.zig` | Written and unit-tested; not yet driven by real clients. |
 | `web.Live` over `server.Server` | Not started. |
 | `web/index.html` | Sign-in and SMB password form; the rest is still to come. |
 
 Planned order of work:
 
-1. Finish `conn.zig` (section 7.2): framing, decryption, NEGOTIATE,
-   SESSION_SETUP, signature checks, TREE_CONNECT, LOGOFF, ECHO, CANCEL,
-   credits, and dispatch to `files.zig`.
+1. Finish `conn.zig` (section 7.2): NEGOTIATE (with the SMB1 upgrade),
+   TREE_CONNECT, then SESSION_SETUP, signature verification, and decryption.
 2. Start the SMB listener from `serve` and connect `web.Live`.
 3. Finish the browser UI.
 4. Run interoperability tests against Windows, macOS, and Linux clients.

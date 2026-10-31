@@ -19,6 +19,7 @@ issue.
 | 8 | Admin HTTP API | web pages in the admin's browser; local users | `X-Zsmbd: 1` on every POST, PUT, and DELETE; SameSite=Strict HttpOnly cookie; no CORS; 64 KiB body cap; 750 ms delay after a failed login | `fuzz: cookie and query parsing` (parsers only; the handlers have no automated tests yet) |
 | 9 | Text configuration and users files | local users who can write them | `textconf.parseConf`, `textusers.parseUsers`; a broken file keeps the last good contents and blocks writes | `fuzz: configuration parsing and editing`, `fuzz: users file parsing` |
 | 10 | Validation of admin input | admins, the CLI | `policy/auth.zig`: `validateUserName`, `validateShareName`, `validateSharePath`, `validateComment`, `normalizeSetting` | `validation` |
+| 11 | SMB frames and compound chains | anyone on the network | `conn.readFrame` (4 MiB + 64 KiB cap), `conn.nextInChain` (alignment and bounds), `Credits` (message-ID window), `conn.smb1OffersSmb2`; unverified signatures and plain frames on encrypting sessions fail closed | `conn.zig` unit tests, `fuzz: frames, compound chains, and credits` |
 
 ## Secrets
 
@@ -67,9 +68,10 @@ Fuzzing found, and these were fixed:
 - **No `Host` header check.** A DNS-rebinding page can reach the admin API as
   same-origin. It has no session cookie for its host name, but it can try
   passwords at the login delay.
-- **The SMB connection handler is not written** (`smb/conn.zig`): signature
-  verification, decryption, credits, and framing limits have no tests yet,
-  and the signing and encryption code lacks known-answer tests.
+- **The SMB handshake is not written** (`smb/conn.zig`): NEGOTIATE,
+  SESSION_SETUP, TREE_CONNECT, signature verification, and decryption are
+  missing and fail closed, and the signing and encryption code lacks
+  known-answer tests.
 - **Host-side races.** A local process could swap a directory for a symlink
   between resolution and open; byte-range locks are advisory among SMB
   clients only.
