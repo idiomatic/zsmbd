@@ -31,7 +31,9 @@ pub fn main(init: std.process.Init) !void {
             loc.config = args[i];
         } else if (std.mem.eql(u8, args[i], "--users") and i + 1 < args.len) {
             i += 1;
-            loc.users = args[i];
+            // Later `--users` wins: a file, or `-` for stdin (serve only).
+            loc.users_stdin = std.mem.eql(u8, args[i], "-");
+            loc.users = if (loc.users_stdin) null else args[i];
         } else if (std.mem.eql(u8, args[i], "--version")) {
             try out.print("zsmbd {s}\n", .{version});
             return;
@@ -47,18 +49,34 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, args[i], "help")) return out.writeAll(usage);
     if (!cli.isCommand(args[i])) usageExit(args[i]);
+    if (loc.users_stdin and !std.mem.eql(u8, args[i], "serve")) {
+        std.debug.print("zsmbd: --users - works only with serve\n", .{});
+        usageExit(args[i]);
+    }
     // `hash` makes users-file lines for another machine, so it opens no store.
     const no_store = std.mem.eql(u8, args[i], "hash");
     if (db_given and !loc.usesSqlite() and !no_store) {
         std.log.err("--db is unused when both --config and --users are given", .{});
         std.process.exit(1);
     }
+    if (!no_store and loc.usesSqlite() and loc.db == null) {
+        // Only `serve` with ephemeral entries can run without a database.
+        if (std.mem.eql(u8, args[i], "serve") and givesEphemeral(args[i + 1 ..], loc.users_stdin)) {
+            loc.db = ":memory:";
+            std.log.info("no --db: the store is in memory, so only the ephemeral entries exist", .{});
+        } else {
+            std.debug.print("zsmbd: give --db PATH to name the SQLite database (or --config FILE and --users FILE)\n", .{});
+            usageExit(args[i]);
+        }
+    }
+    const memory_only = loc.db != null and std.mem.eql(u8, loc.db.?, ":memory:") and !db_given;
     var db: Db = undefined;
     if (!no_store) db = Db.openAt(gpa, io, loc) catch |e| {
         std.log.err("cannot open the store: {s}", .{@errorName(e)});
         std.process.exit(1);
     };
     defer if (!no_store) db.close();
+    if (!no_store) db.ephemeral_only = memory_only;
 
     var c: cli.Cli = .{ .gpa = gpa, .io = io, .db = &db, .out = out, .args = args[i..] };
     cli.run(&c) catch |e| {
@@ -67,6 +85,15 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("zsmbd: {s}\n", .{auth.describe(e)});
         std.process.exit(1);
     };
+}
+
+/// Whether `serve`'s arguments give ephemeral shares or logins.
+fn givesEphemeral(args: []const [:0]const u8, users_stdin: bool) bool {
+    if (users_stdin) return true;
+    for (args) |a| {
+        for ([_][]const u8{ "--share", "--user", "--smb-user", "--web-user" }) |f| if (std.mem.eql(u8, a, f)) return true;
+    }
+    return false;
 }
 
 /// Prints the usage of `cmd` to stderr and exits with status 2.
@@ -81,6 +108,8 @@ fn usageExit(cmd: []const u8) noreturn {
 test {
     _ = @import("cli.zig");
     _ = @import("policy/auth.zig");
+    _ = @import("policy/ephemeral.zig");
+    _ = @import("store/ephemeral.zig");
     _ = @import("store/textconf.zig");
     _ = @import("store/textusers.zig");
     _ = @import("web/server.zig");

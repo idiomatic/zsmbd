@@ -40,24 +40,26 @@ zig build test
 
 ## Quick start
 
-Add a share and an SMB user, then start the server. Port 445 needs root on
-Linux and macOS. To test without root, give just a port, as in
-`zsmbd serve --smb 4450`; a missing address keeps the default.
+Add a share and an SMB user, then start the server. `--db` names the SQLite
+database (created on first use) and is required with every command that uses
+it. Port 445 needs root on Linux and macOS. To test without root, give just a
+port, as in `zsmbd --db zsmbd.db serve --smb 4450`; a missing address keeps the
+default.
 
 ```bash
-zsmbd share add data /srv/data
+zsmbd --db zsmbd.db share add data /srv/data
 ```
 
 ```bash
-zsmbd user add hal
+zsmbd --db zsmbd.db user add hal
 ```
 
 ```bash
-zsmbd user passwd hal
+zsmbd --db zsmbd.db user passwd hal
 ```
 
 ```bash
-sudo zsmbd serve
+sudo zsmbd --db zsmbd.db serve
 ```
 
 `user add` creates a user with no password; `user passwd` sets the SMB
@@ -76,30 +78,42 @@ Connect from a client:
 ## Command line
 
 ```
-zsmbd [--db PATH] [--config FILE] [--users FILE] <command>
+zsmbd [--db PATH] [--config FILE] [--users FILE|-] CMD
 
   serve [--smb [ADDR:]PORT] [--web [ADDR:]PORT]
-                                   defaults: 0.0.0.0:445, 127.0.0.1:8445
+        [--share NAME:PATH[:OPTIONS[:TEXT]]]
+        [--user LOGIN:NT_HASH:WEB_HASH]
+        [--smb-user LOGIN:PASSWORD]
+        [--web-user LOGIN:PASSWORD]
+      defaults: 0.0.0.0:445 and 127.0.0.1:8445; the
+      --share and user flags are ephemeral
   user list
-  user add LOGIN                   no password: can't sign in until one is set
-  user passwd [--web] LOGIN        prompts for the SMB (or web console) password
-  user passwd --both LOGIN         prompts for one password for both
-  user nopasswd [--web] LOGIN      clears the SMB (or web console) password
-  user nopasswd --both LOGIN       clears both
+  user add LOGIN
+      no password: can't sign in until one is set
+  user passwd [--web] LOGIN
+      prompts for the SMB (or web console) password
+  user passwd --both LOGIN
+      prompts for one password for both
+  user nopasswd [--web] LOGIN
+      clears the SMB (or web console) password
+  user nopasswd --both LOGIN
+      clears both; can't sign in anywhere
   user del LOGIN
   share list
   share add SHARE PATH
   share comment SHARE TEXT
   share readonly SHARE
   share readwrite SHARE
-  share guest SHARE                allow guests (no sign-in)
+  share guest SHARE        allow guests (no sign-in)
   share noguest SHARE
   share del SHARE
-  get [KEY]                        show settings
+  get [KEY]                show settings
   set KEY VALUE
-  hash [--web] [LOGIN]             hash an SMB (or web) password; with LOGIN,
-                                   print a users-file line
-  hash --both LOGIN                a users-file line with one password for both
+  hash [--web] [LOGIN]
+      hash an SMB (or web) password; with LOGIN,
+      print a users-file line
+  hash --both LOGIN
+      a users-file line, one password for both
   help
 ```
 
@@ -142,16 +156,49 @@ Settings take effect when `serve` restarts.
 
 ## Storage
 
-By default everything lives in one SQLite database, `./zsmbd.db` (or `--db
-PATH`), created on first use. Either part
-can live in a plain-text file instead:
+Everything lives in one SQLite database, `--db PATH`, created on first use;
+there is no default. Either part can live in a plain-text file instead:
 
 | Flags | Settings and shares | Users |
 |---|---|---|
-| (none) | database | database |
+| `--db PATH` | database | database |
 | `--config FILE` | FILE | database |
 | `--users FILE` | database | FILE |
 | `--config FILE --users FILE` | FILE | FILE |
+
+### Ephemeral shares and logins
+
+For demos, tests, CI, and containers, `serve` takes shares and logins that
+live in memory only and vanish on restart. The flags repeat:
+
+```
+zsmbd serve --share docs:/srv/docs:ro,guest:Team files \
+  --smb-user hal:'a long passphrase' \
+  --web-user hal:'another one'
+```
+
+* `--share NAME:PATH[:OPTIONS[:TEXT]]`: OPTIONS are `ro`, `rw`, `guest`, and
+  `noguest`, comma-separated; TEXT is the comment. The path may be relative to the directory
+  `serve` starts in (it is made absolute), and can't contain a colon.
+* `--user LOGIN:NT_HASH:WEB_HASH` is a [users-file](examples/users) line (make
+  one with `zsmbd hash`); `--smb-user` and `--web-user` take `LOGIN:PASSWORD`
+  and hash it at startup. A login takes each service once.
+* `--users -` reads users-file text from stdin instead, with `serve` only:
+  those are the only users, and they are read-only.
+
+With ephemeral entries and no `--db`, nothing is stored: the store is in memory
+and the settings take their defaults.
+
+Ephemeral entries hide stored ones of the same name and can't be changed
+(`user list` and `share list` mark them `ephemeral`). An ephemeral web login,
+or `--users -`, skips creating the first-run `admin`.
+
+**Passwords and hashes on the command line are visible** to other users of the
+host (in `ps`) until `serve` starts, and stay in your shell history and audit
+logs; an NT hash is as good as the password to anyone who sees it. `serve`
+blanks them in its argument list right after parsing and warns, but prefer
+`--users FILE` or `--users -`. With bash, a leading space keeps a command out
+of the history when `HISTCONTROL=ignorespace`.
 
 Every command, including `serve`, takes the same flags. Hand edits take
 effect without a restart (settings excepted), and a file that doesn't parse is

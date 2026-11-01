@@ -54,31 +54,44 @@ client fallback.
 ## 2. Process overview
 
 ```
-                     ┌──────────────────────── zsmbd serve ────────────────────────┐
-                     │                                                              │
-  SMB clients ──────►│  SMB listener (:445)                                         │
-  (TCP 445)          │     │ accept                                                 │
-                     │     ▼                                                        │
-                     │  conn thread ×N ──► smb/conn.zig ──► smb/files.zig           │
-                     │     │                 │   │             │                    │
-                     │     │                 │   │             ▼                    │
-                     │     │                 │   │          smb/vfs.zig ──► host FS │
-                     │     │                 │   └► smb/rpc.zig (IPC$ srvsvc)       │
-                     │     │                 └► ntlm / spnego / crypto              │
-                     │     ▼                                                        │
-                     │  server.Server (config snapshot, connection registry,        │
-                     │                 open-file nodes, activity ring, counters)    │
-                     │     ▲                                                        │
-                     │     │ web.Live hooks (activity, kick, reload)                │
-                     │     │                                                        │
-  Browser ──────────►│  admin web server (127.0.0.1:8445) ── web/server.zig         │
-  (HTTP)             │     │ thread per HTTP connection                             │
-                     │     ▼                                                        │
-                     │  policy/auth ──► store ─┬► sqlite.zig ──► zsmbd.db           │
-                     │                         └► textconf / textusers ──► files    │
-                     └──────────────────────────────────────────────────────────────┘
+                 ┌──────── zsmbd serve ────────┐
+                 │                             │
+ SMB clients ───►│ SMB listener (:445)         │
+ (TCP 445)       │   │ accept                  │
+                 │   ▼                         │
+                 │ conn thread ×N              │
+                 │   ├► smb/conn.zig           │
+                 │   │    ├► smb/files.zig     │
+                 │   │    │    └► smb/vfs.zig  │
+                 │   │    │         └► host FS │
+                 │   │    ├► smb/rpc.zig       │
+                 │   │    │    (IPC$ srvsvc)   │
+                 │   │    └► ntlm, spnego,     │
+                 │   │       crypto            │
+                 │   ▼                         │
+                 │ server.Server               │
+                 │   config snapshot,          │
+                 │   connection registry,      │
+                 │   open-file nodes,          │
+                 │   activity ring, counters   │
+                 │   ▲                         │
+                 │   │ web.Live hooks          │
+                 │   │ (activity, kick,        │
+                 │   │  reload)                │
+ Browser ───────►│ admin web server            │
+ (HTTP)          │   127.0.0.1:8445,           │
+                 │   web/server.zig            │
+                 │   │ thread per connection   │
+                 │   ▼                         │
+                 │ policy/auth ──► store       │
+                 │     ├► sqlite.zig ► zsmbd.db│
+                 │     └► textconf, textusers  │
+                 │          ──► files          │
+                 └─────────────────────────────┘
 
-  zsmbd user|share|get|set ──► cli ──► policy/auth ──► store   (separate process)
+ zsmbd user|share|get|set ──► cli
+   ──► policy/auth ──► store
+   (a separate process)
 ```
 
 One process hosts two listeners: SMB (`--smb`, default `0.0.0.0:445`) and
@@ -104,41 +117,50 @@ which triggers a reload.
 ## 3. Source layout
 
 ```
-build.zig              build, test, and cross-target type-check steps
-examples/              example --config and --users files
+build.zig            build, test, type-check steps
+examples/            example --config and --users files
 src/
-  main.zig             entry point: global flags, open the store, run a command
-  cli.zig              commands: serve, user, share, get, set, hash
-  nthash_wasm.zig      crypto.ntHash and strength exported for WebAssembly
-                       (at the top so its module can reach shared/ and policy/)
+  main.zig           global flags, store, run a command
+  cli.zig            serve, user, share, get, set, hash
+  nthash_wasm.zig    NT hash and strength for WebAssembly
+                     (top level, so its module can reach
+                     shared/ and policy/)
   shared/
-    wire.zig           little-endian codec, output buffer, UTF-16 conversion
-    crypto.zig         MD4, NT hash, RC4, AES-CCM, SP 800-108 KDF, signatures
+    wire.zig         LE codec, output buffer, UTF-16
+    crypto.zig       MD4, NT hash, RC4, AES-CCM, KDF,
+                     signatures
   store/
-    store.zig          Db: picks a backend for each part, serializes access
-    types.zig          User, UserAuth, Share, Change, and the store's errors
-    sqlite.zig         SQLite bindings, schema, and queries
-    textfile.zig       plain-text file: change detection, atomic replace
-    textconf.zig       settings and shares as a text file (--config FILE)
-    textusers.zig      users as a text file (--users FILE)
+    store.zig        Db: a backend per part, one mutex
+    types.zig        User, UserAuth, Share, Change, errors
+    sqlite.zig       SQLite bindings, schema, queries
+    textfile.zig     text file: change check, atomic write
+    textconf.zig     settings and shares (--config FILE)
+    textusers.zig    users (--users FILE)
+    ephemeral.zig    serve's in-memory shares and users
   policy/
-    auth.zig           validation, password hashing, settings catalog, bootstrap
-    strength.zig       password strength estimate (informs, never enforces)
+    auth.zig         validation, hashing, settings,
+                     first-run bootstrap
+    ephemeral.zig    parses serve's ephemeral flags
+    strength.zig     password strength (informs only)
   smb/
-    server.zig         process-wide SMB state: connections, nodes, events
-    conn.zig           one client connection: framing, chains, credits, dispatch
-    handshake.zig      NEGOTIATE (and the SMB1 upgrade), TREE_CONNECT
-    files.zig          file commands: CREATE … SET_INFO
-    vfs.zig            POSIX file access confined to a share root
-    rpc.zig            DCE/RPC srvsvc pipe: NetrShareEnum, NetrShareGetInfo
-    proto.zig          SMB2/3, MS-FSCC, and NTSTATUS constants
+    server.zig       process-wide state: connections,
+                     nodes, events
+    conn.zig         one connection: framing, chains,
+                     credits, dispatch
+    handshake.zig    NEGOTIATE (and SMB1 upgrade),
+                     TREE_CONNECT
+    files.zig        file commands: CREATE ... SET_INFO
+    vfs.zig          POSIX access confined to a share
+    rpc.zig          DCE/RPC srvsvc: NetrShareEnum,
+                     NetrShareGetInfo
+    proto.zig        SMB2/3, MS-FSCC, NTSTATUS constants
     auth/
-      spnego.zig       minimal DER SPNEGO (NegTokenInit / NegTokenResp)
-      ntlm.zig         NTLMSSP server: CHALLENGE and NTLMv2 verification
+      spnego.zig     minimal DER SPNEGO
+      ntlm.zig       NTLMSSP server, NTLMv2 verification
   web/
-    server.zig         admin HTTP server and JSON API
-    index.html         single-page UI, embedded with @embedFile (sign-in and
-                       SMB password form so far)
+    server.zig       admin HTTP server and JSON API
+    index.html       single-page UI via @embedFile
+                     (sign-in and SMB password form so far)
 ```
 
 ### Module dependencies
@@ -176,11 +198,13 @@ main ──► cli ──┬──► web ────┐
 ```sql
 settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)
 users(name TEXT PRIMARY KEY COLLATE NOCASE,
-      nt_hash BLOB NOT NULL,          -- SMB password: MD4(UTF-16LE(pw)); empty = none
-      web_hash TEXT NOT NULL,         -- web password: argon2id PHC; empty = none
-      created INTEGER NOT NULL)       -- Unix seconds
+      -- SMB password: MD4(UTF-16LE(pw)); empty = none
+      nt_hash BLOB NOT NULL,
+      -- web password: argon2id PHC; empty = none
+      web_hash TEXT NOT NULL,
+      created INTEGER NOT NULL)  -- Unix seconds
 shares(name TEXT PRIMARY KEY COLLATE NOCASE,
-       path TEXT NOT NULL,            -- absolute host directory
+       path TEXT NOT NULL,       -- absolute directory
        comment TEXT NOT NULL DEFAULT '',
        read_only INTEGER NOT NULL DEFAULT 0,
        guest_ok INTEGER NOT NULL DEFAULT 0)
@@ -301,6 +325,34 @@ the database is small and these calls are rare (logins, tree connects, admin
 edits), so a statement cache is not worth its complexity. Returned strings are
 copied into caller-owned memory before the lock is released.
 
+### Ephemeral entries: `store/ephemeral.zig`, `policy/ephemeral.zig`
+
+`serve` can be given shares and logins that exist only in memory. `policy/ephemeral.zig`
+parses them (`--share`, `--user`, `--smb-user`, `--web-user`, and users-file
+text from stdin for `--users -`) with the validators of `share add` and
+`user add` (a relative share path is made absolute against the current directory), merges them per login (each service once; a hash given twice for
+one service is `DuplicateLogin`), and hands them to `Db.addEphemeralShare`
+and `addEphemeralUser`. `Db` keeps them in an `Ephemeral` layer in front of the
+stored part:
+
+- Lookups, `listShares`, and `listUsers` find them first; a stored entry of
+  the same name is hidden (and logged once at startup), untouched.
+- Every change to one is `error.Ephemeral`: `putUser`, `deleteUser`,
+  `putShare`, and `deleteShare`, and `grantPasswords`, `revokePasswords`, and
+  `deleteUser` in `policy/auth.zig` check first, so the CLI and the web API
+  report it. Lists mark them `ephemeral`.
+- `countWebUsers` counts stored users only, so the last-web-user guard can't
+  depend on something a restart drops; `bootstrap` creates no `admin` when an
+  ephemeral web login exists.
+- `--users -` (global flag, `serve` only; the last `--users` wins) sets
+  `Db.users_stdin`: there are no stored users, the users read from stdin are
+  ephemeral, and any other change is `error.ReadOnly`. `bootstrap` creates no
+  `admin`.
+- Argument values that may hold secrets (`--user`, `--smb-user`, `--web-user`)
+  are copied into the spec and then zeroed in place in the process's argv
+  (`cli.wipe`), before any listener starts; `serve` warns that the values were
+  readable until then. Passwords are hashed at startup and the copies wiped.
+
 ### Plain-text files: `store/textconf.zig`, `store/textusers.zig`
 
 The store has two parts, and each can live in SQLite or in a plain-text
@@ -309,12 +361,12 @@ in version control:
 
 | Flags | Settings and shares | Users |
 |---|---|---|
-| (none) | SQLite | SQLite |
+| `--db PATH` | SQLite | SQLite |
 | `--config FILE` | FILE | SQLite |
 | `--users FILE` | SQLite | FILE |
 | `--config FILE --users FILE` | FILE | FILE (no database is opened; `--db` is refused) |
 
-`--db PATH` names the database for the parts that use it. A missing text
+`--db PATH` names the database for the parts that use it, and has no default: without it, `main` refuses every command that needs a store, except `serve` given ephemeral entries, which uses `:memory:`. A missing text
 file starts empty, and its directory is created. `Db` keeps one interface;
 each method goes to the backend of its part, under the same mutex. Keeping
 users apart lets password hashes have stricter permissions, ownership, or
@@ -454,12 +506,18 @@ detected.
 
 ```
  TCP stream
-   └─ framing:     4-byte header (0x00 + 24-bit big-endian length)       conn.zig
-       └─ transform: 0xFD 'SMB' encrypted envelope, if encryption is on  conn.zig + crypto.zig
-           └─ compound: chain of SMB2 messages linked by NextCommand     conn.zig
-               └─ message: 64-byte SMB2 header + command body            conn.zig / files.zig
-                   └─ security blobs: SPNEGO ⊃ NTLMSSP                   spnego.zig, ntlm.zig
-                   └─ IPC$ pipe data: DCE/RPC ⊃ NDR srvsvc                rpc.zig
+  └─ framing: 4-byte header (0x00 + 24-bit
+  │    big-endian length)             conn.zig
+  └─ transform: 0xFD 'SMB' encrypted envelope,
+  │    if encryption is on     conn.zig, crypto.zig
+  └─ compound: SMB2 messages linked by
+  │    NextCommand                    conn.zig
+  └─ message: 64-byte SMB2 header + command
+     │    body                  conn.zig, files.zig
+     ├─ security blobs: SPNEGO ⊃ NTLMSSP
+     │                      spnego.zig, ntlm.zig
+     └─ IPC$ pipe data: DCE/RPC ⊃ NDR srvsvc
+                                        rpc.zig
 ```
 
 Codec work is shared through `wire.zig`: bounds-checked reads
@@ -595,16 +653,25 @@ client's SMB2 NEGOTIATE then uses message ID 1.
 ### 7.4 Authentication: SESSION_SETUP
 
 ```
-client                                        server
-  │ SESSION_SETUP (SPNEGO init, NTLM NEGOTIATE)  │
-  │─────────────────────────────────────────────►│ ntlm.Server.challengeFor
-  │   MORE_PROCESSING_REQUIRED (NTLM CHALLENGE)  │   random 8-byte challenge,
-  │◄─────────────────────────────────────────────│   target info AV pairs
-  │ SESSION_SETUP (NTLM AUTHENTICATE + MIC)      │
-  │─────────────────────────────────────────────►│ ntlm.authenticate
-  │   SUCCESS (accept-completed + mechListMIC)   │   NT hash from db, NTLMv2 check,
-  │◄─────────────────────────────────────────────│   session key, SMB key derivation
+client                              server
+  │ SESSION_SETUP (SPNEGO init,        │
+  │   NTLM NEGOTIATE)                  │
+  │───────────────────────────────────►│
+  │ MORE_PROCESSING_REQUIRED           │
+  │   (NTLM CHALLENGE)                 │
+  │◄───────────────────────────────────│
+  │ SESSION_SETUP (NTLM AUTHENTICATE   │
+  │   + MIC)                           │
+  │───────────────────────────────────►│
+  │ SUCCESS (accept-completed +        │
+  │   mechListMIC)                     │
+  │◄───────────────────────────────────│
 ```
+
+The server side of the exchange: `ntlm.Server.challengeFor` makes a
+random 8-byte challenge and the target info AV pairs;
+`ntlm.authenticate` takes the NT hash from the store, checks the NTLMv2
+response, and derives the session key and the SMB keys.
 
 - `spnego.zig` accepts either SPNEGO-wrapped tokens or raw NTLMSSP, records
   the client's DER `mechTypes` list (for the mechListMIC), and builds

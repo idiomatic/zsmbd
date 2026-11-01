@@ -52,6 +52,14 @@ pub fn describe(err: anyerror) []const u8 {
         error.InvalidPassword => "give the SMB password either as a password or as a 32-digit hex NT hash, not both",
         error.InvalidNtHash => "an NT hash is 32 hexadecimal digits",
         error.NotFound => "not found",
+        error.Store => "a configuration or users file has errors (see above)",
+        error.Ephemeral => "it is ephemeral, given on the command line or stdin; restart without it to change it",
+        error.ReadOnly => "users come from stdin (--users -) and can't be changed",
+        error.InvalidShareSpec => "expected NAME:PATH[:OPTIONS[:TEXT]]",
+        error.InvalidOption => "share options are ro, rw, guest, and noguest, separated by commas",
+        error.InvalidLogin => "expected LOGIN:NT_HASH:WEB_HASH, or LOGIN:PASSWORD",
+        error.DuplicateLogin => "a login may be given once for SMB and once for the web console",
+        error.DuplicateShare => "a share name may be given once",
         error.UserExists => "user exists; set its passwords with `user passwd [--web]`",
         else => @errorName(err),
     };
@@ -205,6 +213,7 @@ pub fn grantPasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, pw: Pas
     if (pw.web) |p| try validatePassword(p);
     const u = (try db.userAuth(gpa, name)) orelse return error.NotFound;
     defer u.free(gpa);
+    if (db.isEphemeralUser(u.name)) return error.Ephemeral;
     if (!pw.hasSmb() and pw.web == null) return .empty;
     var warnings: Warnings = .empty;
     // Only plaintext can be rated; a pre-hashed password was rated in the browser.
@@ -236,6 +245,7 @@ pub fn grantPasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, pw: Pas
 pub fn revokePasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, smb: bool, web: bool) !void {
     const u = (try db.userAuth(gpa, name)) orelse return error.NotFound;
     defer u.free(gpa);
+    if (db.isEphemeralUser(u.name)) return error.Ephemeral;
     if (web and u.web_hash.len > 0 and try db.countWebUsers() <= 1) return error.LastWebUser;
     try db.putUser(u.name, if (smb) .clear else .keep, if (web) .clear else .keep, nowSeconds(io));
 }
@@ -244,6 +254,7 @@ pub fn revokePasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, smb: b
 pub fn deleteUser(gpa: Allocator, db: *Db, name: []const u8) !void {
     const u = (try db.userAuth(gpa, name)) orelse return error.NotFound;
     defer u.free(gpa);
+    if (db.isEphemeralUser(u.name)) return error.Ephemeral;
     if (u.web_hash.len > 0 and try db.countWebUsers() <= 1) return error.LastWebUser;
     _ = try db.deleteUser(name);
 }
@@ -290,8 +301,10 @@ pub fn randomPassword(io: Io, buf: *[16]u8) []const u8 {
 
 /// First-run setup: when nobody can sign in to the web console, give user
 /// "admin" (created if missing) a random web password and return it (caller
-/// prints it once). Returns null otherwise.
+/// prints it once). Returns null otherwise, and when an ephemeral web login
+/// exists or the users come from stdin.
 pub fn bootstrap(gpa: Allocator, io: Io, db: *Db, pw_buf: *[16]u8) !?[]const u8 {
+    if (db.hasEphemeralWebLogin()) return null;
     if (try db.countWebUsers() > 0) return null;
     const pw = randomPassword(io, pw_buf);
     if (try db.userAuth(gpa, "admin")) |u| u.free(gpa) else try addUser(io, db, "admin");

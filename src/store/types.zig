@@ -3,7 +3,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-pub const Error = error{ Sqlite, Store, OutOfMemory };
+/// `Ephemeral`: the entry was given on the command line; `ReadOnly`: the
+/// users come from stdin (`--users -`).
+pub const Error = error{ Sqlite, Store, OutOfMemory, Ephemeral, ReadOnly };
 
 pub const Share = struct {
     name: []const u8,
@@ -11,6 +13,8 @@ pub const Share = struct {
     comment: []const u8 = "",
     read_only: bool = false,
     guest_ok: bool = false,
+    /// Given on the command line; kept in memory only.
+    ephemeral: bool = false,
 
     pub fn dupe(s: Share, gpa: Allocator) !Share {
         return .{
@@ -19,6 +23,7 @@ pub const Share = struct {
             .comment = try gpa.dupe(u8, s.comment),
             .read_only = s.read_only,
             .guest_ok = s.guest_ok,
+            .ephemeral = s.ephemeral,
         };
     }
     pub fn free(s: Share, gpa: Allocator) void {
@@ -40,6 +45,8 @@ pub const User = struct {
     has_smb: bool,
     has_web: bool,
     created: i64,
+    /// Given on the command line or stdin; kept in memory only.
+    ephemeral: bool = false,
 };
 
 pub const UserAuth = struct {

@@ -6,6 +6,7 @@
 * Embedded admin web server: settings, shares (names and directory paths), user credentials, and live activity.
 * All code in Zig 0.17.0 or later; this is non-negotiable.
 * SQLite may store data (hashed passwords, configuration).
+* Markdown code blocks are at most 60 columns wide (due to a Claude desktop app bug).
 * Keep this file, [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), and [CHANGELOG.md](CHANGELOG.md) current with each change.
 
 ## Build
@@ -24,12 +25,13 @@
 * Authentication: SPNEGO with NTLMv2 only; no Kerberos.
 * Not supported: oplocks and leases, multichannel, DFS, and named streams.
 * Shares are confined to their real path: `..` and stream names are rejected, symlinks are followed only inside the share, and lookups fall back to case-insensitive matching.
-* Settings (the complete list): server_name, workgroup, signing_required, encrypt. Settings with shares, and users, each live in SQLite or in a plain-text file (`--config FILE`, `--users FILE`), in any combination; CLI flags exist only for these locations and listen addresses.
+* Settings (the complete list): server_name, workgroup, signing_required, encrypt. Settings with shares, and users, each live in SQLite or in a plain-text file (`--config FILE`, `--users FILE`), in any combination; CLI flags exist only for these locations, listen addresses, and the ephemeral entries of `serve`.
 * Users have an SMB password (NT hash), a web password (argon2id), both (optional), or neither; each opens one service. No role is stored; smb, web, both, and none are display names only.
 * Users with both passwords should keep them separate and get a hygiene warning on every change, and a stronger one when the two passwords match.
 * Password strength is reported, never enforced; only empty passwords are refused.
 * SMB passwords cross the network only from the CLI (stdin) or the web console, which hashes them in the browser with WebAssembly and falls back to server hashing.
-* CLI: `serve [--smb [ADDR:]PORT] [--web [ADDR:]PORT]` (ADDR defaults: 0.0.0.0 and 127.0.0.1), `user list|add LOGIN|passwd [--web|--both] LOGIN|nopasswd [--web|--both] LOGIN|del LOGIN` (flags before or after LOGIN; `add` sets no password), `share list|add SHARE PATH|comment SHARE TEXT|readonly|readwrite|guest|noguest|del SHARE`, `get [KEY]`, `set KEY VALUE`, `hash [--web] [LOGIN]` and `hash --both LOGIN` (one password; a users-file line with LOGIN, else the hash; opens no store), `help`, and `--db PATH`, `--config FILE`, and `--users FILE` for the rest; each password comes from one line of stdin, unechoed at a terminal. Usage errors print that command's synopsis and exit 2; unknown commands open no store.
+* CLI: `serve [--smb [ADDR:]PORT] [--web [ADDR:]PORT] [--share SPEC]... [--user SPEC]... [--smb-user LOGIN:PASSWORD]... [--web-user LOGIN:PASSWORD]...` (ADDR defaults: 0.0.0.0 and 127.0.0.1), `user list|add LOGIN|passwd [--web|--both] LOGIN|nopasswd [--web|--both] LOGIN|del LOGIN` (flags before or after LOGIN; `add` sets no password), `share list|add SHARE PATH|comment SHARE TEXT|readonly|readwrite|guest|noguest|del SHARE`, `get [KEY]`, `set KEY VALUE`, `hash [--web] [LOGIN]` and `hash --both LOGIN` (one password; a users-file line with LOGIN, else the hash; opens no store), `help`, and `--db PATH`, `--config FILE`, and `--users FILE` for the rest (`--db` is required for any part not in a file, with no default; `serve` given only ephemeral entries and no `--db` keeps the store in memory, with no first-run `admin`); each password comes from one line of stdin, unechoed at a terminal. Usage errors print that command's synopsis and exit 2; unknown commands open no store.
+* Ephemeral entries: `serve --share NAME:PATH[:OPTIONS[:TEXT]]` (PATH may be relative to the starting directory; OPTIONS from ro, rw, guest, noguest), `--user LOGIN:NT_HASH:WEB_HASH`, `--smb-user` and `--web-user LOGIN:PASSWORD`, and `--users -` (users-file text from stdin; `serve` only; replaces stored users). They live in memory, hide stored entries of the same name, and refuse every change; a login takes each service once. The last-web-user guard counts stored users only, and an ephemeral web login or `--users -` skips the first-run `admin`. Secret-bearing arguments are blanked in the process's argv right after parsing, and `serve` warns about them.
 * First run gives user `admin` (created if missing) a random web password, printed once.
 * Web console: users with a web password only; session cookie; every POST, PUT, and DELETE must send `X-Zsmbd: 1`; no CORS.
 * The last user with a web password can't be deleted nor lose it.

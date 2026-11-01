@@ -21,7 +21,7 @@ const Change = db.Change;
 const User = db.User;
 const UserAuth = db.UserAuth;
 
-const UserRec = struct {
+pub const UserRec = struct {
     name: []u8,
     nt_hash: ?[16]u8,
     web_hash: []u8,
@@ -191,11 +191,12 @@ fn freeSecret(gpa: Allocator, b: []u8) void {
     gpa.free(b);
 }
 
-fn freeUser(gpa: Allocator, u: UserRec) void {
+pub fn freeUser(gpa: Allocator, u: UserRec) void {
     gpa.free(u.name);
     freeSecret(gpa, u.web_hash);
 }
-fn parseUsers(gpa: Allocator, file: []const u8, text: []const u8) Error!std.ArrayList(UserRec) {
+/// Parses users-file text; `file` names it in error messages.
+pub fn parseUsers(gpa: Allocator, file: []const u8, text: []const u8) Error!std.ArrayList(UserRec) {
     var users: std.ArrayList(UserRec) = .empty;
     errdefer {
         for (users.items) |u| freeUser(gpa, u);

@@ -306,21 +306,28 @@ pub const Admin = struct {
         auth.validateShareName(in.name) catch |e| return respondError(req, .bad_request, auth.describe(e));
         auth.validateSharePath(arena, in.path) catch |e| return respondError(req, .bad_request, auth.describe(e));
         auth.validateComment(in.comment) catch |e| return respondError(req, .bad_request, auth.describe(e));
-        try a.db.putShare(.{ .name = in.name, .path = in.path, .comment = in.comment, .read_only = in.read_only, .guest_ok = in.guest_ok });
+        a.db.putShare(.{ .name = in.name, .path = in.path, .comment = in.comment, .read_only = in.read_only, .guest_ok = in.guest_ok }) catch |e| switch (e) {
+            error.Ephemeral => return respondError(req, .bad_request, auth.describe(e)),
+            else => return e,
+        };
         return respondJson(req, arena, .{ .ok = true });
     }
 
     fn deleteShare(a: *Admin, req: *http.Server.Request, arena: Allocator, query: []const u8) !void {
         const name = try queryParam(arena, query, "name") orelse return respondError(req, .bad_request, "missing name");
-        if (!try a.db.deleteShare(name)) return respondError(req, .not_found, "no such share");
+        const deleted = a.db.deleteShare(name) catch |e| switch (e) {
+            error.Ephemeral => return respondError(req, .bad_request, auth.describe(e)),
+            else => return e,
+        };
+        if (!deleted) return respondError(req, .not_found, "no such share");
         return respondJson(req, arena, .{ .ok = true });
     }
 
     fn listUsers(a: *Admin, req: *http.Server.Request, arena: Allocator) !void {
         const users = try a.db.listUsers(arena);
-        const Out = struct { name: []const u8, access: []const u8, has_smb: bool, has_web: bool, created: i64 };
+        const Out = struct { name: []const u8, access: []const u8, has_smb: bool, has_web: bool, created: i64, ephemeral: bool };
         const out = try arena.alloc(Out, users.len);
-        for (users, out) |u, *o| o.* = .{ .name = u.name, .access = auth.accessName(u.has_smb, u.has_web), .has_smb = u.has_smb, .has_web = u.has_web, .created = u.created };
+        for (users, out) |u, *o| o.* = .{ .name = u.name, .access = auth.accessName(u.has_smb, u.has_web), .has_smb = u.has_smb, .has_web = u.has_web, .created = u.created, .ephemeral = u.ephemeral };
         return respondJson(req, arena, out);
     }
 

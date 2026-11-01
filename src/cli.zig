@@ -9,13 +9,18 @@ const auth = @import("policy/auth.zig");
 const web = @import("web/server.zig");
 const smb_server = @import("smb/server.zig");
 const strength = @import("policy/strength.zig");
+const ephemeral = @import("policy/ephemeral.zig");
 
 pub const usage =
-    \\usage: zsmbd [--db PATH] [--config FILE] [--users FILE] <command>
+    \\usage: zsmbd [--db PATH] [--config FILE] [--users FILE|-] <command>
     \\       zsmbd --version
     \\
     \\  serve [--smb [ADDR:]PORT] [--web [ADDR:]PORT]
     \\                                   defaults: 0.0.0.0:445, 127.0.0.1:8445
+    \\        [--share NAME:PATH[:OPTIONS[:TEXT]]]
+    \\        [--user LOGIN:NT_HASH:WEB_HASH]
+    \\        [--smb-user LOGIN:PASSWORD] [--web-user LOGIN:PASSWORD]
+    \\                                   ephemeral shares and logins, kept in memory
     \\  user list
     \\  user add LOGIN                   no password: can't sign in until one is set
     \\  user passwd [--web] LOGIN        prompts for the SMB (or web console) password
@@ -41,10 +46,19 @@ pub const usage =
     \\Each password opens one service; `user list` shows smb, web (console),
     \\both, or none. Passwords are read from stdin, one per line, without echo
     \\at a terminal. `hash` uses no store.
-    \\The database defaults to ./zsmbd.db and is created on first use.
+    \\--db PATH names the SQLite database, created on first use; it is required
+    \\unless --config and --users cover everything, or serve is given ephemeral
+    \\entries only (then nothing is stored).
     \\--config FILE keeps settings and shares in a plain-text file instead, and
     \\--users FILE keeps users in one; either or both may be given, and the
     \\files may be edited by hand. With both, no database is used.
+    \\--users - (with serve only) reads users-file text from stdin instead:
+    \\ephemeral and read-only, with no stored users.
+    \\Ephemeral entries (repeatable flags; OPTIONS are ro, rw, guest, noguest)
+    \\hide stored ones of the same name and can't be changed. Passwords and
+    \\hashes on the command line are visible to other users of the host until
+    \\startup; zsmbd then blanks them in the process list, but not in your
+    \\shell history. Prefer --users FILE or --users -.
     \\On first start, an "admin" user with a random web password is created
     \\and the password is printed once.
     \\
@@ -171,7 +185,7 @@ fn userCmd(c: *Cli) !void {
     if (std.mem.eql(u8, sub, "list")) {
         const users = try c.db.listUsers(c.gpa);
         defer db_mod.freeUsers(c.gpa, users);
-        for (users) |u| try c.out.print("{s}\t{s}\n", .{ u.name, auth.accessName(u.has_smb, u.has_web) });
+        for (users) |u| try c.out.print("{s}\t{s}{s}\n", .{ u.name, auth.accessName(u.has_smb, u.has_web), if (u.ephemeral) "\tephemeral" else "" });
         return;
     }
     // One LOGIN; `passwd` and `nopasswd` also take --web or --both, before
@@ -247,7 +261,7 @@ fn shareCmd(c: *Cli) !void {
         const shares = try c.db.listShares(c.gpa);
         defer db_mod.freeShares(c.gpa, shares);
         for (shares) |s| {
-            try c.out.print("{s}\t{s}{s}{s}", .{ s.name, s.path, if (s.read_only) "\tread-only" else "", if (s.guest_ok) "\tguest" else "" });
+            try c.out.print("{s}\t{s}{s}{s}{s}", .{ s.name, s.path, if (s.read_only) "\tread-only" else "", if (s.guest_ok) "\tguest" else "", if (s.ephemeral) "\tephemeral" else "" });
             if (s.comment.len > 0) try c.out.print("\t# {s}", .{s.comment});
             try c.out.writeAll("\n");
         }
@@ -299,14 +313,44 @@ fn getCmd(c: *Cli) !void {
 fn serve(c: *Cli) !void {
     var web_addr: []const u8 = "8445";
     var smb_addr: []const u8 = "445";
+    var spec: ephemeral.Spec = .init(c.gpa);
+    defer spec.deinit();
+    var secrets = false;
     while (c.next()) |opt| {
         if (std.mem.eql(u8, opt, "--web"))
             web_addr = try c.need()
         else if (std.mem.eql(u8, opt, "--smb"))
             smb_addr = try c.need()
-        else
+        else if (std.mem.eql(u8, opt, "--share"))
+            spec.addShare(try c.need()) catch |e| return badSpec(opt, e)
+        else if (std.mem.eql(u8, opt, "--user") or std.mem.eql(u8, opt, "--smb-user") or std.mem.eql(u8, opt, "--web-user")) {
+            // Copied into the spec, then blanked in the process's argument
+            // memory, which `ps` reads, before anything else happens.
+            const value = try c.need();
+            secrets = true;
+            const added = addLogin(c, &spec, opt, value);
+            wipe(value);
+            added catch |e| return badSpec(opt, e);
+        } else
             return error.Usage;
     }
+    if (secrets) std.debug.print(
+        \\zsmbd: warning: logins on the command line are readable by other users of this host
+        \\  until startup finishes, and stay in your shell history and audit logs;
+        \\  prefer --users FILE or --users -.
+        \\
+    , .{});
+    if (c.db.users_stdin) {
+        const text = try readStdin(c);
+        defer freeSecret(c, text);
+        spec.addText("stdin", text, false) catch |e| return badSpec("--users -", e);
+        var has_web = false;
+        for (spec.logins.items) |l| has_web = has_web or l.web_hash.len > 0;
+        if (!has_web) std.debug.print("zsmbd: warning: no user on stdin has a web password, so nobody can sign in to the web console\n", .{});
+    }
+    for (spec.logins.items) |l| if (l.nt_hash != null and l.web_hash.len > 0) std.debug.print("zsmbd: warning: user {s}: {s}\n", .{ l.name, auth.Warning.both_passwords.text() });
+    try spec.apply(c.db);
+
     const addr = try parseAddr(web_addr, "127.0.0.1");
     const saddr = try parseAddr(smb_addr, "0.0.0.0");
 
@@ -345,6 +389,36 @@ fn serve(c: *Cli) !void {
 
     var admin: web.Admin = .{ .gpa = c.gpa, .io = c.io, .db = c.db };
     try admin.serve(addr);
+}
+
+/// Adds the login of `--user`, `--smb-user`, or `--web-user` to `spec`,
+/// printing the warnings about its password.
+fn addLogin(c: *Cli, spec: *ephemeral.Spec, opt: []const u8, value: []const u8) !void {
+    if (std.mem.eql(u8, opt, "--user")) return spec.addLine(value);
+    var it = (try spec.addPassword(c.io, value, if (std.mem.eql(u8, opt, "--smb-user")) .smb else .web)).iterator();
+    while (it.next()) |w| warn(w);
+}
+
+/// Reports a bad `--share`, `--user`, or login option; a usage error.
+fn badSpec(opt: []const u8, e: anyerror) error{Usage} {
+    std.debug.print("zsmbd: {s}: {s}\n", .{ opt, auth.describe(e) });
+    return error.Usage;
+}
+
+/// Blanks an argument in place: `args` point into the process's argv strings.
+fn wipe(arg: []const u8) void {
+    std.crypto.secureZero(u8, @constCast(arg));
+}
+
+const max_stdin = 1024 * 1024;
+
+/// All of stdin (the users file of `--users -`); the caller frees it.
+fn readStdin(c: *Cli) ![]u8 {
+    if (c.stdin == null) c.stdin = Io.File.stdin().reader(c.io, &c.stdin_buf);
+    return c.stdin.?.interface.allocRemaining(c.gpa, .limited(max_stdin)) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        else => return error.Store,
+    };
 }
 
 /// `[ADDR]:PORT` or `PORT`; a missing address is `default_host`.
