@@ -173,6 +173,40 @@ pub fn userName(gpa: Allocator, msg: []const u8) ?[]u8 {
 }
 
 /// `lookup` receives the user name (UTF-8) and returns the 16-byte NT hash.
+const av_flag_mic: u32 = 0x00000002;
+/// Offset of the MIC in an AUTHENTICATE message, after the version.
+const mic_off = 72;
+const mic_end = 88;
+
+/// The MsvAvFlags value among the AV pairs of an NTLMv2 blob (0 if none).
+fn avFlags(pairs: []const u8) u32 {
+    var i: usize = 0;
+    while (i + 4 <= pairs.len) {
+        const id = wire.get16(pairs, i);
+        const len = wire.get16(pairs, i + 2);
+        i += 4;
+        if (id == 0 or i + len > pairs.len) return 0;
+        if (id == 6 and len == 4) return wire.get32(pairs, i);
+        i += len;
+    }
+    return 0;
+}
+
+/// Whether the AUTHENTICATE MIC matches HMAC_MD5(ExportedSessionKey,
+/// NEGOTIATE || CHALLENGE || AUTHENTICATE with a zeroed MIC).
+fn validMic(s: *const Server, msg: []const u8, key: *const [16]u8) bool {
+    if (msg.len < mic_end or s.negotiate_msg.len == 0 or s.challenge_msg.len == 0) return false;
+    var want: [16]u8 = undefined;
+    var h = HmacMd5.init(key);
+    h.update(s.negotiate_msg);
+    h.update(s.challenge_msg);
+    h.update(msg[0..mic_off]);
+    h.update(&@as([16]u8, @splat(0)));
+    h.update(msg[mic_end..]);
+    h.final(&want);
+    return std.crypto.timing_safe.eql([16]u8, want, msg[mic_off..mic_end][0..16].*);
+}
+
 pub fn authenticate(
     s: *Server,
     msg: []const u8,
@@ -232,12 +266,21 @@ pub fn authenticate(
 
         var base: [16]u8 = undefined;
         HmacMd5.create(&base, proof, &owf);
+        // The exported session key is the base key, unless the client
+        // exchanged a random one (MS-NLMP 3.2.5.1.2): then it must have
+        // sent one, and it is used when signing or sealing was negotiated.
         var key = base;
-        if (flags & Flag.key_exch != 0 and enc_key.len == 16) {
-            @memcpy(&key, enc_key);
-            var rc = crypto.Rc4.init(&base);
-            rc.apply(&key);
+        if (flags & Flag.key_exch != 0) {
+            if (enc_key.len != 16) return error.Malformed;
+            if (flags & (Flag.sign | Flag.seal) != 0) {
+                @memcpy(&key, enc_key);
+                var rc = crypto.Rc4.init(&base);
+                rc.apply(&key);
+            }
         }
+        // A client that signs its messages says so in MsvAvFlags, and then
+        // the MIC covers all three messages.
+        if (avFlags(blob[28..]) & av_flag_mic != 0 and !validMic(s, msg, &key)) return error.LogonFailure;
         return .{ .user = user, .domain = domain, .workstation = ws, .anonymous = false, .session_key = key, .flags = flags };
     }
     return error.LogonFailure;
@@ -317,6 +360,154 @@ test "NTLMv2 verification (MS-NLMP 4.2.4 vectors)" {
     defer res.deinit(gpa);
     try std.testing.expectEqualStrings("User", res.user);
     try std.testing.expectEqualSlices(u8, &crypto.hex("8de40ccadbc14a82f15cb0ad0de95ca3"), &res.session_key);
+}
+
+/// An AUTHENTICATE message from user "User" (password "Password", domain
+/// "Domain") as a client builds it. `av_flags` goes in MsvAvFlags; when it
+/// has the MIC bit the MIC is filled in (and spoiled if `bad_mic`).
+/// `exchange` makes the client send a random session key (0x33...) with
+/// `key_len` bytes; the caller frees the result.
+fn testAuthenticate(gpa: Allocator, s: *Server, flags: u32, av_flags: ?u32, bad_mic: bool, key_len: usize) ![]u8 {
+    const hash = try crypto.ntHash(gpa, "Password");
+    var dom: std.ArrayList(u8) = .empty;
+    defer dom.deinit(gpa);
+    try wire.appendUtf16(gpa, &dom, "Domain");
+    var blob = wire.Buf.init(gpa);
+    defer blob.deinit();
+    try blob.bytes(&.{ 1, 1, 0, 0, 0, 0, 0, 0 });
+    try blob.zeros(8);
+    try blob.bytes(&crypto.hex("aaaaaaaaaaaaaaaa"));
+    try blob.zeros(4);
+    try avPair(&blob, 2, "Domain");
+    if (av_flags) |f| {
+        try blob.u16_(6);
+        try blob.u16_(4);
+        try blob.u32_(f);
+    }
+    try blob.u32_(0);
+    try blob.zeros(4);
+
+    const user_up = try wire.upperUtf16(gpa, "User");
+    defer gpa.free(user_up);
+    var owf: [16]u8 = undefined;
+    var h = HmacMd5.init(&hash);
+    h.update(user_up);
+    h.update(dom.items);
+    h.final(&owf);
+    var proof: [16]u8 = undefined;
+    var h2 = HmacMd5.init(&owf);
+    h2.update(&s.challenge);
+    h2.update(blob.items());
+    h2.final(&proof);
+    var base: [16]u8 = undefined;
+    HmacMd5.create(&base, &proof, &owf);
+
+    // What the client exports: the base key, or a random one it sends
+    // encrypted under the base key.
+    var exported = base;
+    var sent: [16]u8 = @splat(0x33);
+    if (flags & Flag.key_exch != 0) {
+        exported = sent;
+        var rc = crypto.Rc4.init(&base);
+        rc.apply(&sent);
+        if (flags & (Flag.sign | Flag.seal) == 0) exported = base;
+    }
+
+    var nt = wire.Buf.init(gpa);
+    defer nt.deinit();
+    try nt.bytes(&proof);
+    try nt.bytes(blob.items());
+    var m = wire.Buf.init(gpa);
+    errdefer m.deinit();
+    try m.bytes("NTLMSSP\x00");
+    try m.u32_(3);
+    const parts = [_][]const u8{ &.{}, nt.items(), dom.items, &.{ 'U', 0, 's', 0, 'e', 0, 'r', 0 }, &.{}, sent[0..key_len] };
+    var off: u32 = mic_end;
+    for (parts) |p| {
+        try m.u16_(@intCast(p.len));
+        try m.u16_(@intCast(p.len));
+        try m.u32_(off);
+        off += @intCast(p.len);
+    }
+    try m.u32_(flags);
+    try m.zeros(24);
+    for (parts) |p| try m.bytes(p);
+    const out = try m.list.toOwnedSlice(gpa);
+    if (av_flags) |f| if (f & av_flag_mic != 0) {
+        var mic: [16]u8 = undefined;
+        var hm = HmacMd5.init(&exported);
+        hm.update(s.negotiate_msg);
+        hm.update(s.challenge_msg);
+        hm.update(out);
+        hm.final(&mic);
+        @memcpy(out[mic_off..mic_end], &mic);
+        if (bad_mic) out[mic_off] ^= 1;
+    };
+    return out;
+}
+
+fn testServer(gpa: Allocator) !Server {
+    return .{
+        .gpa = gpa,
+        .challenge = crypto.hex("0123456789abcdef"),
+        .negotiate_msg = try gpa.dupe(u8, "NTLMSSP-negotiate"),
+        .challenge_msg = try gpa.dupe(u8, "NTLMSSP-challenge"),
+    };
+}
+
+test "the AUTHENTICATE MIC is verified when the client says it sent one" {
+    const gpa = std.testing.allocator;
+    var s = try testServer(gpa);
+    defer s.deinit();
+    const lk: TestLookup = .{ .hash = try crypto.ntHash(gpa, "Password") };
+    const plain = Flag.unicode | Flag.extended_session_security | Flag.ntlm;
+
+    const good = try testAuthenticate(gpa, &s, plain, av_flag_mic, false, 16);
+    defer gpa.free(good);
+    var res = try authenticate(&s, good, &lk, TestLookup.get);
+    res.deinit(gpa);
+
+    const bad = try testAuthenticate(gpa, &s, plain, av_flag_mic, true, 16);
+    defer gpa.free(bad);
+    try std.testing.expectError(error.LogonFailure, authenticate(&s, bad, &lk, TestLookup.get));
+
+    // A different NEGOTIATE than the one the MIC covers.
+    gpa.free(s.negotiate_msg);
+    s.negotiate_msg = try gpa.dupe(u8, "NTLMSSP-tampered");
+    try std.testing.expectError(error.LogonFailure, authenticate(&s, good, &lk, TestLookup.get));
+
+    // No MIC claimed, none checked.
+    const none = try testAuthenticate(gpa, &s, plain, null, false, 16);
+    defer gpa.free(none);
+    var r2 = try authenticate(&s, none, &lk, TestLookup.get);
+    r2.deinit(gpa);
+}
+
+test "a random session key is exchanged only with signing or sealing" {
+    const gpa = std.testing.allocator;
+    var s = try testServer(gpa);
+    defer s.deinit();
+    const lk: TestLookup = .{ .hash = try crypto.ntHash(gpa, "Password") };
+    const plain = Flag.unicode | Flag.extended_session_security | Flag.ntlm;
+    const random: [16]u8 = @splat(0x33);
+
+    const signed = try testAuthenticate(gpa, &s, plain | Flag.key_exch | Flag.sign, av_flag_mic, false, 16);
+    defer gpa.free(signed);
+    var r1 = try authenticate(&s, signed, &lk, TestLookup.get);
+    defer r1.deinit(gpa);
+    try std.testing.expectEqualSlices(u8, &random, &r1.session_key);
+
+    // Key exchange without sign or seal keeps the base key.
+    const unsigned = try testAuthenticate(gpa, &s, plain | Flag.key_exch, av_flag_mic, false, 16);
+    defer gpa.free(unsigned);
+    var r2 = try authenticate(&s, unsigned, &lk, TestLookup.get);
+    defer r2.deinit(gpa);
+    try std.testing.expect(!std.mem.eql(u8, &random, &r2.session_key));
+
+    // Key exchange needs a key of 16 bytes.
+    const short = try testAuthenticate(gpa, &s, plain | Flag.key_exch | Flag.sign, null, false, 8);
+    defer gpa.free(short);
+    try std.testing.expectError(error.Malformed, authenticate(&s, short, &lk, TestLookup.get));
 }
 
 /// A minimal AUTHENTICATE message for user "user" with an NTLMv2-sized

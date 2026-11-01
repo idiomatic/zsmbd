@@ -699,6 +699,11 @@ response, and derives the session key and the SMB keys.
 - `ntlm.zig` builds the CHALLENGE with NetBIOS and DNS names and a timestamp,
   then verifies AUTHENTICATE. Only NTLMv2 responses are accepted; an NT
   response shorter than an NTLMv2 blob fails with `STATUS_LOGON_FAILURE`.
+  When the blob's `MsvAvFlags` says the client sent a MIC, the AUTHENTICATE
+  MIC (HMAC-MD5 of the exported session key over the NEGOTIATE, CHALLENGE,
+  and AUTHENTICATE messages) must verify. A random session key (key exchange)
+  is used only with sign or seal and must be 16 bytes; otherwise the
+  logon fails.
   The proof is computed against the domain as sent, upper-cased, and empty,
   since clients differ. Comparison is constant-time. With key exchange, the
   exported session key is RC4-decrypted with the base key.
@@ -1194,6 +1199,7 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 | macOS 15 interop | Keys and signatures verified independently from a capture. `smbutil view` lists shares through `srvsvc` on port 445; on any other port it fails ("Broken pipe", RPC error `0x16c9a042`) because macOS's RPC layer dials 445 for the pipe. Windows and Linux clients are untested. |
 | `web.Live` over `server.Server` | Written: activity, kick, and settings reload, with unit tests and a live run (a raw TCP client listed, kicked, and gone; a settings save reloaded), and a macOS `mount_smbfs` session and tree appeared and vanished on unmount. |
 | `web/index.html` | Sign-in and SMB password form; the rest is still to come. |
+| CI | Green on Fedora and Alpine (x86_64 and aarch64) and macOS: build, unit tests, Linux type checks, and a coverage-guided fuzz run. No real Linux or Windows client is involved. |
 
 Planned order of work:
 

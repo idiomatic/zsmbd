@@ -1,5 +1,7 @@
 # zsmbd
 
+[![CI](https://github.com/idiomatic/zsmbd/actions/workflows/ci.yml/badge.svg)](https://github.com/idiomatic/zsmbd/actions/workflows/ci.yml)
+
 A small SMB 3.1.1 file server for Linux and macOS hosts, written in Zig. One
 binary holds the SMB server, an admin web console, and a command-line tool.
 It has four settings, all with working defaults.
@@ -12,9 +14,10 @@ It has four settings, all with working defaults.
 >
 > Significant portions of this code have been authored by AI.
 
-> **Status:** early. macOS 15 mounts and reads a share; Windows and Linux
-> clients are untested, and the web console is minimal. See
-> [ARCHITECTURE.md](ARCHITECTURE.md) section 13.
+> **Status:** early. macOS 15 mounts and reads a share. CI builds and tests
+> on Fedora and Alpine (x86_64 and aarch64) and macOS, and fuzzes the
+> parsers, but no Linux or Windows client has connected yet, and the web
+> console is minimal. See [ARCHITECTURE.md](ARCHITECTURE.md) section 13.
 
 ## Features
 
