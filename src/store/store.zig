@@ -224,19 +224,6 @@ pub const Db = struct {
         return db.sqlite.?.countWebUsers();
     }
 
-    /// Everyone who can sign in to the web console now, stored or ephemeral.
-    pub fn countWebLogins(db: *Db) Error!i64 {
-        const stored = try db.countWebUsers();
-        db.mutex.lockUncancelable(db.io);
-        defer db.mutex.unlock(db.io);
-        var n = stored;
-        const e = db.ephemeral orelse return n;
-        for (e.users.items) |u| {
-            if (u.web_hash.len > 0) n += 1;
-        }
-        return n;
-    }
-
     /// Stored users, then ephemeral ones, which hide stored users of the
     /// same name; sorted by name.
     pub fn listUsers(db: *Db, gpa: Allocator) Error![]User {

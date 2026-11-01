@@ -293,19 +293,16 @@ test "applied entries shadow stored ones and change like stored ones" {
     try testing.expect((try db.ntHash("hal")) != null);
     try auth.revokePasswords(testing.allocator, testing.io, &db, "hal", true, false);
     try testing.expectEqual(null, try db.ntHash("hal"));
-    // hal's web login may go while another (stored) login remains, but the
-    // last login of either kind may not.
     try auth.revokePasswords(testing.allocator, testing.io, &db, "hal", false, true);
-    try testing.expectEqual(@as(i64, 1), try db.countWebLogins());
     try testing.expect(!db.hasEphemeralWebLogin());
     // Deleting the ephemeral user reveals the stored one it hid.
     try auth.deleteUser(testing.allocator, &db, "hal");
     try testing.expect(!db.isEphemeralUser("hal"));
     try testing.expect((try db.ntHash("hal")) != null);
-    // Stored entries still change, and the guard counts stored web users only.
+    // Stored entries still change.
     try testing.expect(try db.deleteShare("kept"));
-    try testing.expectEqual(@as(i64, 1), try db.countWebUsers());
-    try testing.expectError(error.LastWebUser, auth.deleteUser(testing.allocator, &db, "art"));
+    try auth.deleteUser(testing.allocator, &db, "art");
+    try testing.expectEqual(@as(i64, 0), try db.countWebUsers());
 }
 
 test "users from stdin are the only users" {
@@ -339,8 +336,6 @@ test "users from stdin are the only users" {
     try testing.expect(admin.web_hash.len > 0 and !admin.has_smb);
     try testing.expectEqual(null, try db.ntHash("admin"));
     try testing.expectEqual(null, try auth.bootstrap(testing.allocator, testing.io, &db, &pw));
-    // The ephemeral admin is the only web login: its password can change but not go.
-    try testing.expectError(error.LastWebUser, auth.revokePasswords(testing.allocator, testing.io, &db, "admin", false, true));
     const ws = try auth.grantPasswords(testing.allocator, testing.io, &db, "admin", .{ .web = "another long and unusual passphrase 5" });
     try testing.expect(ws.contains(.ephemeral));
     const users = try db.listUsers(testing.allocator);

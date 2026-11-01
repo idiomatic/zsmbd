@@ -37,6 +37,8 @@ pub const usage =
     \\  share guest SHARE              allow guests (no sign-in)
     \\  share noguest SHARE
     \\  share del SHARE
+    \\  web start [[ADDR:]PORT]        start the web console of a running serve
+    \\  web stop                       stop it
     \\  get [KEY]                      show settings
     \\  set KEY VALUE
     \\  hash [--web] [LOGIN]           hash an SMB (or web) password; with LOGIN,
@@ -70,7 +72,7 @@ pub const usage =
 ;
 
 /// The commands `run` takes, so main can reject others before opening a store.
-pub const commands = [_][]const u8{ "serve", "user", "share", "get", "set", "hash", "help" };
+pub const commands = [_][]const u8{ "serve", "user", "share", "web", "get", "set", "hash", "help" };
 
 pub fn isCommand(s: []const u8) bool {
     for (commands) |x| if (std.mem.eql(u8, x, s)) return true;
@@ -125,6 +127,7 @@ pub fn run(c: *Cli) !void {
     if (std.mem.eql(u8, cmd, "serve")) return serve(c);
     if (std.mem.eql(u8, cmd, "user")) return userCmd(c);
     if (std.mem.eql(u8, cmd, "share")) return shareCmd(c);
+    if (std.mem.eql(u8, cmd, "web")) return webCmd(c);
     if (std.mem.eql(u8, cmd, "get")) return getCmd(c);
     if (std.mem.eql(u8, cmd, "hash")) return hashCmd(c);
     if (std.mem.eql(u8, cmd, "set")) {
@@ -315,12 +318,44 @@ fn tell(c: *Cli, verb: []const u8, name: []const u8) void {
     const path = c.control orelse return;
     var line: [control.max_line]u8 = undefined;
     const text = if (name.len == 0) verb else std.fmt.bufPrint(&line, "{s} {s}", .{ verb, name }) catch return;
-    switch (control.notify(c.io, path, text)) {
+    var reply: [control.reply_max]u8 = undefined;
+    switch (control.notify(c.io, path, text, &reply)) {
         .done => |n| if (n > 0) std.debug.print("zsmbd: {s}: {d} connection{s} dropped; each reconnects under the new rules\n", .{ name, n, if (n == 1) "" else "s" }),
         .no_server => {},
+        .text => {},
+        .refused => |why| std.debug.print("zsmbd: warning: a running server refused to be told: {s}\n", .{why}),
         .denied => std.debug.print("zsmbd: warning: a running server was not told (permission denied on {s}); the change reaches clients on their next connection\n", .{path}),
         .failed => |why| std.debug.print("zsmbd: warning: a running server was not told: {s}\n", .{why}),
     }
+}
+
+/// `web start [[ADDR:]PORT]` and `web stop`, sent to a running `serve`.
+fn webCmd(c: *Cli) !void {
+    const sub = try c.need();
+    var line: [control.max_line]u8 = undefined;
+    const text: []const u8 = if (std.mem.eql(u8, sub, "stop")) blk: {
+        if (c.next() != null) return error.Usage;
+        break :blk "web stop";
+    } else if (std.mem.eql(u8, sub, "start")) blk: {
+        const arg = c.next();
+        if (c.next() != null) return error.Usage;
+        break :blk if (arg) |a| (std.fmt.bufPrint(&line, "web start {s}", .{a}) catch return error.Usage) else "web start";
+    } else return error.Usage;
+    const path = c.control orelse return webFail("no control socket for this store (give --socket PATH)");
+    var reply: [control.reply_max]u8 = undefined;
+    switch (control.notify(c.io, path, text, &reply)) {
+        .text => |t| try c.out.print("{s}\n", .{t}),
+        .done => try c.out.print("done\n", .{}),
+        .no_server => return webFail("no server is running on this store"),
+        .denied => return webFail("permission denied on the control socket"),
+        .refused => |t| return webFail(t),
+        .failed => |why| return webFail(why),
+    }
+}
+
+fn webFail(why: []const u8) noreturn {
+    std.debug.print("zsmbd: {s}\n", .{why});
+    std.process.exit(1);
 }
 
 fn getCmd(c: *Cli) !void {
@@ -418,20 +453,6 @@ fn serve(c: *Cli) !void {
     };
     defer listener.deinit(c.io);
     std.log.info("zsmbd: SMB on {f} as {s}", .{ saddr, srv.cfg.server_name });
-    var control_socket: ?*control.Listener = null;
-    if (c.control) |path| {
-        if (control.Listener.start(c.gpa, c.io, path, .{ .ctx = &srv, .share = ctlShare, .user = ctlUser, .settings = ctlSettings })) |l| {
-            control_socket = l;
-            std.log.info("zsmbd: control socket {s}", .{path});
-        } else |e| std.log.warn("no control socket at {s}: {s}; CLI changes reach clients on their next connection", .{ path, @errorName(e) });
-    }
-    defer if (control_socket) |l| l.stop();
-    if (web_off) {
-        std.log.info("zsmbd: no web console (give --web PORT to start it)", .{});
-        return srv.acceptLoop(&listener);
-    }
-    const smb_thread = try std.Thread.spawn(.{}, smb_server.Server.acceptLoop, .{ &srv, &listener });
-    smb_thread.detach();
 
     var admin: web.Admin = .{ .gpa = c.gpa, .io = c.io, .db = c.db, .live = .{
         .ctx = &srv,
@@ -441,7 +462,60 @@ fn serve(c: *Cli) !void {
         .shareChanged = liveShareChanged,
         .userChanged = liveUserChanged,
     } };
-    try admin.serve(addr.?);
+    var sv: Serving = .{ .c = c, .srv = &srv, .admin = &admin };
+
+    var control_socket: ?*control.Listener = null;
+    if (c.control) |path| {
+        if (control.Listener.start(c.gpa, c.io, path, .{ .ctx = &sv, .share = ctlShare, .user = ctlUser, .settings = ctlSettings, .web = ctlWeb })) |l| {
+            control_socket = l;
+            std.log.info("zsmbd: control socket {s}", .{path});
+        } else |e| std.log.warn("no control socket at {s}: {s}; CLI changes reach clients on their next connection", .{ path, @errorName(e) });
+    }
+    defer if (control_socket) |l| l.stop();
+    if (addr) |a| try admin.start(a) else std.log.info("zsmbd: no web console (give --web PORT to start it)", .{});
+    return srv.acceptLoop(&listener);
+}
+
+/// What the control socket's hooks need: the SMB server, the web console,
+/// and the command line's store.
+const Serving = struct { c: *Cli, srv: *smb_server.Server, admin: *web.Admin };
+
+fn serving(ctx: ?*anyopaque) *Serving {
+    return @ptrCast(@alignCast(ctx.?));
+}
+
+fn ctlShare(ctx: ?*anyopaque, name: []const u8) usize {
+    return serving(ctx).srv.reconcileShare(name);
+}
+
+fn ctlUser(ctx: ?*anyopaque, name: []const u8) usize {
+    const s = serving(ctx);
+    s.admin.userChanged(name);
+    return s.srv.reconcileUser(name);
+}
+
+fn ctlSettings(ctx: ?*anyopaque) void {
+    liveReload(serving(ctx).srv);
+}
+
+/// `web start [[ADDR:]PORT]` and `web stop`. Starting with no web login
+/// makes the ephemeral or stored `admin`, whose password goes in the reply.
+fn ctlWeb(ctx: ?*anyopaque, start: bool, arg: ?[]const u8, buf: []u8) control.Reply {
+    const s = serving(ctx);
+    if (!start) return .{ .text = if (s.admin.stop()) "web console stopped" else "web console was not running" };
+    if (s.admin.isRunning()) return .{ .err = "the web console is already running" };
+    const addr = if (arg) |a|
+        parseAddr(a, "127.0.0.1") catch return .{ .err = "expected [ADDR:]PORT" }
+    else
+        s.admin.last_addr orelse return .{ .err = "give a PORT: the web console has no default port" };
+    var pw_buf: [16]u8 = undefined;
+    const boot = auth.bootstrap(s.c.gpa, s.c.io, s.c.db, &pw_buf) catch |e| return .{ .err = @errorName(e) };
+    s.admin.start(addr) catch |e| return .{ .err = @errorName(e) };
+    const text = if (boot) |b|
+        std.fmt.bufPrint(buf, "web console on http://{f}/ ; no web login, so user admin got the web password {s} (shown once{s})", .{ addr, b.password, if (b.ephemeral) ", gone when zsmbd exits" else "" })
+    else
+        std.fmt.bufPrint(buf, "web console on http://{f}/", .{addr});
+    return .{ .text = text catch "web console started" };
 }
 
 // The admin web server reaches the SMB server only through these hooks
@@ -457,18 +531,6 @@ fn liveActivity(ctx: ?*anyopaque, gpa: Allocator, w: *Io.Writer) anyerror!void {
 
 fn liveKick(ctx: ?*anyopaque, conn_id: u64) bool {
     return liveServer(ctx).kick(conn_id);
-}
-
-fn ctlShare(ctx: ?*anyopaque, name: []const u8) usize {
-    return liveServer(ctx).reconcileShare(name);
-}
-
-fn ctlUser(ctx: ?*anyopaque, name: []const u8) usize {
-    return liveServer(ctx).reconcileUser(name);
-}
-
-fn ctlSettings(ctx: ?*anyopaque) void {
-    liveReload(ctx);
 }
 
 fn liveShareChanged(ctx: ?*anyopaque, share: []const u8) usize {

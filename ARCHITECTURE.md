@@ -354,12 +354,8 @@ stored part:
   adds the `ephemeral` warning to such responses (`isEphemeralUser`,
   `isEphemeralShare`); the change ends with the process. Only the web console
   can do this, because the CLI is another process with its own store.
-  `revokePasswords` and `deleteUser` keep one web login while running,
-  counting stored and ephemeral logins (`Db.countWebLogins`). Lists mark
-  them `ephemeral`.
-- `countWebUsers` counts stored users only, so the last-web-user guard can't
-  depend on something a restart drops; `bootstrap` creates no `admin` when an
-  ephemeral web login exists.
+  Lists mark them `ephemeral`.
+- `bootstrap` creates no `admin` when an ephemeral web login exists.
 - `--users -` (global flag, `serve` only; the last `--users` wins) sets
   `Db.users_stdin`: there are no stored users, so the users read from stdin,
   and any the web console creates, are ephemeral (the layer is made when the
@@ -447,8 +443,12 @@ checked, so the CLI and the web API apply identical rules.
 - **Passwords** may be any non-empty string; weak ones produce a warning
   (section 4, "Password strength"). Each is set (`auth.grantPasswords`) or
   cleared (`auth.revokePasswords`) on its own.
-- **Safeguards.** The last user with a web password can't be deleted or lose
-  it, so the web console can never lock itself out.
+- **Last login.** Any web login may be deleted or lose its password. When
+  none is left (`Admin.stopIfNoLogins`), the console stops after replying,
+  ends every session, and closes its listener; `web start` (control socket)
+  brings it back and runs `bootstrap`. Changes from the CLI reach the
+  console through `Admin.userChanged`, which ends the user's sessions if
+  they lost the web password.
 - **Bootstrap.** When nobody can sign in to the web console, `serve` gives
   user `admin` (creating it if missing) a random 16-character web password
   from an unambiguous alphabet, and prints the password once to stderr. An
@@ -1023,6 +1023,8 @@ access that tightened (the rule of the previous section).
   share NAME      -> ok N | err TEXT
   user NAME       -> ok N | err TEXT
   settings        -> ok 0 | err TEXT
+  web start [[ADDR:]PORT] -> msg TEXT | err TEXT
+  web stop        -> msg TEXT
   ```
 
   `N` is the number of connections dropped. The request names what changed
@@ -1031,7 +1033,10 @@ access that tightened (the rule of the previous section).
   rows keep each tree's share, configured path, and read-only flag), so a
   request can't make the server do more than re-check. `user` drops a
   user's connections only if they lost their SMB password or were deleted.
-  New verbs (a log level, shutdown) would be added to `parse` and `Hooks`.
+  `web` starts or stops the console (`Admin.start`/`stop`; a new listener
+  thread per start, `generation` ending old keep-alive connections); an
+  omitted address reuses `Admin.last_addr`. New verbs (a log level,
+  shutdown) would be added to `parse` and `Hooks`.
 - **CLI.** After `share`, `user`, and `set` commands, the CLI sends the
   matching line and prints only when something was dropped (or a warning if
   the socket exists but refuses it). With no server it prints nothing.

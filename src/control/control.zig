@@ -7,8 +7,11 @@
 //!     share NAME   a share changed or was deleted
 //!     user NAME    a user changed or was deleted
 //!     settings     reload the settings
+//!     web start [[ADDR:]PORT]   start the web console
+//!     web stop     stop the web console
 //!
 //!     ok N         done; N connections were dropped
+//!     msg TEXT     done; TEXT is for the person at the CLI
 //!     err TEXT     refused
 //!
 //! The server never trusts the line for what changed: it re-reads the store.
@@ -30,12 +33,23 @@ pub const Request = union(enum) {
     share: []const u8,
     user: []const u8,
     settings,
+    /// The address argument, if any.
+    web_start: ?[]const u8,
+    web_stop,
 };
 
 /// One request line, without its newline; null when it isn't a command.
 pub fn parse(line: []const u8) ?Request {
     const l = std.mem.trimEnd(u8, line, "\r");
     if (std.mem.eql(u8, l, "settings")) return .settings;
+    if (std.mem.eql(u8, l, "web stop")) return .web_stop;
+    if (std.mem.eql(u8, l, "web start")) return .{ .web_start = null };
+    if (std.mem.startsWith(u8, l, "web start ")) {
+        const arg = l[10..];
+        if (arg.len == 0 or arg.len > 64) return null;
+        for (arg) |ch| if (ch <= 0x20 or ch == 0x7f) return null;
+        return .{ .web_start = arg };
+    }
     const space = std.mem.indexOfScalar(u8, l, ' ') orelse return null;
     const arg = l[space + 1 ..];
     if (arg.len == 0 or arg.len > 128) return null;
@@ -47,6 +61,8 @@ pub fn parse(line: []const u8) ?Request {
 
 pub const Reply = union(enum) {
     ok: usize,
+    /// Done, with a message for the person at the CLI.
+    text: []const u8,
     err: []const u8,
 };
 
@@ -54,13 +70,20 @@ pub const Reply = union(enum) {
 pub fn formatReply(buf: []u8, r: Reply) []const u8 {
     return switch (r) {
         .ok => |n| std.fmt.bufPrint(buf, "ok {d}\n", .{n}) catch "err reply\n",
+        .text => |t| std.fmt.bufPrint(buf, "msg {s}\n", .{oneLine(t)}) catch "err reply\n",
         .err => |t| std.fmt.bufPrint(buf, "err {s}\n", .{t}) catch "err reply\n",
     };
+}
+
+/// Replies are one line: a message stops at its first newline.
+fn oneLine(t: []const u8) []const u8 {
+    return t[0 .. std.mem.indexOfScalar(u8, t, '\n') orelse t.len];
 }
 
 pub fn parseReply(line: []const u8) ?Reply {
     const l = std.mem.trimEnd(u8, line, "\r\n");
     if (std.mem.startsWith(u8, l, "ok ")) return .{ .ok = std.fmt.parseInt(usize, l[3..], 10) catch return null };
+    if (std.mem.startsWith(u8, l, "msg ")) return .{ .text = l[4..] };
     if (std.mem.startsWith(u8, l, "err ")) return .{ .err = l[4..] };
     return null;
 }
@@ -72,10 +95,16 @@ pub const Hooks = struct {
     share: *const fn (ctx: ?*anyopaque, name: []const u8) usize,
     user: *const fn (ctx: ?*anyopaque, name: []const u8) usize,
     settings: *const fn (ctx: ?*anyopaque) void,
+    /// Starts (with an optional address) or stops the web console; the
+    /// reply text, if any, is written to `buf`.
+    web: *const fn (ctx: ?*anyopaque, start: bool, addr: ?[]const u8, buf: []u8) Reply,
 };
 
+/// Room for the longest reply line.
+pub const reply_max = 320;
+
 /// Runs one request line against the hooks.
-pub fn handle(h: Hooks, line: []const u8) Reply {
+pub fn handle(h: Hooks, line: []const u8, buf: []u8) Reply {
     const req = parse(line) orelse return .{ .err = "unknown command" };
     return switch (req) {
         .share => |name| .{ .ok = h.share(h.ctx, name) },
@@ -84,6 +113,8 @@ pub fn handle(h: Hooks, line: []const u8) Reply {
             h.settings(h.ctx);
             break :blk .{ .ok = 0 };
         },
+        .web_start => |addr| h.web(h.ctx, true, addr, buf),
+        .web_stop => h.web(h.ctx, false, null, buf),
     };
 }
 
@@ -210,13 +241,14 @@ fn serveOne(l: *Listener, stream: net.Stream) void {
     if (uid != 0 and uid != std.c.geteuid()) return;
     setTimeouts(fd);
     var rbuf: [max_line + 1]u8 = undefined;
+    var text: [reply_max]u8 = undefined;
     var r = stream.reader(l.io, &rbuf);
     const reply: Reply = if (r.interface.takeDelimiter('\n')) |maybe|
-        (if (maybe) |line| handle(l.hooks, line) else Reply{ .err = "empty request" })
+        (if (maybe) |line| handle(l.hooks, line, &text) else Reply{ .err = "empty request" })
     else |_|
         Reply{ .err = "bad request" };
-    var out: [96]u8 = undefined;
-    var wbuf: [96]u8 = undefined;
+    var out: [reply_max + 8]u8 = undefined;
+    var wbuf: [reply_max + 8]u8 = undefined;
     var w = stream.writer(l.io, &wbuf);
     w.interface.writeAll(formatReply(&out, reply)) catch return;
     w.interface.flush() catch {};
@@ -229,6 +261,10 @@ pub const Result = union(enum) {
     done: usize,
     /// Nothing is listening: no server is running. Not a problem.
     no_server,
+    /// The server did it and has this to say (in the caller's buffer).
+    text: []const u8,
+    /// The server refused, with this reason (in the caller's buffer).
+    refused: []const u8,
     /// The socket exists but this user may not use it.
     denied,
     /// Anything else, as text.
@@ -236,7 +272,8 @@ pub const Result = union(enum) {
 };
 
 /// Sends `line` to the server at `path` and waits (briefly) for its reply.
-pub fn notify(io: Io, path: []const u8, line: []const u8) Result {
+/// Text in the result lives in `buf`, which should hold `reply_max` bytes.
+pub fn notify(io: Io, path: []const u8, line: []const u8, buf: []u8) Result {
     const ua = net.UnixAddress.init(path) catch return .{ .failed = "the control path is too long" };
     const stream = ua.connect(io) catch |e| return switch (e) {
         error.FileNotFound, error.ConnectionRefused, error.NotDir => .no_server,
@@ -249,14 +286,21 @@ pub fn notify(io: Io, path: []const u8, line: []const u8) Result {
     var w = stream.writer(io, &wbuf);
     w.interface.print("{s}\n", .{line}) catch return .{ .failed = "could not send" };
     w.interface.flush() catch return .{ .failed = "could not send" };
-    var rbuf: [96]u8 = undefined;
+    var rbuf: [reply_max + 8]u8 = undefined;
     var r = stream.reader(io, &rbuf);
     const got = r.interface.takeDelimiter('\n') catch return .{ .failed = "no reply (timed out?)" };
     const reply = parseReply(got orelse return .{ .failed = "no reply" }) orelse return .{ .failed = "unreadable reply" };
     return switch (reply) {
         .ok => |n| .{ .done = n },
-        .err => .{ .failed = "the server refused the request" },
+        .text => |t| .{ .text = keep(buf, t) },
+        .err => |t| .{ .refused = keep(buf, t) },
     };
+}
+
+fn keep(buf: []u8, t: []const u8) []const u8 {
+    const n = @min(buf.len, t.len);
+    @memcpy(buf[0..n], t[0..n]);
+    return buf[0..n];
 }
 
 // ---------------------------------------------------------------- tests
@@ -269,6 +313,11 @@ test "requests parse, and everything else is refused" {
     try testing.expectEqualStrings("hal 9000", parse("user hal 9000\r").?.user);
     try testing.expect(parse("settings").? == .settings);
     try testing.expect(parse("settings now") == null);
+    try testing.expect(parse("web stop").? == .web_stop);
+    try testing.expect(parse("web start").?.web_start == null);
+    try testing.expectEqualStrings("[::1]:8445", parse("web start [::1]:8445").?.web_start.?);
+    try testing.expect(parse("web start a b") == null);
+    try testing.expect(parse("web restart") == null);
     try testing.expect(parse("share") == null);
     try testing.expect(parse("share ") == null);
     try testing.expect(parse("shutdown now") == null);
@@ -282,6 +331,8 @@ test "replies round trip" {
     try testing.expectEqualStrings("ok 3\n", formatReply(&buf, .{ .ok = 3 }));
     try testing.expectEqual(@as(usize, 3), parseReply("ok 3\n").?.ok);
     try testing.expectEqualStrings("no", parseReply("err no\n").?.err);
+    try testing.expectEqualStrings("hi", formatReply(&buf, .{ .text = "hi\nthere" })[4..6]);
+    try testing.expectEqualStrings("hi", parseReply("msg hi\n").?.text);
     try testing.expect(parseReply("ok x") == null);
     try testing.expect(parseReply("what") == null);
 }
@@ -315,19 +366,27 @@ const Count = struct {
     fn settings(ctx: ?*anyopaque) void {
         from(ctx).reloads += 1;
     }
+    fn web(_: ?*anyopaque, start: bool, addr: ?[]const u8, buf: []u8) Reply {
+        if (!start) return .{ .text = "stopped" };
+        return .{ .text = std.fmt.bufPrint(buf, "up on {s}", .{addr orelse "?"}) catch "?" };
+    }
     fn hooks(c: *Count) Hooks {
-        return .{ .ctx = c, .share = share, .user = user, .settings = settings };
+        return .{ .ctx = c, .share = share, .user = user, .settings = settings, .web = web };
     }
 };
 
 test "requests run the hooks" {
     var c: Count = .{};
     const h = c.hooks();
-    try testing.expectEqual(@as(usize, 2), handle(h, "share docs").ok);
+    var hb: [reply_max]u8 = undefined;
+    try testing.expectEqual(@as(usize, 2), handle(h, "share docs", &hb).ok);
     try testing.expectEqualStrings("docs", c.last[0..c.last_len]);
-    try testing.expectEqual(@as(usize, 1), handle(h, "user art").ok);
-    try testing.expectEqual(@as(usize, 0), handle(h, "settings").ok);
-    try testing.expectEqualStrings("unknown command", handle(h, "reboot").err);
+    try testing.expectEqual(@as(usize, 1), handle(h, "user art", &hb).ok);
+    try testing.expectEqual(@as(usize, 0), handle(h, "settings", &hb).ok);
+    try testing.expectEqualStrings("unknown command", handle(h, "reboot", &hb).err);
+    try testing.expectEqualStrings("up on 127.0.0.1:9", handle(h, "web start 127.0.0.1:9", &hb).text);
+    try testing.expectEqualStrings("up on ?", handle(h, "web start", &hb).text);
+    try testing.expectEqualStrings("stopped", handle(h, "web stop", &hb).text);
     try testing.expectEqual(@as(usize, 1), c.shares);
     try testing.expectEqual(@as(usize, 1), c.users);
     try testing.expectEqual(@as(usize, 1), c.reloads);
@@ -363,8 +422,9 @@ test "a client reaches a listening server; stale sockets are replaced" {
     const path = try tmpSocket(&tmp, &pbuf);
     if (path.len > max_path) return error.SkipZigTest;
 
+    var nb: [reply_max]u8 = undefined;
     // Nobody listening.
-    try testing.expect(notify(testing.io, path, "settings") == .no_server);
+    try testing.expect(notify(testing.io, path, "settings", &nb) == .no_server);
 
     var c: Count = .{};
     const l = try Listener.start(testing.allocator, testing.io, path, c.hooks());
@@ -376,11 +436,13 @@ test "a client reaches a listening server; stale sockets are replaced" {
     const st = try tmp.dir.statFile(testing.io, "c.sock", .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
 
-    try testing.expectEqual(@as(usize, 2), notify(testing.io, path, "share docs").done);
+    try testing.expectEqual(@as(usize, 2), notify(testing.io, path, "share docs", &nb).done);
     try testing.expectEqualStrings("docs", c.last[0..c.last_len]);
-    try testing.expectEqual(@as(usize, 1), notify(testing.io, path, "user art").done);
-    try testing.expectEqual(@as(usize, 0), notify(testing.io, path, "settings").done);
-    try testing.expect(notify(testing.io, path, "reboot") == .failed);
+    try testing.expectEqual(@as(usize, 1), notify(testing.io, path, "user art", &nb).done);
+    try testing.expectEqual(@as(usize, 0), notify(testing.io, path, "settings", &nb).done);
+    try testing.expect(notify(testing.io, path, "reboot", &nb) == .refused);
+    try testing.expectEqualStrings("up on 8445", notify(testing.io, path, "web start 8445", &nb).text);
+    try testing.expectEqualStrings("stopped", notify(testing.io, path, "web stop", &nb).text);
     try testing.expectEqual(@as(usize, 1), c.reloads);
 
     // A second server on a live socket refuses to start.
@@ -406,7 +468,8 @@ test "fuzz: control requests and replies" {
         fn one(_: void, in: []const u8) !void {
             if (parse(in)) |req| switch (req) {
                 .share, .user => |name| try testing.expect(name.len > 0 and name.len <= 128),
-                .settings => {},
+                .settings, .web_stop => {},
+                .web_start => |a| if (a) |x| try testing.expect(x.len > 0 and x.len <= 64),
             };
             _ = parseReply(in);
         }

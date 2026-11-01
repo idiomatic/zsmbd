@@ -48,7 +48,6 @@ pub fn describe(err: anyerror) []const u8 {
         error.InvalidPath => "the share path may not contain control characters",
         error.InvalidComment => "share comments are at most 256 characters, without control characters",
         error.InvalidSetting => "unknown setting or invalid value",
-        error.LastWebUser => "at least one user must keep a web password, so the web console stays reachable",
         error.InvalidPassword => "give the SMB password either as a password or as a 32-digit hex NT hash, not both",
         error.InvalidNtHash => "an NT hash is 32 hexadecimal digits",
         error.NotFound => "not found",
@@ -242,27 +241,17 @@ pub fn grantPasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, pw: Pas
 }
 
 /// Clear a user's SMB password, web password, or both, closing those
-/// services to them. The last web password can't be cleared.
+/// services to them.
 pub fn revokePasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, smb: bool, web: bool) !void {
     const u = (try db.userAuth(gpa, name)) orelse return error.NotFound;
     defer u.free(gpa);
-    // An ephemeral user can't lock the console out for good, but keep one
-    // web login while running: count both kinds.
-    if (web and u.web_hash.len > 0) {
-        const logins = if (db.isEphemeralUser(u.name)) try db.countWebLogins() else try db.countWebUsers();
-        if (logins <= 1) return error.LastWebUser;
-    }
     try db.putUser(u.name, if (smb) .clear else .keep, if (web) .clear else .keep, nowSeconds(io));
 }
 
-/// Delete a user, refusing to remove the last web console user.
+/// Delete a user.
 pub fn deleteUser(gpa: Allocator, db: *Db, name: []const u8) !void {
     const u = (try db.userAuth(gpa, name)) orelse return error.NotFound;
     defer u.free(gpa);
-    if (u.web_hash.len > 0) {
-        const logins = if (db.isEphemeralUser(u.name)) try db.countWebLogins() else try db.countWebUsers();
-        if (logins <= 1) return error.LastWebUser;
-    }
     _ = try db.deleteUser(name);
 }
 
@@ -384,11 +373,9 @@ test "passwords open and close each service" {
     try std.testing.expect((try db.ntHash("cal")) == null);
     try std.testing.expect(try canWebLogin(&db, "cal", "web-other"));
 
-    // The last web console user can't be removed or lose the web password.
+    // Any web login may go, even the last one.
     try revokePasswords(gpa, io, &db, "cal", false, true);
     try std.testing.expect(!try canWebLogin(&db, "cal", "web-other"));
-    try std.testing.expectError(error.LastWebUser, revokePasswords(gpa, io, &db, "ann", false, true));
-    try std.testing.expectError(error.LastWebUser, deleteUser(gpa, &db, "ann"));
     try deleteUser(gpa, &db, "cal");
     try std.testing.expectError(error.NotFound, revokePasswords(gpa, io, &db, "cal", true, true));
 

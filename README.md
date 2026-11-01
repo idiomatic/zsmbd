@@ -91,6 +91,9 @@ zsmbd [--db PATH|none] [--config FILE] [--users FILE|-] CMD
         [--smb-user LOGIN:PASSWORD]
         [--web-user LOGIN:PASSWORD]
           the last four are ephemeral, in memory
+  web start [[ADDR:]PORT]
+  web stop
+      start or stop the console of a running serve
   user list
   user add LOGIN
       no password: can't sign in until one is set
@@ -141,7 +144,7 @@ clears them. `user list` names the four cases:
 
 Users with both passwords get a warning, and a stronger one when the two
 match.
-The last user with a web password can't be deleted or lose it.
+Any web login may go, even the last: the console then stops and ends that user's sessions.
 
 ### Settings
 
@@ -183,6 +186,11 @@ reconnects under the new rules
 With no server running the CLI says nothing. `--socket PATH` moves the
 socket, `--socket none` turns it off, and a store path over 100 bytes needs
 `--socket` (the OS limits socket paths). An in-memory store has no socket.
+
+`zsmbd web stop` and `zsmbd web start [[ADDR:]PORT]` stop and start a running
+server's web console through the same socket. Without an address, `start` reuses
+the console's last one. If no user has a web password, `start` makes `admin`
+and prints its random password once.
 
 Settings saved in the web console take effect at once; changes made with `zsmbd set` or in a file take effect when `serve` restarts.
 

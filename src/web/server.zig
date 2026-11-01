@@ -59,6 +59,13 @@ pub const Live = struct {
 
 const WebSession = struct { user: []u8, expires_ms: i64 };
 
+/// A listening console: its socket and whether it is being stopped.
+const Running = struct {
+    server: net.Server,
+    addr: net.IpAddress,
+    stopping: std.atomic.Value(bool) = .init(false),
+};
+
 pub const Admin = struct {
     gpa: Allocator,
     io: Io,
@@ -66,21 +73,91 @@ pub const Admin = struct {
     live: Live = .{},
     mutex: Io.Mutex = .init,
     sessions: std.StringHashMapUnmanaged(WebSession) = .empty,
+    /// The listening console, null while stopped (guarded by `mutex`).
+    running: ?*Running = null,
+    /// Where the console last listened, for a restart without an address.
+    last_addr: ?net.IpAddress = null,
+    /// Counts stops, so connections of an earlier run end.
+    generation: std.atomic.Value(u32) = .init(0),
 
     fn nowMs(a: *Admin) i64 {
         return Io.Clock.real.now(a.io).toMilliseconds();
     }
 
-    /// Accept loop; runs until the listener fails. One thread per HTTP connection.
-    pub fn serve(a: *Admin, addr: net.IpAddress) !void {
-        var listener = try addr.listen(a.io, .{ .reuse_address = true });
-        defer listener.deinit(a.io);
+    /// Starts the console on `addr` on its own thread. Fails if it is
+    /// already running or the address can't be bound.
+    pub fn start(a: *Admin, addr: net.IpAddress) !void {
+        a.mutex.lockUncancelable(a.io);
+        defer a.mutex.unlock(a.io);
+        if (a.running != null) return error.AlreadyRunning;
+        const r = try a.gpa.create(Running);
+        errdefer a.gpa.destroy(r);
+        r.* = .{ .server = try addr.listen(a.io, .{ .reuse_address = true }), .addr = addr };
+        errdefer r.server.deinit(a.io);
+        const t = try std.Thread.spawn(.{}, acceptMain, .{ a, r });
+        t.detach();
+        a.running = r;
+        a.last_addr = addr;
         std.log.info("zsmbd {s}: admin web UI on http://{f}/", .{ @import("build_options").version, addr });
-        while (true) {
-            const stream = listener.accept(a.io) catch |e| {
+    }
+
+    /// Stops the console: no new connections, no sessions. Returns false if
+    /// it wasn't running.
+    pub fn stop(a: *Admin) bool {
+        a.mutex.lockUncancelable(a.io);
+        const r = a.running orelse {
+            a.mutex.unlock(a.io);
+            return false;
+        };
+        a.running = null;
+        r.stopping.store(true, .release);
+        _ = a.generation.fetchAdd(1, .acq_rel);
+        a.clearSessionsLocked();
+        a.mutex.unlock(a.io);
+        // Wake the accept thread, which closes the listener and frees `r`.
+        var wake = r.addr;
+        switch (wake) {
+            .ip4 => |*x| if (std.mem.allEqual(u8, &x.bytes, 0)) {
+                x.bytes = .{ 127, 0, 0, 1 };
+            },
+            .ip6 => |*x| if (std.mem.allEqual(u8, &x.bytes, 0)) {
+                x.bytes[15] = 1;
+            },
+        }
+        if (wake.connect(a.io, .{ .mode = .stream })) |s| s.close(a.io) else |_| {}
+        std.log.info("zsmbd: admin web UI stopped", .{});
+        return true;
+    }
+
+    pub fn isRunning(a: *Admin) bool {
+        a.mutex.lockUncancelable(a.io);
+        defer a.mutex.unlock(a.io);
+        return a.running != null;
+    }
+
+    /// Stops the console when no user can sign in to it any more, since
+    /// nothing could use it. Returns true if it stopped.
+    pub fn stopIfNoLogins(a: *Admin) bool {
+        const stored = a.db.countWebUsers() catch return false;
+        if (stored > 0 or a.db.hasEphemeralWebLogin()) return false;
+        return a.stop();
+    }
+
+    fn acceptMain(a: *Admin, r: *Running) void {
+        defer {
+            r.server.deinit(a.io);
+            a.gpa.destroy(r);
+        }
+        while (!r.stopping.load(.acquire)) {
+            const stream = r.server.accept(a.io) catch |e| {
+                if (r.stopping.load(.acquire)) return;
                 std.log.warn("admin accept: {s}", .{@errorName(e)});
                 continue;
             };
+            if (r.stopping.load(.acquire)) {
+                stream.close(a.io);
+                return;
+            }
             const t = std.Thread.spawn(.{}, connMain, .{ a, stream }) catch {
                 stream.close(a.io);
                 continue;
@@ -96,8 +173,10 @@ pub const Admin = struct {
         var r = stream.reader(a.io, &rbuf);
         var w = stream.writer(a.io, &wbuf);
         var hs = http.Server.init(&r.interface, &w.interface);
+        const gen = a.generation.load(.acquire);
         while (true) {
             var req = hs.receiveHead() catch return;
+            if (a.generation.load(.acquire) != gen) return;
             a.handle(&req) catch |e| {
                 std.log.warn("admin request failed: {s}", .{@errorName(e)});
                 return;
@@ -155,6 +234,27 @@ pub const Admin = struct {
             a.gpa.free(kv.value.user);
             a.gpa.free(kv.key);
         }
+    }
+
+    /// A user changed in the store by another process (the control socket):
+    /// end their sessions if they lost the web password, and stop the
+    /// console if nobody can sign in any more.
+    pub fn userChanged(a: *Admin, name: []const u8) void {
+        const u = a.db.userAuth(a.gpa, name) catch return;
+        if (u) |x| {
+            defer x.free(a.gpa);
+            if (x.web_hash.len == 0) a.endUserSessions(name);
+        } else a.endUserSessions(name);
+        _ = a.stopIfNoLogins();
+    }
+
+    fn clearSessionsLocked(a: *Admin) void {
+        var it = a.sessions.iterator();
+        while (it.next()) |e| {
+            a.gpa.free(e.value_ptr.user);
+            a.gpa.free(e.key_ptr.*);
+        }
+        a.sessions.clearRetainingCapacity();
     }
 
     /// Drop sessions of a user (after deletion or demotion).
@@ -372,7 +472,9 @@ pub const Admin = struct {
         var texts: std.ArrayList([]const u8) = .empty;
         var it = warning.iterator();
         while (it.next()) |w| try texts.append(arena, w.text());
-        return respondJson(req, arena, .{ .ok = true, .warnings = texts.items });
+        try respondJson(req, arena, .{ .ok = true, .warnings = texts.items });
+        // Clearing the last web password shuts the console, after the reply.
+        if (in.no_web_password) _ = a.stopIfNoLogins();
     }
 
     /// Create (when `create`), then clear, then set passwords.
@@ -391,7 +493,9 @@ pub const Admin = struct {
         };
         a.endUserSessions(name);
         _ = a.live.userChanged(a.live.ctx, name);
-        return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral) });
+        try respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral) });
+        // Deleting the last web login shuts the console, after the reply.
+        _ = a.stopIfNoLogins();
     }
 
     fn getSettings(a: *Admin, req: *http.Server.Request, arena: Allocator) !void {
