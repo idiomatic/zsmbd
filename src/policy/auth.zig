@@ -54,6 +54,7 @@ pub fn describe(err: anyerror) []const u8 {
         error.NotFound => "not found",
         error.Store => "a configuration or users file has errors (see above)",
         error.Ephemeral => "it is ephemeral, given on the command line or stdin; restart without it to change it",
+        error.WebOff => "web passwords need the web console: add --web PORT",
         error.ReadOnly => "users come from stdin (--users -) and can't be changed",
         error.InvalidShareSpec => "expected NAME:PATH[:OPTIONS[:TEXT]]",
         error.InvalidOption => "share options are ro, rw, guest, and noguest, separated by commas",
@@ -299,17 +300,34 @@ pub fn randomPassword(io: Io, buf: *[16]u8) []const u8 {
     return buf;
 }
 
+pub const Bootstrapped = struct {
+    /// Point into the caller's buffer; print once.
+    password: []const u8,
+    /// The `admin` login lives in memory only and ends with the process.
+    ephemeral: bool,
+};
+
 /// First-run setup: when nobody can sign in to the web console, give user
-/// "admin" (created if missing) a random web password and return it (caller
-/// prints it once). Returns null otherwise, and when an ephemeral web login
-/// exists or the users come from stdin.
-pub fn bootstrap(gpa: Allocator, io: Io, db: *Db, pw_buf: *[16]u8) !?[]const u8 {
+/// "admin" a random web password (no SMB password) and return it (caller
+/// prints it once). The user is stored (created if missing), except when
+/// nothing can be stored (no `--db`, or `--users -`): then it is an
+/// ephemeral login, unless the name is already an ephemeral user. Returns
+/// null when a web login exists, stored or ephemeral.
+pub fn bootstrap(gpa: Allocator, io: Io, db: *Db, pw_buf: *[16]u8) !?Bootstrapped {
     if (db.hasEphemeralWebLogin()) return null;
+    if (db.users_stdin or db.ephemeral_only) {
+        if (db.isEphemeralUser("admin")) return null;
+        const pw = randomPassword(io, pw_buf);
+        const phc = try hashPassword(gpa, io, pw);
+        defer gpa.free(phc);
+        try db.addEphemeralUser(gpa, "admin", null, phc);
+        return .{ .password = pw, .ephemeral = true };
+    }
     if (try db.countWebUsers() > 0) return null;
     const pw = randomPassword(io, pw_buf);
     if (try db.userAuth(gpa, "admin")) |u| u.free(gpa) else try addUser(io, db, "admin");
     _ = try grantPasswords(gpa, io, db, "admin", .{ .web = pw });
-    return pw;
+    return .{ .password = pw, .ephemeral = false };
 }
 
 test "validation" {
@@ -424,7 +442,9 @@ test "bootstrap creates an admin" {
     var db = try testDb();
     defer db.close();
     var buf: [16]u8 = undefined;
-    const pw = (try bootstrap(gpa, io, &db, &buf)).?;
+    const b = (try bootstrap(gpa, io, &db, &buf)).?;
+    const pw = b.password;
+    try std.testing.expect(!b.ephemeral);
     try std.testing.expect((try db.ntHash("admin")) == null);
     try std.testing.expect(try canWebLogin(&db, "admin", pw));
     try std.testing.expect((try bootstrap(gpa, io, &db, &buf)) == null);

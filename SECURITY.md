@@ -32,7 +32,7 @@ issue.
 | Session token | 256 random bits, in memory | Looked up in a hash map; a 12-hour sliding expiry; ended by a web password change or clearing, or deletion of the user. |
 | SMB session keys | in memory | Derived with `crypto.kdf`; copied into each pending `Notify` so another thread can sign or seal. |
 
-Passwords and hashes given as `serve` arguments are copied, then masked with `x` in place in the process's argv (`ps` shows the login and `xxxx`, which still gives away the secret's length); what stays exposed is the moment between `exec` and the wipe, shell history, audit logs, and whatever launched `serve`, so `serve` warns whenever one is used. Plaintext passwords are wiped (`secureZero`) after use in the CLI, the
+Passwords and hashes given as `serve` arguments are copied, then masked with `X` in place in the process's argv (`ps` shows the login and `XXXX`, which still gives away the secret's length); what stays exposed is the moment between `exec` and the wipe, shell history, audit logs, and whatever launched `serve`, so `serve` warns whenever one is used. Plaintext passwords are wiped (`secureZero`) after use in the CLI, the
 WebAssembly module, and the users-file writer.
 
 ## Review checklist for changes

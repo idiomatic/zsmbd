@@ -301,10 +301,38 @@ test "users from stdin are the only users" {
     try testing.expectError(error.ReadOnly, db.putUser("new", .keep, .keep, 1));
     try testing.expectError(error.Ephemeral, db.putUser("art", .keep, .keep, 1));
     try testing.expect(!try db.deleteUser("old"));
-    try testing.expect(db.hasEphemeralWebLogin());
+    // No web login on stdin: bootstrap makes an ephemeral, web-only admin.
+    try testing.expect(!db.hasEphemeralWebLogin());
+    var pw: [16]u8 = undefined;
+    const b = (try auth.bootstrap(testing.allocator, testing.io, &db, &pw)).?;
+    try testing.expect(b.ephemeral and db.isEphemeralUser("admin") and db.hasEphemeralWebLogin());
+    const admin = (try db.userAuth(testing.allocator, "admin")).?;
+    defer admin.free(testing.allocator);
+    try testing.expect(admin.web_hash.len > 0 and !admin.has_smb);
+    try testing.expectEqual(null, try db.ntHash("admin"));
+    try testing.expectEqual(null, try auth.bootstrap(testing.allocator, testing.io, &db, &pw));
     const users = try db.listUsers(testing.allocator);
     defer store.freeUsers(testing.allocator, users);
-    try testing.expectEqual(@as(usize, 1), users.len);
+    try testing.expectEqual(@as(usize, 2), users.len);
+}
+
+test "in-memory mode makes an ephemeral admin unless the name is taken" {
+    var db = try store.Db.open(testing.io, ":memory:");
+    defer db.close();
+    db.ephemeral_only = true;
+    var s: Spec = .init(testing.allocator);
+    defer s.deinit();
+    try s.addLine("admin:" ++ hash_a ++ ":");
+    try s.apply(&db);
+    var pw: [16]u8 = undefined;
+    // An SMB-only ephemeral admin can't gain a password, so none is made.
+    try testing.expectEqual(null, try auth.bootstrap(testing.allocator, testing.io, &db, &pw));
+    var db2 = try store.Db.open(testing.io, ":memory:");
+    defer db2.close();
+    db2.ephemeral_only = true;
+    const b = (try auth.bootstrap(testing.allocator, testing.io, &db2, &pw)).?;
+    try testing.expect(b.ephemeral);
+    try testing.expectEqual(@as(i64, 0), try db2.countWebUsers());
 }
 
 test "fuzz: ephemeral login and share specs" {

@@ -16,7 +16,7 @@ pub const usage =
     \\       zsmbd --version
     \\
     \\  serve [--smb [ADDR:]PORT]    default: 0.0.0.0:445 (0.0.0.0:4450 as user)
-    \\        [--web [ADDR:]PORT]    default: 127.0.0.1:8445
+    \\        [--web [ADDR:]PORT]    admin web console, off unless given
     \\        [--share NAME:PATH[:OPTIONS[:TEXT]]]
     \\        [--user LOGIN:NT_HASH:WEB_HASH]
     \\        [--smb-user LOGIN:PASSWORD]    ephemeral
@@ -57,10 +57,11 @@ pub const usage =
     \\Ephemeral entries (repeatable flags; OPTIONS are ro, rw, guest, noguest)
     \\hide stored ones of the same name and can't be changed. Passwords and
     \\hashes on the command line are visible to other users of the host until
-    \\startup; zsmbd then masks them with x in the process list, but not in your
+    \\startup; zsmbd then masks them with X in the process list, but not in your
     \\shell history. Prefer --users FILE or --users -.
-    \\On first start, an "admin" user with a random web password is created
-    \\and the password is printed once.
+    \\With --web, on first start an "admin" user with a random web password
+    \\is created and the password is printed once; with no stored users (no --db, or
+    \\--users -) and no web login given, "admin" lasts only while zsmbd runs.
     \\
 ;
 
@@ -311,11 +312,12 @@ fn getCmd(c: *Cli) !void {
 }
 
 fn serve(c: *Cli) !void {
-    var web_addr: []const u8 = "8445";
+    var web_addr: ?[]const u8 = null;
     var smb_addr: []const u8 = defaultSmbPort(std.c.geteuid());
     var spec: ephemeral.Spec = .init(c.gpa);
     defer spec.deinit();
     var secrets = false;
+    var web_user_given = false;
     while (c.next()) |opt| {
         if (std.mem.eql(u8, opt, "--web"))
             web_addr = try c.need()
@@ -328,6 +330,7 @@ fn serve(c: *Cli) !void {
             // memory, which `ps` reads, before anything else happens.
             const value = try c.need();
             secrets = true;
+            web_user_given = web_user_given or std.mem.eql(u8, opt, "--web-user");
             const added = addLogin(c, &spec, opt, value);
             maskSecret(value);
             added catch |e| return badSpec(opt, e);
@@ -344,26 +347,33 @@ fn serve(c: *Cli) !void {
         const text = try readStdin(c);
         defer freeSecret(c, text);
         spec.addText("stdin", text, false) catch |e| return badSpec("--users -", e);
-        var has_web = false;
-        for (spec.logins.items) |l| has_web = has_web or l.web_hash.len > 0;
-        if (!has_web) std.debug.print("zsmbd: warning: no user on stdin has a web password, so nobody can sign in to the web console\n", .{});
     }
     for (spec.logins.items) |l| if (l.nt_hash != null and l.web_hash.len > 0) std.debug.print("zsmbd: warning: user {s}: {s}\n", .{ l.name, auth.Warning.both_passwords.text() });
     try spec.apply(c.db);
 
-    const addr = try parseAddr(web_addr, "127.0.0.1");
+    // The web console is opt-in: it runs only with `--web`.
+    const web_off = web_addr == null;
+    if (web_off and web_user_given) return badSpec("--web-user", error.WebOff);
+    const addr = if (web_addr) |a| try parseAddr(a, "127.0.0.1") else null;
     const saddr = try parseAddr(smb_addr, "0.0.0.0");
 
     var pw_buf: [16]u8 = undefined;
-    if (try auth.bootstrap(c.gpa, c.io, c.db, &pw_buf)) |pw| {
-        std.debug.print(
+    if (web_off) {} else if (try auth.bootstrap(c.gpa, c.io, c.db, &pw_buf)) |b| {
+        if (b.ephemeral) std.debug.print(
+            \\
+            \\  No web login: gave user "admin" the web password {s}
+            \\  Sign in at http://{f}/. It is not stored: it ends when zsmbd
+            \\  exits, and is shown only once. It is not an SMB password.
+            \\
+            \\
+        , .{ b.password, addr.? }) else std.debug.print(
             \\
             \\  First run: gave user "admin" the web password {s}
             \\  Sign in at http://{f}/ and change it. This is shown only once.
             \\  It is not an SMB password; set one with `zsmbd user passwd admin`.
             \\
             \\
-        , .{ pw, addr });
+        , .{ b.password, addr.? });
     }
 
     var guid: [16]u8 = undefined;
@@ -384,6 +394,10 @@ fn serve(c: *Cli) !void {
     };
     defer listener.deinit(c.io);
     std.log.info("zsmbd: SMB on {f} as {s}", .{ saddr, srv.cfg.server_name });
+    if (web_off) {
+        std.log.info("zsmbd: no web console (give --web PORT to start it)", .{});
+        return srv.acceptLoop(&listener);
+    }
     const smb_thread = try std.Thread.spawn(.{}, smb_server.Server.acceptLoop, .{ &srv, &listener });
     smb_thread.detach();
 
@@ -393,7 +407,7 @@ fn serve(c: *Cli) !void {
         .kick = liveKick,
         .reload = liveReload,
     } };
-    try admin.serve(addr);
+    try admin.serve(addr.?);
 }
 
 // The admin web server reaches the SMB server only through these hooks
@@ -468,13 +482,13 @@ fn parseAddr(s: []const u8, default_host: []const u8) !Io.net.IpAddress {
 test "masking keeps the login and hides the secret" {
     var a = "brian:peekaboo".*;
     maskSecret(&a);
-    try std.testing.expectEqualStrings("brian:xxxxxxxx", &a);
+    try std.testing.expectEqualStrings("brian:XXXXXXXX", &a);
     var h = "art:00112233:$argon2id$x".*;
     maskSecret(&h);
-    try std.testing.expectEqualStrings("art:xxxxxxxxxxxxxxxxxxxx", &h);
+    try std.testing.expectEqualStrings("art:XXXXXXXXXXXXXXXXXXXX", &h);
     var n = "nocolon".*;
     maskSecret(&n);
-    try std.testing.expectEqualStrings("xxxxxxx", &n);
+    try std.testing.expectEqualStrings("XXXXXXX", &n);
     var e = "hal:".*;
     maskSecret(&e);
     try std.testing.expectEqualStrings("hal:", &e);

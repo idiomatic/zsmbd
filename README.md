@@ -60,13 +60,13 @@ zsmbd --db zsmbd.db user passwd hal
 ```
 
 ```bash
-sudo zsmbd --db zsmbd.db serve
+sudo zsmbd --db zsmbd.db serve --web 8445
 ```
 
 `user add` creates a user with no password; `user passwd` sets the SMB
-password, from stdin. On first start, zsmbd creates the
-web console user `admin` and prints its random password once. The console is
-at <http://127.0.0.1:8445/>.
+password, from stdin. The web console is opt-in: `--web 8445` starts it
+at <http://127.0.0.1:8445/>, and on first start zsmbd creates the web console
+user `admin` and prints its random password once.
 
 Connect from a client. On port 4450, name the port, as in
 `smb://HOST:4450/data` on macOS; other clients have their own port options.
@@ -85,7 +85,7 @@ zsmbd [--db PATH] [--config FILE] [--users FILE|-] CMD
   serve [--smb [ADDR:]PORT]
           default: 0.0.0.0:445 (0.0.0.0:4450 as user)
         [--web [ADDR:]PORT]
-          default: 127.0.0.1:8445
+          the web console, off unless given
         [--share NAME:PATH[:OPTIONS[:TEXT]]]
         [--user LOGIN:NT_HASH:WEB_HASH]
         [--smb-user LOGIN:PASSWORD]
@@ -156,6 +156,11 @@ The last user with a web password can't be deleted or lose it.
 zsmbd set encrypt yes
 ```
 
+The web console runs only when `serve` is given `--web [ADDR:]PORT`; a
+bare port listens on `127.0.0.1`. Without it no HTTP listener starts, no
+first-run `admin` is made, and `--web-user` is refused. Manage users and
+shares with the CLI and files instead.
+
 Settings saved in the web console take effect at once; changes made with `zsmbd set` or in a file take effect when `serve` restarts.
 
 ## Storage
@@ -194,13 +199,14 @@ With ephemeral entries and no `--db`, nothing is stored: the store is in memory
 and the settings take their defaults.
 
 Ephemeral entries hide stored ones of the same name and can't be changed
-(`user list` and `share list` mark them `ephemeral`). An ephemeral web login,
-or `--users -`, skips creating the first-run `admin`.
+(`user list` and `share list` mark them `ephemeral`). With no `--db` or with `--users -`, and no web login given, `serve`
+makes an ephemeral `admin` with a random web password (no SMB
+password), printed once and gone when `zsmbd` exits.
 
 **Passwords and hashes on the command line are visible** to other users of the
 host (in `ps`) until `serve` starts, and stay in your shell history and audit
 logs; an NT hash is as good as the password to anyone who sees it. `serve`
-masks them with `x` in its argument list right after parsing (the login
+masks them with `X` in its argument list right after parsing (the login
 stays visible, and the length of the secret does) and warns, but prefer
 `--users FILE` or `--users -`. With bash, a leading space keeps a command out
 of the history when `HISTCONTROL=ignorespace`.

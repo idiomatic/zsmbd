@@ -94,13 +94,15 @@ client fallback.
    (a separate process)
 ```
 
-One process hosts two listeners: SMB (`--smb`, default `0.0.0.0:445`, or
-`0.0.0.0:4450` unless run as root) and
-the admin web server (`--web`, default `127.0.0.1:8445`). Each flag takes
+One process hosts up to two listeners: SMB (`--smb`, default `0.0.0.0:445`,
+or `0.0.0.0:4450` unless run as root) and the admin web server, which runs
+only when `--web` is given (it has no default port). Each flag takes
 `ADDR:PORT` or just `PORT` (or `:PORT`), and a missing address keeps that
 listener's default, so `--smb 4450` still listens on every interface and
 `--web 8099` only on localhost. `serve` binds the SMB port first and fails
-if it cannot, then runs `Server.acceptLoop` on its own thread. Each accepted
+if it cannot, then runs `Server.acceptLoop` on its own thread (without
+`--web` there is no web listener and no first-run `admin`, and
+`acceptLoop` runs on the main thread). Each accepted
 connection, SMB or HTTP, gets its own detached OS thread. The threads share three things: the store
 (`store.Db`: SQLite or plain-text files), the in-memory server state (`server.Server`), and the
 `std.Io` instance from `std.process.Init`, which is thread-safe.
@@ -347,12 +349,11 @@ stored part:
   ephemeral web login exists.
 - `--users -` (global flag, `serve` only; the last `--users` wins) sets
   `Db.users_stdin`: there are no stored users, the users read from stdin are
-  ephemeral, and any other change is `error.ReadOnly`. `bootstrap` creates no
-  `admin`.
+  ephemeral, and any other change is `error.ReadOnly`.
 - Argument values that may hold secrets (`--user`, `--smb-user`, `--web-user`)
-  are copied into the spec and then masked with `x` in place in the process's
+  are copied into the spec and then masked with `X` in place in the process's
   argv (`cli.maskSecret`: everything after the login's colon, so `ps` shows
-  `brian:xxxxxxxx`), before any listener starts; `serve` warns that the values were
+  `brian:XXXXXXXX`), before any listener starts; `serve` warns that the values were
   readable until then. Passwords are hashed at startup and the copies wiped.
 
 ### Plain-text files: `store/textconf.zig`, `store/textusers.zig`
@@ -437,7 +438,10 @@ checked, so the CLI and the web API apply identical rules.
 - **Bootstrap.** When nobody can sign in to the web console, `serve` gives
   user `admin` (creating it if missing) a random 16-character web password
   from an unambiguous alphabet, and prints the password once to stderr. An
-  existing `admin` keeps its SMB password.
+  existing `admin` keeps its SMB password. When nothing can be stored (no
+  `--db`, or `--users -`) and no web login is given, the `admin` is an
+  ephemeral login with a web password only, printed once and gone at exit
+  (none is made if an ephemeral `admin` already exists).
 - **Login timing.** An unknown user name still costs one argon2id hash, so
   response time does not reveal which names exist.
 
@@ -879,7 +883,8 @@ clients probe (`lsarpc`, `samr`, `wkssvc`) are refused at CREATE with
 
 ### Serving
 
-`Admin.serve` listens (default `127.0.0.1:8445`), spawns a detached thread per
+`Admin.serve` listens (on the `--web` address; a bare port means
+`127.0.0.1`), spawns a detached thread per
 HTTP connection, and uses `std.http.Server` with keep-alive. Each request gets
 an arena allocator freed when the request ends. Request bodies are capped at
 64 KiB, and `Expect: 100-continue` is refused. The UI is a single HTML file

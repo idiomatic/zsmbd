@@ -123,11 +123,10 @@ pub const Db = struct {
     }
 
     /// Whether anyone is given a web password outside the store, so the
-    /// first-run `admin` isn't needed (and with `--users -`, can't be made).
+    /// first-run `admin` isn't needed.
     pub fn hasEphemeralWebLogin(db: *Db) bool {
         db.mutex.lockUncancelable(db.io);
         defer db.mutex.unlock(db.io);
-        if (db.users_stdin or db.ephemeral_only) return true;
         const e = db.ephemeral orelse return false;
         for (e.users.items) |u| if (u.web_hash.len > 0) return true;
         return false;
