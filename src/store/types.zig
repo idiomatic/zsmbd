@@ -3,9 +3,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-/// `Ephemeral`: the entry was given on the command line; `ReadOnly`: the
-/// users come from stdin (`--users -`).
-pub const Error = error{ Sqlite, Store, OutOfMemory, Ephemeral, ReadOnly };
+pub const Error = error{ Sqlite, Store, OutOfMemory };
 
 pub const Share = struct {
     name: []const u8,

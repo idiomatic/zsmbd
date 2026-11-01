@@ -340,16 +340,23 @@ stored part:
 
 - Lookups, `listShares`, and `listUsers` find them first; a stored entry of
   the same name is hidden (and logged once at startup), untouched.
-- Every change to one is `error.Ephemeral`: `putUser`, `deleteUser`,
-  `putShare`, and `deleteShare`, and `grantPasswords`, `revokePasswords`, and
-  `deleteUser` in `policy/auth.zig` check first, so the CLI and the web API
-  report it. Lists mark them `ephemeral`.
+- They change like stored entries, in memory: `putUser`
+  (`Ephemeral.changeUser`), `deleteUser` (`removeUser`), `putShare`
+  (`changeShare`), and `deleteShare` (`removeShare`) act on the layer when the
+  name is ephemeral. Deleting one reveals the stored entry it hid. The web API
+  adds the `ephemeral` warning to such responses (`isEphemeralUser`,
+  `isEphemeralShare`); the change ends with the process. Only the web console
+  can do this, because the CLI is another process with its own store.
+  `revokePasswords` and `deleteUser` keep one web login while running,
+  counting stored and ephemeral logins (`Db.countWebLogins`). Lists mark
+  them `ephemeral`.
 - `countWebUsers` counts stored users only, so the last-web-user guard can't
   depend on something a restart drops; `bootstrap` creates no `admin` when an
   ephemeral web login exists.
 - `--users -` (global flag, `serve` only; the last `--users` wins) sets
-  `Db.users_stdin`: there are no stored users, the users read from stdin are
-  ephemeral, and any other change is `error.ReadOnly`.
+  `Db.users_stdin`: there are no stored users, so the users read from stdin,
+  and any the web console creates, are ephemeral (the layer is made when the
+  store opens).
 - Argument values that may hold secrets (`--user`, `--smb-user`, `--web-user`)
   are copied into the spec and then masked with `X` in place in the process's
   argv (`cli.maskSecret`: everything after the login's colon, so `ps` shows

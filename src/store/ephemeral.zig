@@ -60,6 +60,57 @@ pub const Ephemeral = struct {
         try e.users.append(e.gpa, .{ .name = n, .nt_hash = nt_hash, .web_hash = w });
     }
 
+    /// Sets, keeps, or clears each hash of `u` in memory (same rules as the
+    /// stores' `putUser`). Nothing changes on failure.
+    pub fn changeUser(e: *Ephemeral, u: *User, nt_hash: types.Change([16]u8), web_hash: types.Change([]const u8)) Allocator.Error!void {
+        const new_web: ?[]u8 = switch (web_hash) {
+            .keep => null,
+            .clear => try e.gpa.alloc(u8, 0),
+            .set => |h| try e.gpa.dupe(u8, h),
+        };
+        switch (nt_hash) {
+            .keep => {},
+            .clear => u.nt_hash = null,
+            .set => |h| u.nt_hash = h,
+        }
+        if (new_web) |w| {
+            std.crypto.secureZero(u8, u.web_hash);
+            e.gpa.free(u.web_hash);
+            u.web_hash = w;
+        }
+    }
+
+    /// Removes user `name`; false when there is none.
+    pub fn removeUser(e: *Ephemeral, name: []const u8) bool {
+        for (e.users.items, 0..) |u, i| if (std.ascii.eqlIgnoreCase(u.name, name)) {
+            e.gpa.free(u.name);
+            std.crypto.secureZero(u8, u.web_hash);
+            e.gpa.free(u.web_hash);
+            _ = e.users.orderedRemove(i);
+            return true;
+        };
+        return false;
+    }
+
+    /// Removes share `name`; false when there is none.
+    pub fn removeShare(e: *Ephemeral, name: []const u8) bool {
+        for (e.shares.items, 0..) |s, i| if (std.ascii.eqlIgnoreCase(s.name, name)) {
+            s.free(e.gpa);
+            _ = e.shares.orderedRemove(i);
+            return true;
+        };
+        return false;
+    }
+
+    /// Replaces share `old`'s fields with a copy of `share`'s (the name keeps
+    /// its stored spelling); the share stays ephemeral.
+    pub fn changeShare(e: *Ephemeral, old: *Share, share: Share) Allocator.Error!void {
+        var n = try share.dupe(e.gpa);
+        n.ephemeral = true;
+        old.free(e.gpa);
+        old.* = n;
+    }
+
     /// Adds a copy marked ephemeral; a name already present is `error.Store`.
     pub fn addShare(e: *Ephemeral, share: Share) !void {
         if (e.findShare(share.name) != null) return error.Store;
@@ -69,6 +120,23 @@ pub const Ephemeral = struct {
         try e.shares.append(e.gpa, s);
     }
 };
+
+test "an ephemeral user's hashes can be set, kept, and cleared" {
+    const t = std.testing;
+    const e = try Ephemeral.create(t.allocator);
+    defer e.destroy();
+    try e.addUser("hal", null, "$argon2id$old");
+    const u = e.findUser("hal").?;
+    const nt: [16]u8 = @splat(7);
+    try e.changeUser(u, .{ .set = nt }, .keep);
+    try t.expectEqual(nt, u.nt_hash.?);
+    try t.expectEqualStrings("$argon2id$old", u.web_hash);
+    try e.changeUser(u, .clear, .{ .set = "$argon2id$new" });
+    try t.expect(u.nt_hash == null);
+    try t.expectEqualStrings("$argon2id$new", u.web_hash);
+    try e.changeUser(u, .keep, .clear);
+    try t.expectEqual(@as(usize, 0), u.web_hash.len);
+}
 
 test "entries are found without regard to case and names stay unique" {
     const t = std.testing;

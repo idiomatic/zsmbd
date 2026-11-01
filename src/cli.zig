@@ -55,7 +55,8 @@ pub const usage =
     \\--users - (with serve only) reads users-file text from stdin instead:
     \\ephemeral and read-only, with no stored users.
     \\Ephemeral entries (repeatable flags; OPTIONS are ro, rw, guest, noguest)
-    \\hide stored ones of the same name and can't be changed. Passwords and
+    \\hide stored ones of the same name; the web console edits and deletes them
+    \\like stored ones, until exit. Passwords and
     \\hashes on the command line are visible to other users of the host until
     \\startup; zsmbd then masks them with X in the process list, but not in your
     \\shell history. Prefer --users FILE or --users -.

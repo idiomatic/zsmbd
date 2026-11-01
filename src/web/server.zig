@@ -306,21 +306,16 @@ pub const Admin = struct {
         auth.validateShareName(in.name) catch |e| return respondError(req, .bad_request, auth.describe(e));
         auth.validateSharePath(arena, in.path) catch |e| return respondError(req, .bad_request, auth.describe(e));
         auth.validateComment(in.comment) catch |e| return respondError(req, .bad_request, auth.describe(e));
-        a.db.putShare(.{ .name = in.name, .path = in.path, .comment = in.comment, .read_only = in.read_only, .guest_ok = in.guest_ok }) catch |e| switch (e) {
-            error.Ephemeral => return respondError(req, .bad_request, auth.describe(e)),
-            else => return e,
-        };
-        return respondJson(req, arena, .{ .ok = true });
+        const ephemeral = a.db.isEphemeralShare(in.name);
+        try a.db.putShare(.{ .name = in.name, .path = in.path, .comment = in.comment, .read_only = in.read_only, .guest_ok = in.guest_ok });
+        return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral) });
     }
 
     fn deleteShare(a: *Admin, req: *http.Server.Request, arena: Allocator, query: []const u8) !void {
         const name = try queryParam(arena, query, "name") orelse return respondError(req, .bad_request, "missing name");
-        const deleted = a.db.deleteShare(name) catch |e| switch (e) {
-            error.Ephemeral => return respondError(req, .bad_request, auth.describe(e)),
-            else => return e,
-        };
-        if (!deleted) return respondError(req, .not_found, "no such share");
-        return respondJson(req, arena, .{ .ok = true });
+        const ephemeral = a.db.isEphemeralShare(name);
+        if (!try a.db.deleteShare(name)) return respondError(req, .not_found, "no such share");
+        return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral) });
     }
 
     fn listUsers(a: *Admin, req: *http.Server.Request, arena: Allocator) !void {
@@ -374,12 +369,13 @@ pub const Admin = struct {
 
     fn deleteUser(a: *Admin, req: *http.Server.Request, arena: Allocator, query: []const u8) !void {
         const name = try queryParam(arena, query, "name") orelse return respondError(req, .bad_request, "missing name");
+        const ephemeral = a.db.isEphemeralUser(name);
         auth.deleteUser(a.gpa, a.db, name) catch |e| switch (e) {
             error.NotFound => return respondError(req, .not_found, "no such user"),
             else => return respondError(req, .bad_request, auth.describe(e)),
         };
         a.endUserSessions(name);
-        return respondJson(req, arena, .{ .ok = true });
+        return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral) });
     }
 
     fn getSettings(a: *Admin, req: *http.Server.Request, arena: Allocator) !void {
@@ -414,6 +410,11 @@ pub const Admin = struct {
         return respondJson(req, arena, .{ .ok = true });
     }
 };
+
+/// The warning list of a response about an ephemeral share or user.
+fn ephemeralWarning(ephemeral: bool) []const []const u8 {
+    return if (ephemeral) &.{auth.Warning.ephemeral.text()} else &.{};
+}
 
 const json_headers = [_]http.Header{
     .{ .name = "content-type", .value = "application/json" },

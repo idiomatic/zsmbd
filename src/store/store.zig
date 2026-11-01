@@ -62,6 +62,8 @@ pub const Db = struct {
     pub fn openAt(gpa: Allocator, io: Io, loc: Location) Error!Db {
         var d: Db = .{ .io = io, .users_stdin = loc.users_stdin };
         errdefer d.close();
+        // With `--users -` the users are ephemeral, so the layer holds them.
+        if (loc.users_stdin) d.ephemeral = try ephemeral.Ephemeral.create(gpa);
         if (loc.usesSqlite()) d.sqlite = try Sqlite.open(loc.db orelse return error.Store);
         if (loc.config) |p| d.conf = try textconf.Conf.open(gpa, io, p);
         if (loc.users) |p| d.users = try textusers.Users.open(gpa, io, p);
@@ -122,6 +124,14 @@ pub const Db = struct {
         return e.findUser(name) != null;
     }
 
+    /// Whether `name` is an ephemeral share (the same warning as for users).
+    pub fn isEphemeralShare(db: *Db, name: []const u8) bool {
+        db.mutex.lockUncancelable(db.io);
+        defer db.mutex.unlock(db.io);
+        const e = db.ephemeral orelse return false;
+        return e.findShare(name) != null;
+    }
+
     /// Whether anyone is given a web password outside the store, so the
     /// first-run `admin` isn't needed.
     pub fn hasEphemeralWebLogin(db: *Db) bool {
@@ -174,14 +184,23 @@ pub const Db = struct {
     }
 
     /// Create or update a user, setting, keeping, or clearing each password
-    /// hash; a kept hash of a new user is absent. Ephemeral users are
-    /// `error.Ephemeral`, and with `--users -` every change is
-    /// `error.ReadOnly`.
+    /// hash; a kept hash of a new user is absent. Ephemeral users, and with
+    /// `--users -` every user, change in memory only: the change ends with
+    /// the process.
     pub fn putUser(db: *Db, name: []const u8, nt_hash: Change([16]u8), web_hash: Change([]const u8), now: i64) Error!void {
         db.mutex.lockUncancelable(db.io);
         defer db.mutex.unlock(db.io);
-        if (db.ephemeral) |e| if (e.findUser(name) != null) return error.Ephemeral;
-        if (db.users_stdin) return error.ReadOnly;
+        if (db.ephemeral) |e| if (e.findUser(name)) |u| return e.changeUser(u, nt_hash, web_hash);
+        if (db.users_stdin) {
+            const e = db.ephemeral orelse return error.Store;
+            return e.addUser(name, switch (nt_hash) {
+                .set => |h| h,
+                else => null,
+            }, switch (web_hash) {
+                .set => |h| h,
+                else => "",
+            });
+        }
         if (db.users) |t| return t.putUser(name, nt_hash, web_hash, now);
         return db.sqlite.?.putUser(name, nt_hash, web_hash, now);
     }
@@ -189,7 +208,7 @@ pub const Db = struct {
     pub fn deleteUser(db: *Db, name: []const u8) Error!bool {
         db.mutex.lockUncancelable(db.io);
         defer db.mutex.unlock(db.io);
-        if (db.ephemeral) |e| if (e.findUser(name) != null) return error.Ephemeral;
+        if (db.ephemeral) |e| if (e.removeUser(name)) return true;
         if (db.users_stdin) return false;
         if (db.users) |t| return t.deleteUser(name);
         return db.sqlite.?.deleteUser(name);
@@ -203,6 +222,19 @@ pub const Db = struct {
         if (db.users_stdin) return 0;
         if (db.users) |t| return t.countWebUsers();
         return db.sqlite.?.countWebUsers();
+    }
+
+    /// Everyone who can sign in to the web console now, stored or ephemeral.
+    pub fn countWebLogins(db: *Db) Error!i64 {
+        const stored = try db.countWebUsers();
+        db.mutex.lockUncancelable(db.io);
+        defer db.mutex.unlock(db.io);
+        var n = stored;
+        const e = db.ephemeral orelse return n;
+        for (e.users.items) |u| {
+            if (u.web_hash.len > 0) n += 1;
+        }
+        return n;
     }
 
     /// Stored users, then ephemeral ones, which hide stored users of the
@@ -280,7 +312,7 @@ pub const Db = struct {
     pub fn putShare(db: *Db, s: Share) Error!void {
         db.mutex.lockUncancelable(db.io);
         defer db.mutex.unlock(db.io);
-        if (db.ephemeral) |e| if (e.findShare(s.name) != null) return error.Ephemeral;
+        if (db.ephemeral) |e| if (e.findShare(s.name)) |old| return e.changeShare(old, s);
         if (db.conf) |t| return t.putShare(s);
         return db.sqlite.?.putShare(s);
     }
@@ -288,7 +320,7 @@ pub const Db = struct {
     pub fn deleteShare(db: *Db, name: []const u8) Error!bool {
         db.mutex.lockUncancelable(db.io);
         defer db.mutex.unlock(db.io);
-        if (db.ephemeral) |e| if (e.findShare(name) != null) return error.Ephemeral;
+        if (db.ephemeral) |e| if (e.removeShare(name)) return true;
         if (db.conf) |t| return t.deleteShare(name);
         return db.sqlite.?.deleteShare(name);
     }

@@ -242,7 +242,7 @@ test "passwords are hashed, merged, and checked for reuse" {
     try testing.expectError(error.InvalidUserName, s.addPassword(testing.io, ":pw", .web));
 }
 
-test "applied entries shadow stored ones and refuse changes" {
+test "applied entries shadow stored ones and change like stored ones" {
     var db = try store.Db.open(testing.io, ":memory:");
     defer db.close();
     try db.putShare(.{ .name = "docs", .path = "/tmp" });
@@ -269,21 +269,43 @@ test "applied entries shadow stored ones and refuse changes" {
     try testing.expectEqualStrings("art", users[0].name);
     try testing.expect(!users[0].ephemeral and users[1].ephemeral and users[1].has_web and !users[1].has_smb);
 
-    try testing.expectError(error.Ephemeral, db.putShare(.{ .name = "docs", .path = "/" }));
-    try testing.expectError(error.Ephemeral, db.deleteShare("Docs"));
-    try testing.expectError(error.Ephemeral, db.putUser("hal", .clear, .keep, 2));
-    try testing.expectError(error.Ephemeral, db.deleteUser("hal"));
-    try testing.expectError(error.Ephemeral, auth.grantPasswords(testing.allocator, testing.io, &db, "hal", .{ .smb = "x" }));
-    try testing.expectError(error.Ephemeral, auth.revokePasswords(testing.allocator, testing.io, &db, "hal", true, false));
-    try testing.expectError(error.Ephemeral, auth.deleteUser(testing.allocator, &db, "hal"));
+    // An ephemeral share edits in place and stays ephemeral; deleting it
+    // reveals the stored share it hid.
+    try testing.expect(db.isEphemeralShare("DOCS"));
+    try db.putShare(.{ .name = "docs", .path = "/", .comment = "edited" });
+    const edited = try db.listShares(testing.allocator);
+    defer store.freeShares(testing.allocator, edited);
+    for (edited) |x| if (std.ascii.eqlIgnoreCase(x.name, "docs")) {
+        try testing.expect(x.ephemeral and !x.read_only);
+        try testing.expectEqualStrings("edited", x.comment);
+        try testing.expectEqualStrings("/", x.path);
+    };
+    try testing.expect(try db.deleteShare("Docs"));
+    try testing.expect(!db.isEphemeralShare("docs"));
+    const revealed = try db.listShares(testing.allocator);
+    defer store.freeShares(testing.allocator, revealed);
+    for (revealed) |x| try testing.expect(!x.ephemeral);
+    try testing.expectEqual(@as(usize, 2), revealed.len);
+    // Passwords of an ephemeral user change, in memory, with a warning; the
+    // stored user of that name stays hidden and untouched.
+    const ws = try auth.grantPasswords(testing.allocator, testing.io, &db, "hal", .{ .smb = "a long and unusual passphrase 3" });
+    try testing.expect(ws.contains(.ephemeral));
+    try testing.expect((try db.ntHash("hal")) != null);
+    try auth.revokePasswords(testing.allocator, testing.io, &db, "hal", true, false);
+    try testing.expectEqual(null, try db.ntHash("hal"));
+    // hal's web login may go while another (stored) login remains, but the
+    // last login of either kind may not.
+    try auth.revokePasswords(testing.allocator, testing.io, &db, "hal", false, true);
+    try testing.expectEqual(@as(i64, 1), try db.countWebLogins());
+    try testing.expect(!db.hasEphemeralWebLogin());
+    // Deleting the ephemeral user reveals the stored one it hid.
+    try auth.deleteUser(testing.allocator, &db, "hal");
+    try testing.expect(!db.isEphemeralUser("hal"));
+    try testing.expect((try db.ntHash("hal")) != null);
     // Stored entries still change, and the guard counts stored web users only.
     try testing.expect(try db.deleteShare("kept"));
     try testing.expectEqual(@as(i64, 1), try db.countWebUsers());
     try testing.expectError(error.LastWebUser, auth.deleteUser(testing.allocator, &db, "art"));
-    // An ephemeral web login makes the first-run admin unnecessary.
-    try testing.expect(db.hasEphemeralWebLogin());
-    var pw: [16]u8 = undefined;
-    try testing.expectEqual(null, try auth.bootstrap(testing.allocator, testing.io, &db, &pw));
 }
 
 test "users from stdin are the only users" {
@@ -298,8 +320,14 @@ test "users from stdin are the only users" {
     try testing.expectEqual(null, try db.ntHash("old"));
     try testing.expect((try db.ntHash("ART")) != null);
     try testing.expectEqual(@as(i64, 0), try db.countWebUsers());
-    try testing.expectError(error.ReadOnly, db.putUser("new", .keep, .keep, 1));
-    try testing.expectError(error.Ephemeral, db.putUser("art", .keep, .keep, 1));
+    // With `--users -` every user lives in memory: new ones are made there,
+    // and any of them changes or goes like a stored user would.
+    try db.putUser("new", .{ .set = @splat(2) }, .keep, 1);
+    try testing.expect(db.isEphemeralUser("new") and (try db.ntHash("new")) != null);
+    try db.putUser("art", .clear, .keep, 1);
+    try testing.expectEqual(null, try db.ntHash("art"));
+    try testing.expect(try db.deleteUser("new"));
+    try testing.expect(!try db.deleteUser("new"));
     try testing.expect(!try db.deleteUser("old"));
     // No web login on stdin: bootstrap makes an ephemeral, web-only admin.
     try testing.expect(!db.hasEphemeralWebLogin());
@@ -311,6 +339,10 @@ test "users from stdin are the only users" {
     try testing.expect(admin.web_hash.len > 0 and !admin.has_smb);
     try testing.expectEqual(null, try db.ntHash("admin"));
     try testing.expectEqual(null, try auth.bootstrap(testing.allocator, testing.io, &db, &pw));
+    // The ephemeral admin is the only web login: its password can change but not go.
+    try testing.expectError(error.LastWebUser, auth.revokePasswords(testing.allocator, testing.io, &db, "admin", false, true));
+    const ws = try auth.grantPasswords(testing.allocator, testing.io, &db, "admin", .{ .web = "another long and unusual passphrase 5" });
+    try testing.expect(ws.contains(.ephemeral));
     const users = try db.listUsers(testing.allocator);
     defer store.freeUsers(testing.allocator, users);
     try testing.expectEqual(@as(usize, 2), users.len);

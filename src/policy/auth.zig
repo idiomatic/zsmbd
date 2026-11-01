@@ -53,9 +53,7 @@ pub fn describe(err: anyerror) []const u8 {
         error.InvalidNtHash => "an NT hash is 32 hexadecimal digits",
         error.NotFound => "not found",
         error.Store => "a configuration or users file has errors (see above)",
-        error.Ephemeral => "it is ephemeral, given on the command line or stdin; restart without it to change it",
         error.WebOff => "web passwords need the web console: add --web PORT",
-        error.ReadOnly => "users come from stdin (--users -) and can't be changed",
         error.InvalidShareSpec => "expected NAME:PATH[:OPTIONS[:TEXT]]",
         error.InvalidOption => "share options are ro, rw, guest, and noguest, separated by commas",
         error.InvalidLogin => "expected LOGIN:NT_HASH:WEB_HASH, or LOGIN:PASSWORD",
@@ -187,12 +185,14 @@ pub const Warning = enum {
     same_password,
     weak_smb,
     weak_web,
+    ephemeral,
 
     pub fn text(w: Warning) []const u8 {
         return switch (w) {
             .weak_smb => "the SMB password is weak: a longer passphrase is much harder to guess",
             .weak_web => "the web password is weak: a longer passphrase is much harder to guess",
             .both_passwords => "users with both passwords sign in to SMB and the web console: give them different passwords, and keep the web console on localhost or behind TLS",
+            .ephemeral => "this entry is ephemeral: the change lasts only until zsmbd exits",
             .same_password => "the SMB and web passwords are identical: anyone who captures the web login can also connect over SMB; set different passwords",
         };
     }
@@ -214,9 +214,9 @@ pub fn grantPasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, pw: Pas
     if (pw.web) |p| try validatePassword(p);
     const u = (try db.userAuth(gpa, name)) orelse return error.NotFound;
     defer u.free(gpa);
-    if (db.isEphemeralUser(u.name)) return error.Ephemeral;
-    if (!pw.hasSmb() and pw.web == null) return .empty;
     var warnings: Warnings = .empty;
+    if (db.isEphemeralUser(u.name)) warnings.insert(.ephemeral);
+    if (!pw.hasSmb() and pw.web == null) return warnings;
     // Only plaintext can be rated; a pre-hashed password was rated in the browser.
     if (pw.smb) |p| if (strength.estimate(p).level == .weak) warnings.insert(.weak_smb);
     if (pw.web) |p| if (strength.estimate(p).level == .weak) warnings.insert(.weak_web);
@@ -246,8 +246,12 @@ pub fn grantPasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, pw: Pas
 pub fn revokePasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, smb: bool, web: bool) !void {
     const u = (try db.userAuth(gpa, name)) orelse return error.NotFound;
     defer u.free(gpa);
-    if (db.isEphemeralUser(u.name)) return error.Ephemeral;
-    if (web and u.web_hash.len > 0 and try db.countWebUsers() <= 1) return error.LastWebUser;
+    // An ephemeral user can't lock the console out for good, but keep one
+    // web login while running: count both kinds.
+    if (web and u.web_hash.len > 0) {
+        const logins = if (db.isEphemeralUser(u.name)) try db.countWebLogins() else try db.countWebUsers();
+        if (logins <= 1) return error.LastWebUser;
+    }
     try db.putUser(u.name, if (smb) .clear else .keep, if (web) .clear else .keep, nowSeconds(io));
 }
 
@@ -255,8 +259,10 @@ pub fn revokePasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, smb: b
 pub fn deleteUser(gpa: Allocator, db: *Db, name: []const u8) !void {
     const u = (try db.userAuth(gpa, name)) orelse return error.NotFound;
     defer u.free(gpa);
-    if (db.isEphemeralUser(u.name)) return error.Ephemeral;
-    if (u.web_hash.len > 0 and try db.countWebUsers() <= 1) return error.LastWebUser;
+    if (u.web_hash.len > 0) {
+        const logins = if (db.isEphemeralUser(u.name)) try db.countWebLogins() else try db.countWebUsers();
+        if (logins <= 1) return error.LastWebUser;
+    }
     _ = try db.deleteUser(name);
 }
 

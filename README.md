@@ -198,8 +198,12 @@ zsmbd serve --share docs:/srv/docs:ro,guest:Team files \
 With ephemeral entries and no `--db`, nothing is stored: the store is in memory
 and the settings take their defaults.
 
-Ephemeral entries hide stored ones of the same name and can't be changed
-(`user list` and `share list` mark them `ephemeral`). With no `--db` or with `--users -`, and no web login given, `serve`
+Ephemeral entries hide stored ones of the same name. The web console edits
+and deletes them like stored ones (and, with `--users -`, creates users
+too), with a warning in the response; the only difference is that a
+restart forgets the change, and deleting one reveals the stored entry it
+hid. The CLI can't reach them, being another process (`user list` and
+`share list` mark them `ephemeral`). With no `--db` or with `--users -`, and no web login given, `serve`
 makes an ephemeral `admin` with a random web password (no SMB
 password), printed once and gone when `zsmbd` exits.
 
