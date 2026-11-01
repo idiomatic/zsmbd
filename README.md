@@ -80,7 +80,7 @@ Connect from a client. On port 4450, name the port, as in
 ## Command line
 
 ```
-zsmbd [--db PATH] [--config FILE] [--users FILE|-] CMD
+zsmbd [--db PATH|none] [--config FILE] [--users FILE|-] CMD
 
   serve [--smb [ADDR:]PORT]
           default: 0.0.0.0:445 (0.0.0.0:4450 as user)
@@ -164,8 +164,25 @@ shares with the CLI and files instead.
 The console's Shares panel has Read-only and Allow guests switches for each
 share. Making a share read-only, or removing guests, disconnects the
 connections using it (a confirmation says how many) so they reconnect under
-the new rules; other changes, and any made with the CLI, apply to new
-connections.
+the new rules; relaxing changes apply to new connections.
+
+### Control socket
+
+When `serve` has a persistent store it also listens on a Unix socket beside
+it (`zsmbd.db.sock` for `--db zsmbd.db`; mode 0600, same user or root only).
+CLI commands that change shares, users, or settings tell the running server
+through it, so tightening a share, or removing a user's SMB password, drops
+the affected connections at once:
+
+```
+$ zsmbd --db zsmbd.db share readonly docs
+zsmbd: docs: 1 connection dropped; each
+reconnects under the new rules
+```
+
+With no server running the CLI says nothing. `--socket PATH` moves the
+socket, `--socket none` turns it off, and a store path over 100 bytes needs
+`--socket` (the OS limits socket paths). An in-memory store has no socket.
 
 Settings saved in the web console take effect at once; changes made with `zsmbd set` or in a file take effect when `serve` restarts.
 
@@ -201,8 +218,9 @@ zsmbd serve --share docs:/srv/docs:ro,guest:Team files \
 * `--users -` reads users-file text from stdin instead, with `serve` only:
   those are the only users, and they are read-only.
 
-With ephemeral entries and no `--db`, nothing is stored: the store is in memory
-and the settings take their defaults.
+`--db none` (with `serve` only) keeps the store in memory: nothing is written,
+and the settings take their defaults. `serve` does the same when it is given
+ephemeral entries and no `--db`.
 
 Ephemeral entries hide stored ones of the same name. The web console edits
 and deletes them like stored ones (and, with `--users -`, creates users

@@ -10,9 +10,10 @@ const web = @import("web/server.zig");
 const smb_server = @import("smb/server.zig");
 const strength = @import("policy/strength.zig");
 const ephemeral = @import("policy/ephemeral.zig");
+const control = @import("control/control.zig");
 
 pub const usage =
-    \\usage: zsmbd [--db PATH] [--config FILE] [--users FILE|-] <command>
+    \\usage: zsmbd [--db PATH|none] [--config FILE] [--users FILE|-] [--socket PATH] <command>
     \\       zsmbd --version
     \\
     \\  serve [--smb [ADDR:]PORT]    default: 0.0.0.0:445 (0.0.0.0:4450 as user)
@@ -48,7 +49,9 @@ pub const usage =
     \\at a terminal. `hash` uses no store.
     \\--db PATH names the SQLite database, created on first use; it is required
     \\unless --config and --users cover everything, or serve is given ephemeral
-    \\entries only (then nothing is stored).
+    \\entries only (then nothing is stored). --db none (serve only) stores nothing.
+    \\A running serve is told of share, user, and setting changes through a control
+    \\socket beside the store (PATH.sock); --socket PATH moves it, none disables it.
     \\--config FILE keeps settings and shares in a plain-text file instead, and
     \\--users FILE keeps users in one; either or both may be given, and the
     \\files may be edited by hand. With both, no database is used.
@@ -101,6 +104,8 @@ pub const Cli = struct {
     db: *Db,
     out: *Io.Writer,
     args: []const [:0]const u8,
+    /// The control socket of a running `serve` on this store, if any.
+    control: ?[]const u8 = null,
     pos: usize = 0,
     stdin_buf: [1024]u8 = undefined,
     stdin: ?Io.File.Reader = null,
@@ -126,6 +131,7 @@ pub fn run(c: *Cli) !void {
         const key = try c.need();
         const value = try auth.normalizeSetting(key, try c.need());
         try c.db.setSetting(key, value);
+        tell(c, "settings", "");
         return;
     }
     return error.Usage;
@@ -219,6 +225,7 @@ fn userCmd(c: *Cli) !void {
     } else if (std.mem.eql(u8, sub, "del")) {
         try auth.deleteUser(c.gpa, c.db, login);
     } else return error.Usage;
+    tell(c, "user", login);
 }
 
 /// Prints a users-file line, or one hash, for a store on another machine,
@@ -297,6 +304,22 @@ fn shareCmd(c: *Cli) !void {
         else if (std.mem.eql(u8, sub, "noguest")) share.guest_ok = false //
         else return error.Usage;
         try c.db.putShare(share);
+    }
+    tell(c, "share", name);
+}
+
+/// Tells a running `serve` on this store (through its control socket) about
+/// the change just written, so it can drop connections whose access the
+/// change tightens. Silent when no server is running.
+fn tell(c: *Cli, verb: []const u8, name: []const u8) void {
+    const path = c.control orelse return;
+    var line: [control.max_line]u8 = undefined;
+    const text = if (name.len == 0) verb else std.fmt.bufPrint(&line, "{s} {s}", .{ verb, name }) catch return;
+    switch (control.notify(c.io, path, text)) {
+        .done => |n| if (n > 0) std.debug.print("zsmbd: {s}: {d} connection{s} dropped; each reconnects under the new rules\n", .{ name, n, if (n == 1) "" else "s" }),
+        .no_server => {},
+        .denied => std.debug.print("zsmbd: warning: a running server was not told (permission denied on {s}); the change reaches clients on their next connection\n", .{path}),
+        .failed => |why| std.debug.print("zsmbd: warning: a running server was not told: {s}\n", .{why}),
     }
 }
 
@@ -395,6 +418,14 @@ fn serve(c: *Cli) !void {
     };
     defer listener.deinit(c.io);
     std.log.info("zsmbd: SMB on {f} as {s}", .{ saddr, srv.cfg.server_name });
+    var control_socket: ?*control.Listener = null;
+    if (c.control) |path| {
+        if (control.Listener.start(c.gpa, c.io, path, .{ .ctx = &srv, .share = ctlShare, .user = ctlUser, .settings = ctlSettings })) |l| {
+            control_socket = l;
+            std.log.info("zsmbd: control socket {s}", .{path});
+        } else |e| std.log.warn("no control socket at {s}: {s}; CLI changes reach clients on their next connection", .{ path, @errorName(e) });
+    }
+    defer if (control_socket) |l| l.stop();
     if (web_off) {
         std.log.info("zsmbd: no web console (give --web PORT to start it)", .{});
         return srv.acceptLoop(&listener);
@@ -407,7 +438,8 @@ fn serve(c: *Cli) !void {
         .writeActivity = liveActivity,
         .kick = liveKick,
         .reload = liveReload,
-        .shareTightened = liveTightened,
+        .shareChanged = liveShareChanged,
+        .userChanged = liveUserChanged,
     } };
     try admin.serve(addr.?);
 }
@@ -427,8 +459,24 @@ fn liveKick(ctx: ?*anyopaque, conn_id: u64) bool {
     return liveServer(ctx).kick(conn_id);
 }
 
-fn liveTightened(ctx: ?*anyopaque, share: []const u8, anonymous_only: bool) usize {
-    return liveServer(ctx).kickShare(share, anonymous_only);
+fn ctlShare(ctx: ?*anyopaque, name: []const u8) usize {
+    return liveServer(ctx).reconcileShare(name);
+}
+
+fn ctlUser(ctx: ?*anyopaque, name: []const u8) usize {
+    return liveServer(ctx).reconcileUser(name);
+}
+
+fn ctlSettings(ctx: ?*anyopaque) void {
+    liveReload(ctx);
+}
+
+fn liveShareChanged(ctx: ?*anyopaque, share: []const u8) usize {
+    return liveServer(ctx).reconcileShare(share);
+}
+
+fn liveUserChanged(ctx: ?*anyopaque, name: []const u8) usize {
+    return liveServer(ctx).reconcileUser(name);
 }
 
 /// Settings changed in the store; a bad value keeps the old ones.

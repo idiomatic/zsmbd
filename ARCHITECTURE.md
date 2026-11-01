@@ -160,6 +160,8 @@ src/
     auth/
       spnego.zig     minimal DER SPNEGO
       ntlm.zig       NTLMSSP server, NTLMv2 verification
+  control/
+    control.zig      control socket: the CLI tells serve
   web/
     server.zig       admin HTTP server and JSON API
     index.html       single-page UI via @embedFile
@@ -173,6 +175,8 @@ Each folder is a component, and dependencies point one way:
 ```
 main ──► cli ──┬──► web ────┐
                │            ▼
+               ├──► control (std only)
+               │
                └──► smb ──► policy ──► store ──► shared
                      │                   ▲
                      └───────────────────┴──────► shared
@@ -185,6 +189,9 @@ main ──► cli ──┬──► web ────┐
   `smb/`.
 - `web/` uses `policy/` and `store/` and reaches the SMB side only through
   the `web.Live` hooks (section 8).
+- `control/` imports only `std` and `shared/fuzz.zig` (for its fuzz
+  target) and reaches the SMB side only through its `Hooks` (section 8,
+  "Control socket").
 - `smb/` is the only component that knows about connections and threads.
   `smb/server.zig` and `smb/conn.zig` refer to each other, but the cycle
   stays inside the component. `files.zig` gets the share list from the store
@@ -376,7 +383,7 @@ in version control:
 | `--users FILE` | SQLite | FILE |
 | `--config FILE --users FILE` | FILE | FILE (no database is opened; `--db` is refused) |
 
-`--db PATH` names the database for the parts that use it, and has no default: without it, `main` refuses every command that needs a store, except `serve` given ephemeral entries, which uses `:memory:`. A missing text
+`--db PATH` names the database for the parts that use it, and has no default: without it, `main` refuses every command that needs a store, except `serve` with `--db none` or given ephemeral entries, which keeps the store in memory (SQLite's `:memory:` inside; the flag accepts only `none`). A missing text
 file starts empty, and its directory is created. `Db` keeps one interface;
 each method goes to the backend of its part, under the same mutex. Keeping
 users apart lets password hashes have stricter permissions, ownership, or
@@ -946,12 +953,13 @@ messages the CLI prints, because both use `auth.describe`.
 ### Coupling to the SMB side: `web.Live`
 
 The web server does not import `smb/server.zig`. Instead it holds a `Live` value:
-a context pointer and four function pointers.
+a context pointer and five function pointers.
 
 - `writeActivity` writes the activity view (below).
 - `kick` drops a connection by ID.
 - `reload` re-reads settings after a save.
-- `shareTightened` drops the connections using a share that was tightened.
+- `shareChanged` and `userChanged` drop the connections whose access a
+  share or user change tightened.
 
 The defaults report `"smb_running": false`, which lets the admin server run,
 and be tested, without the SMB side. `serve` (`cli.zig`, the one place that
@@ -974,16 +982,61 @@ connection is accepted.
 
 Share changes and connected clients: each `Tree` copies the share's flags at
 TREE_CONNECT, so a change reaches only later connections, except that
-tightening revokes access clients already hold, so the web handlers call
-`shareTightened` (`Server.kickShare`, which picks connections from the
-activity rows with `connectionsOnShare` and shuts their sockets down; each
-client reconnects under the new rules). Tightening means read-only turned on
-or the path changed or the share deleted (every connection using it), or
-guests turned off (only connections whose session on that share is
-anonymous). Relaxing changes drop no one and apply to new connections. The
-response of `PUT` and `DELETE /api/shares` reports `disconnected`, and the
-Shares panel asks first, counting connections from `/api/activity`. A change
-made by the CLI is another process and applies to new connections only.
+tightening revokes access clients already hold. After a change, the web
+handlers call `shareChanged` and `userChanged`, and the control socket
+(below) calls the same functions for CLI changes: `Server.reconcileShare`
+compares the share in the store with what live connections hold (the
+activity rows keep each tree's share, configured path, and read-only flag;
+`staleOnShare` picks the connections) and shuts down the stale ones, so each
+client reconnects under the new rules. Stale means: the share is now
+read-only and the tree was writable, or its path changed, or it was deleted
+(every connection using it), or guests are now off (only connections whose
+session on that share is anonymous). Relaxing changes drop no one and apply
+to new connections. The response of `PUT` and `DELETE /api/shares` reports
+`disconnected`, and the Shares panel asks first, counting connections from
+`/api/activity`. `reconcileUser` drops a user's connections when they lost
+their SMB password or were deleted.
+
+### Control socket: `control/control.zig`
+
+The CLI is another process, so it can't touch a running server's
+connections. After it writes the store it tells `serve` over a Unix domain
+socket, and `serve` re-reads the store and drops the connections whose
+access that tightened (the rule of the previous section).
+
+- **Where.** `PATH.sock` beside the first persistent store: the `--db` path
+  if SQLite is used, else `--config`, else `--users`. An in-memory store has
+  none. Both `serve` and the CLI derive it from the same flags, so the CLI
+  needs none. `--socket PATH` overrides it, and `--socket none` turns it
+  off. A path over 100 bytes (the OS limit is 104 on macOS) disables it:
+  `serve` warns, and the CLI is silent.
+- **Who.** `serve` binds with umask 0177 (mode 0600) and accepts only the
+  same user or root, checked on every connection (`SO_PEERCRED` on Linux,
+  `getpeereid` elsewhere). A leftover socket is replaced only when nothing
+  answers; a live one stops a second server (a warning, not a failure), and
+  a regular file at the path is never touched. The file is removed on a
+  normal exit.
+- **What.** One request line per connection (at most 256 bytes, 2 s
+  timeouts), one reply line:
+
+  ```
+  share NAME      -> ok N | err TEXT
+  user NAME       -> ok N | err TEXT
+  settings        -> ok 0 | err TEXT
+  ```
+
+  `N` is the number of connections dropped. The request names what changed
+  and nothing else: `Server.reconcileShare` and `reconcileUser` compare the
+  new store contents with what live connections hold (`Server.watch`
+  rows keep each tree's share, configured path, and read-only flag), so a
+  request can't make the server do more than re-check. `user` drops a
+  user's connections only if they lost their SMB password or were deleted.
+  New verbs (a log level, shutdown) would be added to `parse` and `Hooks`.
+- **CLI.** After `share`, `user`, and `set` commands, the CLI sends the
+  matching line and prints only when something was dropped (or a warning if
+  the socket exists but refuses it). With no server it prints nothing.
+- **Wiring.** `cli.zig` passes `control.Hooks` to `Listener.start`, with the
+  same server functions the web console's `web.Live` hooks use.
 
 ### Browser UI (`index.html`, partly written)
 

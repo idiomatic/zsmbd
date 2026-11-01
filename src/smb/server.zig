@@ -7,7 +7,9 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const Db = @import("../store/store.zig").Db;
+const db_mod = @import("../store/store.zig");
+const Db = db_mod.Db;
+const Share = db_mod.Share;
 const auth = @import("../policy/auth.zig");
 const conn_mod = @import("conn.zig");
 const Conn = conn_mod.Conn;
@@ -75,6 +77,8 @@ const Watch = struct {
     session_id: u64,
     tree_id: u32,
     name: []u8,
+    /// Tree rows: the share's path as configured when the client connected.
+    path: []u8,
     read_only: bool,
     since_ms: i64,
 };
@@ -232,11 +236,11 @@ pub const Server = struct {
     /// Records a signed-in session (`user` empty for anonymous). Best effort:
     /// the view is for the admin console only.
     pub fn watchSession(srv: *Server, conn_id: u64, session_id: u64, user: []const u8) void {
-        srv.addWatch(.{ .conn_id = conn_id, .session_id = session_id, .tree_id = 0, .name = user, .read_only = false });
+        srv.addWatch(.{ .conn_id = conn_id, .session_id = session_id, .tree_id = 0, .name = user, .path = "", .read_only = false });
     }
 
-    pub fn watchTree(srv: *Server, conn_id: u64, session_id: u64, tree_id: u32, share: []const u8, read_only: bool) void {
-        srv.addWatch(.{ .conn_id = conn_id, .session_id = session_id, .tree_id = tree_id, .name = share, .read_only = read_only });
+    pub fn watchTree(srv: *Server, conn_id: u64, session_id: u64, tree_id: u32, share: []const u8, path: []const u8, read_only: bool) void {
+        srv.addWatch(.{ .conn_id = conn_id, .session_id = session_id, .tree_id = tree_id, .name = share, .path = path, .read_only = read_only });
     }
 
     pub fn unwatchSession(srv: *Server, conn_id: u64, session_id: u64) void {
@@ -252,19 +256,29 @@ pub const Server = struct {
     }
 
     pub fn deinitMonitor(srv: *Server) void {
-        for (srv.watch.items) |w| srv.gpa.free(w.name);
+        for (srv.watch.items) |w| {
+            srv.gpa.free(w.name);
+            srv.gpa.free(w.path);
+        }
         srv.watch.deinit(srv.gpa);
         srv.watch = .empty;
     }
 
-    const NewWatch = struct { conn_id: u64, session_id: u64, tree_id: u32, name: []const u8, read_only: bool };
+    const NewWatch = struct { conn_id: u64, session_id: u64, tree_id: u32, name: []const u8, path: []const u8, read_only: bool };
 
     fn addWatch(srv: *Server, n: NewWatch) void {
         const name = srv.gpa.dupe(u8, n.name) catch return;
+        const path = srv.gpa.dupe(u8, n.path) catch {
+            srv.gpa.free(name);
+            return;
+        };
         const since = srv.nowMs();
         srv.lock();
         defer srv.unlock();
-        srv.watch.append(srv.gpa, .{ .conn_id = n.conn_id, .session_id = n.session_id, .tree_id = n.tree_id, .name = name, .read_only = n.read_only, .since_ms = since }) catch srv.gpa.free(name);
+        srv.watch.append(srv.gpa, .{ .conn_id = n.conn_id, .session_id = n.session_id, .tree_id = n.tree_id, .name = name, .path = path, .read_only = n.read_only, .since_ms = since }) catch {
+            srv.gpa.free(name);
+            srv.gpa.free(path);
+        };
     }
 
     /// Removes the rows of a connection, of one of its sessions (with its
@@ -278,6 +292,7 @@ pub const Server = struct {
                 (tree_id == null or w.tree_id == tree_id.?);
             if (hit) {
                 srv.gpa.free(w.name);
+                srv.gpa.free(w.path);
                 _ = srv.watch.orderedRemove(i);
             } else i += 1;
         }
@@ -367,38 +382,84 @@ pub const Server = struct {
         try j.endObject();
     }
 
-    /// IDs of the connections with a tree on `share` (each once); with
-    /// `anonymous_only`, only those where the tree's session is anonymous.
-    /// Caller frees the slice.
-    pub fn connectionsOnShare(srv: *Server, gpa: Allocator, share: []const u8, anonymous_only: bool) ![]u64 {
+    /// IDs of the connections whose rights on `share` the share as it is now
+    /// (`cur`; null when it is gone) no longer allows: a tree opened writable
+    /// on a share now read-only, a tree on a share that moved, or an
+    /// anonymous session on a share without guests. Relaxing a share makes
+    /// none stale. Caller frees the slice.
+    pub fn staleOnShare(srv: *Server, gpa: Allocator, share: []const u8, cur: ?Share) ![]u64 {
         srv.lock();
         defer srv.unlock();
         var ids: std.ArrayList(u64) = .empty;
         errdefer ids.deinit(gpa);
         for (srv.watch.items) |t| {
             if (t.tree_id == 0 or !std.ascii.eqlIgnoreCase(t.name, share)) continue;
-            if (anonymous_only) {
-                const anonymous = for (srv.watch.items) |s| {
-                    if (s.tree_id == 0 and s.conn_id == t.conn_id and s.session_id == t.session_id) break s.name.len == 0;
-                } else false;
-                if (!anonymous) continue;
-            }
-            if (std.mem.indexOfScalar(u64, ids.items, t.conn_id) == null) try ids.append(gpa, t.conn_id);
+            const stale = if (cur) |c|
+                (!t.read_only and c.read_only) or !std.mem.eql(u8, t.path, c.path) or
+                    (!c.guest_ok and srv.sessionIsAnonymous(t.conn_id, t.session_id))
+            else
+                true;
+            if (stale and std.mem.indexOfScalar(u64, ids.items, t.conn_id) == null) try ids.append(gpa, t.conn_id);
         }
         return ids.toOwnedSlice(gpa);
     }
 
-    /// Drops the connections using `share` after it was tightened (made
-    /// read-only, stripped of guests, moved, or deleted), so each client
+    /// Caller holds the lock.
+    fn sessionIsAnonymous(srv: *Server, conn_id: u64, session_id: u64) bool {
+        for (srv.watch.items) |s| {
+            if (s.tree_id == 0 and s.conn_id == conn_id and s.session_id == session_id) return s.name.len == 0;
+        }
+        return false;
+    }
+
+    /// Call after share `name` changed in the store (or was deleted): drops
+    /// the connections whose access it now tightens, so each client
     /// reconnects under the new rules. Returns how many were dropped.
-    pub fn kickShare(srv: *Server, share: []const u8, anonymous_only: bool) usize {
-        const ids = srv.connectionsOnShare(srv.gpa, share, anonymous_only) catch return 0;
+    pub fn reconcileShare(srv: *Server, name: []const u8) usize {
+        const shares = srv.db.listShares(srv.gpa) catch return 0;
+        defer db_mod.freeShares(srv.gpa, shares);
+        const cur: ?Share = for (shares) |sh| {
+            if (std.ascii.eqlIgnoreCase(sh.name, name)) break sh;
+        } else null;
+        const ids = srv.staleOnShare(srv.gpa, name, cur) catch return 0;
         defer srv.gpa.free(ids);
+        const n = srv.kickAll(ids);
+        if (n > 0) srv.log(0, "share", "{s} changed: {d} connection(s) dropped", .{ name, n });
+        return n;
+    }
+
+    /// IDs of the connections with a session of user `name` (any case).
+    /// Caller frees the slice.
+    pub fn connectionsOfUser(srv: *Server, gpa: Allocator, name: []const u8) ![]u64 {
+        srv.lock();
+        defer srv.unlock();
+        var ids: std.ArrayList(u64) = .empty;
+        errdefer ids.deinit(gpa);
+        for (srv.watch.items) |w| {
+            if (w.tree_id != 0 or w.name.len == 0 or !std.ascii.eqlIgnoreCase(w.name, name)) continue;
+            if (std.mem.indexOfScalar(u64, ids.items, w.conn_id) == null) try ids.append(gpa, w.conn_id);
+        }
+        return ids.toOwnedSlice(gpa);
+    }
+
+    /// Call after user `name` changed in the store: drops their connections
+    /// if they no longer have an SMB password (or no longer exist). A new
+    /// password alone keeps sessions, as on any SMB server.
+    pub fn reconcileUser(srv: *Server, name: []const u8) usize {
+        const nt = srv.db.ntHash(name) catch return 0;
+        if (nt != null) return 0;
+        const ids = srv.connectionsOfUser(srv.gpa, name) catch return 0;
+        defer srv.gpa.free(ids);
+        const n = srv.kickAll(ids);
+        if (n > 0) srv.log(0, "user", "{s} lost SMB access: {d} connection(s) dropped", .{ name, n });
+        return n;
+    }
+
+    fn kickAll(srv: *Server, ids: []const u64) usize {
         var n: usize = 0;
         for (ids) |id| if (srv.kick(id)) {
             n += 1;
         };
-        if (n > 0) srv.log(0, "share", "{s} changed: {d} connection(s) dropped", .{ share, n });
         return n;
     }
 
@@ -508,7 +569,7 @@ test "the activity view lists connections, sessions, trees, and events" {
     try t.srv.conns.append(testing.allocator, c);
     defer t.srv.conns.deinit(testing.allocator);
     t.srv.watchSession(c.id, 7, "hal");
-    t.srv.watchTree(c.id, 7, 3, "data", true);
+    t.srv.watchTree(c.id, 7, 3, "data", "/srv/data", true);
     t.srv.watchSession(c.id, 8, "");
     t.srv.log(c.id, "auth", "hal logged on from {s}", .{"HAL9000"});
 
@@ -559,30 +620,56 @@ test "the event log is written oldest first after it wraps" {
     try testing.expectEqualStrings("event 514", events[events.len - 1].object.get("msg").?.string);
 }
 
-test "connections using a share, optionally only guests" {
+test "which connections a changed share leaves stale" {
     var t: conn_mod.TestConn = undefined;
     try t.init();
     defer t.deinit();
     const srv = &t.srv;
-    // Connection 1: hal and a guest on Data; 2: art on data; 3: art on other.
+    const gpa = testing.allocator;
+    // Connection 1: hal and a guest on Data; 2: art on data, read-only;
+    // 3: art on another share.
     srv.watchSession(1, 7, "hal");
-    srv.watchTree(1, 7, 3, "Data", false);
+    srv.watchTree(1, 7, 3, "Data", "/srv/data", false);
     srv.watchSession(1, 8, "");
-    srv.watchTree(1, 8, 4, "Data", false);
+    srv.watchTree(1, 8, 4, "Data", "/srv/data", false);
     srv.watchSession(2, 9, "art");
-    srv.watchTree(2, 9, 5, "data", false);
+    srv.watchTree(2, 9, 5, "data", "/srv/data", true);
     srv.watchSession(3, 10, "art");
-    srv.watchTree(3, 10, 6, "other", false);
+    srv.watchTree(3, 10, 6, "other", "/srv/other", false);
 
-    const all = try srv.connectionsOnShare(testing.allocator, "DATA", false);
-    defer testing.allocator.free(all);
-    try testing.expectEqualSlices(u64, &.{ 1, 2 }, all);
-    const guests = try srv.connectionsOnShare(testing.allocator, "data", true);
-    defer testing.allocator.free(guests);
-    try testing.expectEqualSlices(u64, &.{1}, guests);
-    const none = try srv.connectionsOnShare(testing.allocator, "missing", false);
-    defer testing.allocator.free(none);
-    try testing.expectEqual(@as(usize, 0), none.len);
-    // No such connection is registered, so nothing is dropped.
-    try testing.expectEqual(@as(usize, 0), srv.kickShare("data", false));
+    const open: Share = .{ .name = "data", .path = "/srv/data", .guest_ok = true };
+    // Unchanged, or relaxed, leaves nobody stale.
+    const same = try srv.staleOnShare(gpa, "DATA", open);
+    defer gpa.free(same);
+    try testing.expectEqual(@as(usize, 0), same.len);
+    // Read-only turned on: the writable trees (connection 1 only).
+    var cur = open;
+    cur.read_only = true;
+    const ro = try srv.staleOnShare(gpa, "data", cur);
+    defer gpa.free(ro);
+    try testing.expectEqualSlices(u64, &.{1}, ro);
+    // Guests turned off: only the guest session's connection.
+    cur = open;
+    cur.guest_ok = false;
+    const noguest = try srv.staleOnShare(gpa, "data", cur);
+    defer gpa.free(noguest);
+    try testing.expectEqualSlices(u64, &.{1}, noguest);
+    // Moved, or deleted: every connection using it.
+    cur = open;
+    cur.path = "/srv/elsewhere";
+    const moved = try srv.staleOnShare(gpa, "data", cur);
+    defer gpa.free(moved);
+    try testing.expectEqualSlices(u64, &.{ 1, 2 }, moved);
+    const gone = try srv.staleOnShare(gpa, "data", null);
+    defer gpa.free(gone);
+    try testing.expectEqualSlices(u64, &.{ 1, 2 }, gone);
+    // Nothing is registered as a live connection, so nothing is dropped.
+    try testing.expectEqual(@as(usize, 0), srv.reconcileShare("data"));
+
+    const art = try srv.connectionsOfUser(gpa, "ART");
+    defer gpa.free(art);
+    try testing.expectEqualSlices(u64, &.{ 2, 3 }, art);
+    const anon = try srv.connectionsOfUser(gpa, "");
+    defer gpa.free(anon);
+    try testing.expectEqual(@as(usize, 0), anon.len);
 }

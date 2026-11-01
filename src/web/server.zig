@@ -36,10 +36,12 @@ pub const Live = struct {
     kick: *const fn (ctx: ?*anyopaque, conn_id: u64) bool = noKick,
     /// Settings changed in the database; reload them.
     reload: *const fn (ctx: ?*anyopaque) void = noReload,
-    /// A share was tightened (read-only on, guests off, moved, or deleted):
-    /// drop the connections using it, or with `anonymous_only` just the guest
-    /// ones. Returns how many were dropped.
-    shareTightened: *const fn (ctx: ?*anyopaque, share: []const u8, anonymous_only: bool) usize = noTightened,
+    /// A share changed in the store (or was deleted): drop the connections
+    /// whose access that tightens. Returns how many were dropped.
+    shareChanged: *const fn (ctx: ?*anyopaque, share: []const u8) usize = noChange,
+    /// A user changed in the store (or was deleted): drop their connections
+    /// if they lost SMB access. Returns how many were dropped.
+    userChanged: *const fn (ctx: ?*anyopaque, name: []const u8) usize = noChange,
 
     fn emptyActivity(_: ?*anyopaque, _: Allocator, w: *Io.Writer) anyerror!void {
         try w.writeAll(
@@ -50,7 +52,7 @@ pub const Live = struct {
         return false;
     }
     fn noReload(_: ?*anyopaque) void {}
-    fn noTightened(_: ?*anyopaque, _: []const u8, _: bool) usize {
+    fn noChange(_: ?*anyopaque, _: []const u8) usize {
         return 0;
     }
 };
@@ -314,17 +316,10 @@ pub const Admin = struct {
         auth.validateSharePath(arena, in.path) catch |e| return respondError(req, .bad_request, auth.describe(e));
         auth.validateComment(in.comment) catch |e| return respondError(req, .bad_request, auth.describe(e));
         const ephemeral = a.db.isEphemeralShare(in.name);
-        const old = try findShare(a.db, arena, in.name);
         try a.db.putShare(.{ .name = in.name, .path = in.path, .comment = in.comment, .read_only = in.read_only, .guest_ok = in.guest_ok });
         // Tightening revokes access clients already have, so they reconnect
         // under the new rules; relaxing changes apply to new connections.
-        var disconnected: usize = 0;
-        if (old) |o| {
-            if ((!o.read_only and in.read_only) or !std.mem.eql(u8, o.path, in.path))
-                disconnected = a.live.shareTightened(a.live.ctx, in.name, false)
-            else if (o.guest_ok and !in.guest_ok)
-                disconnected = a.live.shareTightened(a.live.ctx, in.name, true);
-        }
+        const disconnected = a.live.shareChanged(a.live.ctx, in.name);
         return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral), .disconnected = disconnected });
     }
 
@@ -332,7 +327,7 @@ pub const Admin = struct {
         const name = try queryParam(arena, query, "name") orelse return respondError(req, .bad_request, "missing name");
         const ephemeral = a.db.isEphemeralShare(name);
         if (!try a.db.deleteShare(name)) return respondError(req, .not_found, "no such share");
-        const disconnected = a.live.shareTightened(a.live.ctx, name, false);
+        const disconnected = a.live.shareChanged(a.live.ctx, name);
         return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral), .disconnected = disconnected });
     }
 
@@ -372,6 +367,8 @@ pub const Admin = struct {
         const warning = a.changeUser(in.name, existing == null, in.no_smb_password, in.no_web_password, pw) catch |e|
             return respondError(req, .bad_request, auth.describe(e));
         if (existing) |u| if (in.no_web_password or pw.web != null) a.endUserSessions(u.name);
+        // Losing the SMB password ends the user's SMB connections.
+        if (in.no_smb_password) _ = a.live.userChanged(a.live.ctx, in.name);
         var texts: std.ArrayList([]const u8) = .empty;
         var it = warning.iterator();
         while (it.next()) |w| try texts.append(arena, w.text());
@@ -393,6 +390,7 @@ pub const Admin = struct {
             else => return respondError(req, .bad_request, auth.describe(e)),
         };
         a.endUserSessions(name);
+        _ = a.live.userChanged(a.live.ctx, name);
         return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral) });
     }
 
@@ -428,13 +426,6 @@ pub const Admin = struct {
         return respondJson(req, arena, .{ .ok = true });
     }
 };
-
-/// The share called `name` (any case) as it is now, or null.
-fn findShare(db: *Db, arena: Allocator, name: []const u8) !?db_mod.Share {
-    const shares = try db.listShares(arena);
-    for (shares) |s| if (std.ascii.eqlIgnoreCase(s.name, name)) return s;
-    return null;
-}
 
 /// The warning list of a response about an ephemeral share or user.
 fn ephemeralWarning(ephemeral: bool) []const []const u8 {

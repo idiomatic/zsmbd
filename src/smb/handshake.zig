@@ -426,6 +426,10 @@ pub fn treeConnect(c: *Conn, s: *Session, msg: []const u8, out: *Buf) !TreeOutco
     var share_name: []u8 = undefined;
     var root: [:0]u8 = undefined;
     var read_only = true;
+    // The share's configured path, kept for the activity view and for
+    // noticing that the share has since changed.
+    var configured: []u8 = &.{};
+    defer gpa.free(configured);
     if (ipc) {
         share_name = try gpa.dupe(u8, "IPC$");
         errdefer gpa.free(share_name);
@@ -453,6 +457,7 @@ pub fn treeConnect(c: *Conn, s: *Session, msg: []const u8, out: *Buf) !TreeOutco
         const info = vfs.statPath(root) catch return .{ .status = Status.bad_network_name };
         if (!info.isDir()) return .{ .status = Status.bad_network_name };
         share_name = try gpa.dupe(u8, sh.name);
+        configured = try gpa.dupe(u8, sh.path);
         read_only = sh.read_only;
     }
     errdefer gpa.free(root);
@@ -471,7 +476,7 @@ pub fn treeConnect(c: *Conn, s: *Session, msg: []const u8, out: *Buf) !TreeOutco
         .connected_ms = c.srv.nowMs(),
     };
     try s.trees.put(gpa, id, t);
-    c.srv.watchTree(c.id, s.id, id, share_name, read_only);
+    c.srv.watchTree(c.id, s.id, id, share_name, configured, read_only);
 
     var flags: u32 = proto.ShareFlags.no_caching;
     if (s.encrypt or encryptRequired(c)) flags |= proto.ShareFlags.encrypt_data;

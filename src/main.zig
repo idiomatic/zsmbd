@@ -5,8 +5,12 @@ const Io = std.Io;
 const Db = @import("store/store.zig").Db;
 const auth = @import("policy/auth.zig");
 const cli = @import("cli.zig");
+const control = @import("control/control.zig");
 const usage = cli.usage;
 pub const version = @import("build_options").version;
+
+/// SQLite's name for a database that lives only in memory.
+const memory_db = ":memory:";
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -20,11 +24,18 @@ pub fn main(init: std.process.Init) !void {
 
     var loc: Db.Location = .{};
     var db_given = false;
+    var db_none = false;
+    var socket_arg: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len and std.mem.startsWith(u8, args[i], "--")) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--db") and i + 1 < args.len) {
             i += 1;
-            loc.db = args[i];
+            if (std.mem.eql(u8, args[i], ":memory:")) {
+                std.debug.print("zsmbd: for an in-memory store use --db none (serve only)\n", .{});
+                std.process.exit(2);
+            }
+            db_none = std.mem.eql(u8, args[i], "none");
+            loc.db = if (db_none) null else args[i];
             db_given = true;
         } else if (std.mem.eql(u8, args[i], "--config") and i + 1 < args.len) {
             i += 1;
@@ -34,6 +45,9 @@ pub fn main(init: std.process.Init) !void {
             // Later `--users` wins: a file, or `-` for stdin (serve only).
             loc.users_stdin = std.mem.eql(u8, args[i], "-");
             loc.users = if (loc.users_stdin) null else args[i];
+        } else if (std.mem.eql(u8, args[i], "--socket") and i + 1 < args.len) {
+            i += 1;
+            socket_arg = args[i];
         } else if (std.mem.eql(u8, args[i], "--version")) {
             try out.print("zsmbd {s}\n", .{version});
             return;
@@ -53,23 +67,46 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("zsmbd: --users - works only with serve\n", .{});
         usageExit(args[i]);
     }
+    if (db_none and !std.mem.eql(u8, args[i], "serve")) {
+        std.debug.print("zsmbd: --db none works only with serve\n", .{});
+        usageExit(args[i]);
+    }
     // `hash` makes users-file lines for another machine, so it opens no store.
     const no_store = std.mem.eql(u8, args[i], "hash");
     if (db_given and !loc.usesSqlite() and !no_store) {
         std.log.err("--db is unused when both --config and --users are given", .{});
         std.process.exit(1);
     }
-    if (!no_store and loc.usesSqlite() and loc.db == null) {
-        // Only `serve` with ephemeral entries can run without a database.
-        if (std.mem.eql(u8, args[i], "serve") and givesEphemeral(args[i + 1 ..], loc.users_stdin)) {
-            loc.db = ":memory:";
+    // `--db none`, or `serve` given ephemeral entries and no `--db`, keeps the
+    // store in memory: nothing is stored.
+    var memory_only = false;
+    if (!no_store and loc.usesSqlite() and (db_none or loc.db == null)) {
+        if (db_none) {
+            loc.db = memory_db;
+            memory_only = true;
+            std.log.info("--db none: the store is in memory, so only what this run creates exists", .{});
+        } else if (std.mem.eql(u8, args[i], "serve") and givesEphemeral(args[i + 1 ..], loc.users_stdin)) {
+            loc.db = memory_db;
+            memory_only = true;
             std.log.info("no --db: the store is in memory, so only the ephemeral entries exist", .{});
         } else {
             std.debug.print("zsmbd: give --db PATH to name the SQLite database (or --config FILE and --users FILE)\n", .{});
             usageExit(args[i]);
         }
     }
-    const memory_only = loc.db != null and std.mem.eql(u8, loc.db.?, ":memory:") and !db_given;
+    // The control socket sits beside the store (see control.zig); a path too
+    // long for a socket just turns it off.
+    const control_path: ?[]const u8 = if (no_store) null else control.pathFor(init.arena.allocator(), .{
+        .arg = socket_arg,
+        .db = if (loc.usesSqlite()) loc.db else null,
+        .config = loc.config,
+        .users = loc.users,
+    }) catch |e| blk: {
+        // Only `serve` says so; for the CLI no socket just means no notice.
+        if (e == error.NameTooLong and std.mem.eql(u8, args[i], "serve"))
+            std.log.warn("no control socket: its path is too long for a socket; give --socket PATH", .{});
+        break :blk null;
+    };
     var db: Db = undefined;
     if (!no_store) db = Db.openAt(gpa, io, loc) catch |e| {
         std.log.err("cannot open the store: {s}", .{@errorName(e)});
@@ -78,7 +115,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (!no_store) db.close();
     if (!no_store) db.ephemeral_only = memory_only;
 
-    var c: cli.Cli = .{ .gpa = gpa, .io = io, .db = &db, .out = out, .args = args[i..] };
+    var c: cli.Cli = .{ .gpa = gpa, .io = io, .db = &db, .out = out, .args = args[i..], .control = control_path };
     cli.run(&c) catch |e| {
         out.flush() catch {};
         if (e == error.Usage) usageExit(args[i]);
@@ -113,6 +150,7 @@ test {
     _ = @import("store/textconf.zig");
     _ = @import("store/textusers.zig");
     _ = @import("web/server.zig");
+    _ = @import("control/control.zig");
     _ = @import("smb/rpc.zig");
     _ = @import("smb/auth/ntlm.zig");
     _ = @import("smb/auth/spnego.zig");
