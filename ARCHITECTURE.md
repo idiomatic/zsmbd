@@ -939,7 +939,7 @@ so cleanup is always done by the thread that owns the state.
 | File metadata | `statx` for birth time when available | `stat` with `st_birthtimespec` |
 | Volume sizes | `statvfs` | `statfs` (Darwin struct layout declared in `vfs.zig`) |
 | Case sensitivity | usually case-sensitive; resolver falls back to a case-insensitive scan | APFS is usually case-insensitive already; the fallback rarely runs |
-| Port 445 | needs root or `CAP_NET_BIND_SERVICE` | needs root, and the built-in `smbd` must be off |
+| Port 445 | needs root or `CAP_NET_BIND_SERVICE` | needs root, and the built-in `smbd` must be off; macOS share listing (`smbutil view`) works only on 445 |
 | SQLite | distribution package (Fedora `sqlite-devel`, Alpine `sqlite-dev`) | system `libsqlite3` from the SDK; `-Dsqlite-prefix` for Homebrew |
 
 Supported build targets are macOS and Linux on x86_64 and aarch64.
@@ -1000,14 +1000,13 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 | `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch), signature verification, and decryption, unit-tested and fuzzed; not yet tried with real clients. |
 | `smb/handshake.zig` | NEGOTIATE, the SMB1 upgrade, SESSION_SETUP, and TREE_CONNECT, unit-tested (SESSION_SETUP against an in-test NTLMv2 client) and fuzzed; not yet tried with real clients. |
 | `smb/files.zig` | Written and unit-tested; macOS 15 `mount_smbfs` mounts a read-only share, lists it, and reads files byte-identical. |
-| macOS 15 interop | Keys and signatures verified independently from a capture. `smbutil view` fails ("Broken pipe"): macOS connects to `IPC$` but never opens `srvsvc`, for reasons not yet known. Windows and Linux clients are untested. |
+| macOS 15 interop | Keys and signatures verified independently from a capture. `smbutil view` lists shares through `srvsvc` on port 445; on any other port it fails ("Broken pipe", RPC error `0x16c9a042`) because macOS's RPC layer dials 445 for the pipe. Windows and Linux clients are untested. |
 | `web.Live` over `server.Server` | Not started. |
 | `web/index.html` | Sign-in and SMB password form; the rest is still to come. |
 
 Planned order of work:
 
-1. Run interoperability tests against Windows and Linux clients, and find
-   why macOS share listing fails.
+1. Run interoperability tests against Windows and Linux clients.
 2. Connect `web.Live` (activity, kick, and settings reload; until then a
    settings change needs a restart).
 3. Finish the browser UI.
