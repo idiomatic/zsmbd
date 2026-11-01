@@ -889,6 +889,24 @@ pub const TestConn = struct {
         t.db.close();
     }
 
+    /// Ends every session and drops the tables' capacity, so a fuzz input
+    /// leaves nothing allocated (`--fuzz` checks each input for leaks).
+    pub fn dropSessions(t: *TestConn) void {
+        const gpa = testing.allocator;
+        const c = t.conn;
+        files.closeAll(c, null, null);
+        while (true) {
+            var it = c.sessions.valueIterator();
+            const s = it.next() orelse break;
+            logoff(c, s.*);
+        }
+        c.sessions.clearAndFree(gpa);
+        c.opens.map.clearAndFree(gpa);
+        for (c.notifies.items) |n| gpa.free(n.dir_path);
+        c.notifies.clearAndFree(gpa);
+        t.srv.nodes.clearAndFree(gpa);
+    }
+
     /// A valid, unsigned session 7 with tree 3 on `IPC$`.
     pub fn addSession(t: *TestConn, sign: bool) !*Session {
         const gpa = testing.allocator;
@@ -1199,7 +1217,8 @@ test "fuzz: frames, compound chains, and credits" {
 
     try @import("../shared/fuzz.zig").run(&t, struct {
         fn one(tc: *TestConn, in: []const u8) !void {
-            if (tc.conn.sessions.count() == 0) (try tc.addSession(false)).dec_key = @splat(1);
+            (try tc.addSession(false)).dec_key = @splat(1);
+            defer tc.dropSessions();
             tc.conn.neg.cipher = proto.Cipher.aes128_gcm;
             tc.conn.credits = .{ .high = Credits.window };
             var out = Buf.init(testing.allocator);

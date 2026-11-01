@@ -1110,15 +1110,8 @@ test "fuzz: NEGOTIATE, SESSION_SETUP, and TREE_CONNECT" {
 
     try @import("../shared/fuzz.zig").run(&t, struct {
         fn one(tc: *TestConn, in: []const u8) !void {
-            // Drop sessions that earlier inputs started, keeping session 7.
-            while (true) {
-                var sit = tc.conn.sessions.valueIterator();
-                const extra = while (sit.next()) |x| {
-                    if (x.*.id != 7) break x.*;
-                } else break;
-                conn_mod.logoff(tc.conn, extra);
-            }
-            if (tc.conn.sessions.count() == 0) _ = try tc.addSession(false);
+            _ = try tc.addSession(false);
+            defer tc.dropSessions();
             const s = tc.conn.sessions.get(7).?;
             // Keep the tree table small: drop all but the original IPC$ tree.
             while (s.trees.count() > 1) {

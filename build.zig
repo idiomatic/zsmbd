@@ -40,6 +40,9 @@ pub fn build(b: *std.Build) void {
     mod.addImport("nthash_wasm", wasm_mod);
 
     const exe = b.addExecutable(.{ .name = "zsmbd", .root_module = mod });
+    // On Linux aarch64 Zig can pick an older glibc than the system's, and
+    // the linker then rejects the newer libc symbols that libsqlite3 uses.
+    exe.linker_allow_shlib_undefined = true;
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -49,6 +52,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     const tests = b.addTest(.{ .root_module = mod });
+    tests.linker_allow_shlib_undefined = true;
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
