@@ -161,6 +161,12 @@ bare port listens on `127.0.0.1`. Without it no HTTP listener starts, no
 first-run `admin` is made, and `--web-user` is refused. Manage users and
 shares with the CLI and files instead.
 
+The console's Shares panel has Read-only and Allow guests switches for each
+share. Making a share read-only, or removing guests, disconnects the
+connections using it (a confirmation says how many) so they reconnect under
+the new rules; other changes, and any made with the CLI, apply to new
+connections.
+
 Settings saved in the web console take effect at once; changes made with `zsmbd set` or in a file take effect when `serve` restarts.
 
 ## Storage

@@ -407,6 +407,7 @@ fn serve(c: *Cli) !void {
         .writeActivity = liveActivity,
         .kick = liveKick,
         .reload = liveReload,
+        .shareTightened = liveTightened,
     } };
     try admin.serve(addr.?);
 }
@@ -424,6 +425,10 @@ fn liveActivity(ctx: ?*anyopaque, gpa: Allocator, w: *Io.Writer) anyerror!void {
 
 fn liveKick(ctx: ?*anyopaque, conn_id: u64) bool {
     return liveServer(ctx).kick(conn_id);
+}
+
+fn liveTightened(ctx: ?*anyopaque, share: []const u8, anonymous_only: bool) usize {
+    return liveServer(ctx).kickShare(share, anonymous_only);
 }
 
 /// Settings changed in the store; a bad value keeps the old ones.

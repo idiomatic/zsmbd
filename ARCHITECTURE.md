@@ -946,11 +946,12 @@ messages the CLI prints, because both use `auth.describe`.
 ### Coupling to the SMB side: `web.Live`
 
 The web server does not import `smb/server.zig`. Instead it holds a `Live` value:
-a context pointer and three function pointers.
+a context pointer and four function pointers.
 
 - `writeActivity` writes the activity view (below).
 - `kick` drops a connection by ID.
 - `reload` re-reads settings after a save.
+- `shareTightened` drops the connections using a share that was tightened.
 
 The defaults report `"smb_running": false`, which lets the admin server run,
 and be tested, without the SMB side. `serve` (`cli.zig`, the one place that
@@ -971,9 +972,18 @@ TREE_DISCONNECT, and `removeConn`. `opens` counts file and directory handles
 from the node table, and `peer` is the client's address, set when the
 connection is accepted.
 
-Not covered: a share changed while clients are connected (`read_only`,
-path, deletion) applies only to later TREE_CONNECTs, because each `Tree`
-copies the share's settings.
+Share changes and connected clients: each `Tree` copies the share's flags at
+TREE_CONNECT, so a change reaches only later connections, except that
+tightening revokes access clients already hold, so the web handlers call
+`shareTightened` (`Server.kickShare`, which picks connections from the
+activity rows with `connectionsOnShare` and shuts their sockets down; each
+client reconnects under the new rules). Tightening means read-only turned on
+or the path changed or the share deleted (every connection using it), or
+guests turned off (only connections whose session on that share is
+anonymous). Relaxing changes drop no one and apply to new connections. The
+response of `PUT` and `DELETE /api/shares` reports `disconnected`, and the
+Shares panel asks first, counting connections from `/api/activity`. A change
+made by the CLI is another process and applies to new connections only.
 
 ### Browser UI (`index.html`, partly written)
 
@@ -986,10 +996,20 @@ A single page with no build step and no external assets. So far it has:
   estimator. On submit it checks only that the two entries match, then sends
   `nt_hash`, or `password` when browser hashing is unavailable. It shows any
   warnings the server returns.
+- **Shares** panel: each share with its path and comment, an `ephemeral`
+  badge, and Read-only and Allow guests switches (real checkboxes, so
+  keyboard and screen readers work). A switch sends the whole share in a
+  `PUT /api/shares` with that one flag flipped, disables the row's switches
+  while it saves, then redraws from `GET /api/shares`; a failure puts the
+  switch back and shows the server's message, and the server's warnings (such
+  as the ephemeral one) appear under the list. The panel says that changes
+  apply to new connections, since each `Tree` copies the share's flags at
+  TREE_CONNECT (section 8, "Coupling to the SMB side").
 
 Still to come: tabs for Activity (polled every few seconds; connections with user, client
 address, dialect, signing and encryption state, trees, and open files, plus a
-kick button, the event log, and counters), Shares, Users, and Settings.
+kick button, the event log, and counters), Users, and Settings, and adding,
+renaming, and deleting shares.
 Every mutating `fetch` sends `X-Zsmbd: 1`.
 
 ---

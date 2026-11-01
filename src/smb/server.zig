@@ -367,6 +367,41 @@ pub const Server = struct {
         try j.endObject();
     }
 
+    /// IDs of the connections with a tree on `share` (each once); with
+    /// `anonymous_only`, only those where the tree's session is anonymous.
+    /// Caller frees the slice.
+    pub fn connectionsOnShare(srv: *Server, gpa: Allocator, share: []const u8, anonymous_only: bool) ![]u64 {
+        srv.lock();
+        defer srv.unlock();
+        var ids: std.ArrayList(u64) = .empty;
+        errdefer ids.deinit(gpa);
+        for (srv.watch.items) |t| {
+            if (t.tree_id == 0 or !std.ascii.eqlIgnoreCase(t.name, share)) continue;
+            if (anonymous_only) {
+                const anonymous = for (srv.watch.items) |s| {
+                    if (s.tree_id == 0 and s.conn_id == t.conn_id and s.session_id == t.session_id) break s.name.len == 0;
+                } else false;
+                if (!anonymous) continue;
+            }
+            if (std.mem.indexOfScalar(u64, ids.items, t.conn_id) == null) try ids.append(gpa, t.conn_id);
+        }
+        return ids.toOwnedSlice(gpa);
+    }
+
+    /// Drops the connections using `share` after it was tightened (made
+    /// read-only, stripped of guests, moved, or deleted), so each client
+    /// reconnects under the new rules. Returns how many were dropped.
+    pub fn kickShare(srv: *Server, share: []const u8, anonymous_only: bool) usize {
+        const ids = srv.connectionsOnShare(srv.gpa, share, anonymous_only) catch return 0;
+        defer srv.gpa.free(ids);
+        var n: usize = 0;
+        for (ids) |id| if (srv.kick(id)) {
+            n += 1;
+        };
+        if (n > 0) srv.log(0, "share", "{s} changed: {d} connection(s) dropped", .{ share, n });
+        return n;
+    }
+
     /// Request that a connection be dropped (from the admin UI).
     pub fn kick(srv: *Server, conn_id: u64) bool {
         srv.lock();
@@ -522,4 +557,32 @@ test "the event log is written oldest first after it wraps" {
     try testing.expectEqual(t.srv.events.len, events.len);
     try testing.expectEqualStrings("event 3", events[0].object.get("msg").?.string);
     try testing.expectEqualStrings("event 514", events[events.len - 1].object.get("msg").?.string);
+}
+
+test "connections using a share, optionally only guests" {
+    var t: conn_mod.TestConn = undefined;
+    try t.init();
+    defer t.deinit();
+    const srv = &t.srv;
+    // Connection 1: hal and a guest on Data; 2: art on data; 3: art on other.
+    srv.watchSession(1, 7, "hal");
+    srv.watchTree(1, 7, 3, "Data", false);
+    srv.watchSession(1, 8, "");
+    srv.watchTree(1, 8, 4, "Data", false);
+    srv.watchSession(2, 9, "art");
+    srv.watchTree(2, 9, 5, "data", false);
+    srv.watchSession(3, 10, "art");
+    srv.watchTree(3, 10, 6, "other", false);
+
+    const all = try srv.connectionsOnShare(testing.allocator, "DATA", false);
+    defer testing.allocator.free(all);
+    try testing.expectEqualSlices(u64, &.{ 1, 2 }, all);
+    const guests = try srv.connectionsOnShare(testing.allocator, "data", true);
+    defer testing.allocator.free(guests);
+    try testing.expectEqualSlices(u64, &.{1}, guests);
+    const none = try srv.connectionsOnShare(testing.allocator, "missing", false);
+    defer testing.allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+    // No such connection is registered, so nothing is dropped.
+    try testing.expectEqual(@as(usize, 0), srv.kickShare("data", false));
 }

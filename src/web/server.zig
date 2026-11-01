@@ -36,6 +36,10 @@ pub const Live = struct {
     kick: *const fn (ctx: ?*anyopaque, conn_id: u64) bool = noKick,
     /// Settings changed in the database; reload them.
     reload: *const fn (ctx: ?*anyopaque) void = noReload,
+    /// A share was tightened (read-only on, guests off, moved, or deleted):
+    /// drop the connections using it, or with `anonymous_only` just the guest
+    /// ones. Returns how many were dropped.
+    shareTightened: *const fn (ctx: ?*anyopaque, share: []const u8, anonymous_only: bool) usize = noTightened,
 
     fn emptyActivity(_: ?*anyopaque, _: Allocator, w: *Io.Writer) anyerror!void {
         try w.writeAll(
@@ -46,6 +50,9 @@ pub const Live = struct {
         return false;
     }
     fn noReload(_: ?*anyopaque) void {}
+    fn noTightened(_: ?*anyopaque, _: []const u8, _: bool) usize {
+        return 0;
+    }
 };
 
 const WebSession = struct { user: []u8, expires_ms: i64 };
@@ -307,15 +314,26 @@ pub const Admin = struct {
         auth.validateSharePath(arena, in.path) catch |e| return respondError(req, .bad_request, auth.describe(e));
         auth.validateComment(in.comment) catch |e| return respondError(req, .bad_request, auth.describe(e));
         const ephemeral = a.db.isEphemeralShare(in.name);
+        const old = try findShare(a.db, arena, in.name);
         try a.db.putShare(.{ .name = in.name, .path = in.path, .comment = in.comment, .read_only = in.read_only, .guest_ok = in.guest_ok });
-        return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral) });
+        // Tightening revokes access clients already have, so they reconnect
+        // under the new rules; relaxing changes apply to new connections.
+        var disconnected: usize = 0;
+        if (old) |o| {
+            if ((!o.read_only and in.read_only) or !std.mem.eql(u8, o.path, in.path))
+                disconnected = a.live.shareTightened(a.live.ctx, in.name, false)
+            else if (o.guest_ok and !in.guest_ok)
+                disconnected = a.live.shareTightened(a.live.ctx, in.name, true);
+        }
+        return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral), .disconnected = disconnected });
     }
 
     fn deleteShare(a: *Admin, req: *http.Server.Request, arena: Allocator, query: []const u8) !void {
         const name = try queryParam(arena, query, "name") orelse return respondError(req, .bad_request, "missing name");
         const ephemeral = a.db.isEphemeralShare(name);
         if (!try a.db.deleteShare(name)) return respondError(req, .not_found, "no such share");
-        return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral) });
+        const disconnected = a.live.shareTightened(a.live.ctx, name, false);
+        return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral), .disconnected = disconnected });
     }
 
     fn listUsers(a: *Admin, req: *http.Server.Request, arena: Allocator) !void {
@@ -410,6 +428,13 @@ pub const Admin = struct {
         return respondJson(req, arena, .{ .ok = true });
     }
 };
+
+/// The share called `name` (any case) as it is now, or null.
+fn findShare(db: *Db, arena: Allocator, name: []const u8) !?db_mod.Share {
+    const shares = try db.listShares(arena);
+    for (shares) |s| if (std.ascii.eqlIgnoreCase(s.name, name)) return s;
+    return null;
+}
 
 /// The warning list of a response about an ephemeral share or user.
 fn ephemeralWarning(ephemeral: bool) []const []const u8 {
