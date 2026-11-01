@@ -15,17 +15,17 @@ pub const usage =
     \\usage: zsmbd [--db PATH] [--config FILE] [--users FILE|-] <command>
     \\       zsmbd --version
     \\
-    \\  serve [--smb [ADDR:]PORT] [--web [ADDR:]PORT]
-    \\                                   defaults: 0.0.0.0:445, 127.0.0.1:8445
+    \\  serve [--smb [ADDR:]PORT]    default: 0.0.0.0:445 (0.0.0.0:4450 as user)
+    \\        [--web [ADDR:]PORT]    default: 127.0.0.1:8445
     \\        [--share NAME:PATH[:OPTIONS[:TEXT]]]
     \\        [--user LOGIN:NT_HASH:WEB_HASH]
-    \\        [--smb-user LOGIN:PASSWORD] [--web-user LOGIN:PASSWORD]
-    \\                                   ephemeral shares and logins, kept in memory
+    \\        [--smb-user LOGIN:PASSWORD]    ephemeral
+    \\        [--web-user LOGIN:PASSWORD]    ephemeral
     \\  user list
-    \\  user add LOGIN                   no password: can't sign in until one is set
-    \\  user passwd [--web] LOGIN        prompts for the SMB (or web console) password
+    \\  user add LOGIN                 no password: can't sign in until one is set
+    \\  user passwd [--web] LOGIN      prompts for the SMB (or web console) password
     \\  user passwd --both LOGIN       prompts for one password for both
-    \\  user nopasswd [--web] LOGIN      clears the SMB (or web console) password
+    \\  user nopasswd [--web] LOGIN    clears the SMB (or web console) password
     \\  user nopasswd --both LOGIN     clears both
     \\  user del LOGIN
     \\  share list
@@ -33,13 +33,13 @@ pub const usage =
     \\  share comment SHARE TEXT
     \\  share readonly SHARE
     \\  share readwrite SHARE
-    \\  share guest SHARE                allow guests (no sign-in)
+    \\  share guest SHARE              allow guests (no sign-in)
     \\  share noguest SHARE
     \\  share del SHARE
-    \\  get [KEY]                        show settings
+    \\  get [KEY]                      show settings
     \\  set KEY VALUE
-    \\  hash [--web] [LOGIN]             hash an SMB (or web) password; with LOGIN,
-    \\                                   print a users-file line
+    \\  hash [--web] [LOGIN]           hash an SMB (or web) password; with LOGIN,
+    \\                                 print a users-file line
     \\  hash --both LOGIN              a users-file line with one password for both
     \\  help
     \\
@@ -57,7 +57,7 @@ pub const usage =
     \\Ephemeral entries (repeatable flags; OPTIONS are ro, rw, guest, noguest)
     \\hide stored ones of the same name and can't be changed. Passwords and
     \\hashes on the command line are visible to other users of the host until
-    \\startup; zsmbd then blanks them in the process list, but not in your
+    \\startup; zsmbd then masks them with x in the process list, but not in your
     \\shell history. Prefer --users FILE or --users -.
     \\On first start, an "admin" user with a random web password is created
     \\and the password is printed once.
@@ -312,7 +312,7 @@ fn getCmd(c: *Cli) !void {
 
 fn serve(c: *Cli) !void {
     var web_addr: []const u8 = "8445";
-    var smb_addr: []const u8 = "445";
+    var smb_addr: []const u8 = defaultSmbPort(std.c.geteuid());
     var spec: ephemeral.Spec = .init(c.gpa);
     defer spec.deinit();
     var secrets = false;
@@ -324,12 +324,12 @@ fn serve(c: *Cli) !void {
         else if (std.mem.eql(u8, opt, "--share"))
             spec.addShare(try c.need()) catch |e| return badSpec(opt, e)
         else if (std.mem.eql(u8, opt, "--user") or std.mem.eql(u8, opt, "--smb-user") or std.mem.eql(u8, opt, "--web-user")) {
-            // Copied into the spec, then blanked in the process's argument
+            // Copied into the spec, then masked in the process's argument
             // memory, which `ps` reads, before anything else happens.
             const value = try c.need();
             secrets = true;
             const added = addLogin(c, &spec, opt, value);
-            wipe(value);
+            maskSecret(value);
             added catch |e| return badSpec(opt, e);
         } else
             return error.Usage;
@@ -379,7 +379,7 @@ fn serve(c: *Cli) !void {
     };
     try srv.loadConfig();
     var listener = saddr.listen(c.io, .{ .reuse_address = true }) catch |e| {
-        std.log.err("cannot listen for SMB on {f}: {s} (port 445 may need root; try --smb 4450)", .{ saddr, @errorName(e) });
+        std.log.err("cannot listen for SMB on {f}: {s} (ports below 1024 need root; try --smb 4450)", .{ saddr, @errorName(e) });
         return e;
     };
     defer listener.deinit(c.io);
@@ -387,8 +387,33 @@ fn serve(c: *Cli) !void {
     const smb_thread = try std.Thread.spawn(.{}, smb_server.Server.acceptLoop, .{ &srv, &listener });
     smb_thread.detach();
 
-    var admin: web.Admin = .{ .gpa = c.gpa, .io = c.io, .db = c.db };
+    var admin: web.Admin = .{ .gpa = c.gpa, .io = c.io, .db = c.db, .live = .{
+        .ctx = &srv,
+        .writeActivity = liveActivity,
+        .kick = liveKick,
+        .reload = liveReload,
+    } };
     try admin.serve(addr);
+}
+
+// The admin web server reaches the SMB server only through these hooks
+// (web.Live), because `web/` may not import `smb/`.
+
+fn liveServer(ctx: ?*anyopaque) *smb_server.Server {
+    return @ptrCast(@alignCast(ctx.?));
+}
+
+fn liveActivity(ctx: ?*anyopaque, gpa: Allocator, w: *Io.Writer) anyerror!void {
+    return liveServer(ctx).writeActivity(gpa, w);
+}
+
+fn liveKick(ctx: ?*anyopaque, conn_id: u64) bool {
+    return liveServer(ctx).kick(conn_id);
+}
+
+/// Settings changed in the store; a bad value keeps the old ones.
+fn liveReload(ctx: ?*anyopaque) void {
+    liveServer(ctx).loadConfig() catch |e| std.log.warn("settings not reloaded: {s}", .{@errorName(e)});
 }
 
 /// Adds the login of `--user`, `--smb-user`, or `--web-user` to `spec`,
@@ -399,15 +424,24 @@ fn addLogin(c: *Cli, spec: *ephemeral.Spec, opt: []const u8, value: []const u8) 
     while (it.next()) |w| warn(w);
 }
 
+/// Only root can listen on 445, so everyone else gets a high port.
+fn defaultSmbPort(euid: std.c.uid_t) []const u8 {
+    return if (euid == 0) "445" else "4450";
+}
+
 /// Reports a bad `--share`, `--user`, or login option; a usage error.
 fn badSpec(opt: []const u8, e: anyerror) error{Usage} {
     std.debug.print("zsmbd: {s}: {s}\n", .{ opt, auth.describe(e) });
     return error.Usage;
 }
 
-/// Blanks an argument in place: `args` point into the process's argv strings.
-fn wipe(arg: []const u8) void {
-    std.crypto.secureZero(u8, @constCast(arg));
+/// Masks the secret of a `LOGIN:SECRET` argument with `X`, in place (`args`
+/// point into the process's argv strings), so `ps` still shows the login;
+/// with no colon the whole value is masked. Volatile stores, so the compiler
+/// can't drop them. The mask keeps the secret's length.
+fn maskSecret(arg: []const u8) void {
+    const from = if (std.mem.indexOfScalar(u8, arg, ':')) |i| i + 1 else 0;
+    for (@constCast(arg[from..])) |*b| @as(*volatile u8, b).* = 'X';
 }
 
 const max_stdin = 1024 * 1024;
@@ -429,6 +463,26 @@ fn parseAddr(s: []const u8, default_host: []const u8) !Io.net.IpAddress {
     if (host.len == 0) host = default_host;
     if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']') host = host[1 .. host.len - 1];
     return Io.net.IpAddress.parse(host, port);
+}
+
+test "masking keeps the login and hides the secret" {
+    var a = "brian:peekaboo".*;
+    maskSecret(&a);
+    try std.testing.expectEqualStrings("brian:xxxxxxxx", &a);
+    var h = "art:00112233:$argon2id$x".*;
+    maskSecret(&h);
+    try std.testing.expectEqualStrings("art:xxxxxxxxxxxxxxxxxxxx", &h);
+    var n = "nocolon".*;
+    maskSecret(&n);
+    try std.testing.expectEqualStrings("xxxxxxx", &n);
+    var e = "hal:".*;
+    maskSecret(&e);
+    try std.testing.expectEqualStrings("hal:", &e);
+}
+
+test "the SMB port defaults to 445 only for root" {
+    try std.testing.expectEqualStrings("445", defaultSmbPort(0));
+    try std.testing.expectEqualStrings("4450", defaultSmbPort(501));
 }
 
 test "listen addresses default their host" {

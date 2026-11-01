@@ -129,6 +129,10 @@ pub const Conn = struct {
     srv: *Server,
     id: u64,
     stream: net.Stream,
+    connected_ms: i64 = 0,
+    /// The client's address and port, as text, for the activity view.
+    peer: [64]u8 = undefined,
+    peer_len: u8 = 0,
     refs: std.atomic.Value(u32) = .init(1),
     closed: std.atomic.Value(bool) = .init(false),
     neg: files.Negotiated = .{},
@@ -709,6 +713,7 @@ fn cancel(c: *Conn, msg: []const u8, encrypted: bool) void {
 /// LOGOFF: close the session's handles and trees, then forget it.
 pub fn logoff(c: *Conn, s: *Session) void {
     files.closeAll(c, s.id, null);
+    c.srv.unwatchSession(c.id, s.id);
     _ = c.sessions.remove(s.id);
     freeSession(c.gpa, s);
 }
@@ -716,6 +721,7 @@ pub fn logoff(c: *Conn, s: *Session) void {
 /// TREE_DISCONNECT: close the tree's handles, then forget it.
 pub fn disconnectTree(c: *Conn, s: *Session, t: *Tree) void {
     files.closeAll(c, s.id, t);
+    c.srv.unwatchTree(c.id, s.id, t.id);
     _ = s.trees.remove(t.id);
     freeTree(c.gpa, t);
 }
@@ -879,6 +885,7 @@ pub const TestConn = struct {
         c.notifies.deinit(gpa);
         gpa.destroy(c);
         t.srv.nodes.deinit(gpa);
+        t.srv.deinitMonitor();
         t.db.close();
     }
 

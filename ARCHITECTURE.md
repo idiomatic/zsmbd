@@ -94,7 +94,8 @@ client fallback.
    (a separate process)
 ```
 
-One process hosts two listeners: SMB (`--smb`, default `0.0.0.0:445`) and
+One process hosts two listeners: SMB (`--smb`, default `0.0.0.0:445`, or
+`0.0.0.0:4450` unless run as root) and
 the admin web server (`--web`, default `127.0.0.1:8445`). Each flag takes
 `ADDR:PORT` or just `PORT` (or `:PORT`), and a missing address keeps that
 listener's default, so `--smb 4450` still listens on every interface and
@@ -349,8 +350,9 @@ stored part:
   ephemeral, and any other change is `error.ReadOnly`. `bootstrap` creates no
   `admin`.
 - Argument values that may hold secrets (`--user`, `--smb-user`, `--web-user`)
-  are copied into the spec and then zeroed in place in the process's argv
-  (`cli.wipe`), before any listener starts; `serve` warns that the values were
+  are copied into the spec and then masked with `x` in place in the process's
+  argv (`cli.maskSecret`: everything after the login's colon, so `ps` shows
+  `brian:xxxxxxxx`), before any listener starts; `serve` warns that the values were
   readable until then. Passwords are hashed at startup and the copies wiped.
 
 ### Plain-text files: `store/textconf.zig`, `store/textusers.zig`
@@ -934,17 +936,32 @@ messages the CLI prints, because both use `auth.describe`.
 The web server does not import `smb/server.zig`. Instead it holds a `Live` value:
 a context pointer and three function pointers.
 
-- `writeActivity` writes `{"connections":[…],"events":[…],"stats":{…}}`.
+- `writeActivity` writes the activity view (below).
 - `kick` drops a connection by ID.
 - `reload` re-reads settings after a save.
 
 The defaults report `"smb_running": false`, which lets the admin server run,
-and be tested, without the SMB side. `serve` now creates the
-`server.Server` and starts the SMB listener but still leaves `Live` at its
-defaults; it is to point `Live` at functions that, under the server lock, walk `conns` (each with its
-sessions, trees, and opens), copy the event ring, and read the counters;
-call `Server.kick`, which shuts the socket down so the connection's own
-thread tears it down; and call `Server.loadConfig`.
+and be tested, without the SMB side. `serve` (`cli.zig`, the one place that
+sees both sides) points `Live` at `Server.writeActivity`, `Server.kick`
+(which shuts the socket down so the connection's own thread tears it
+down), and `Server.loadConfig` (a bad value is logged and the old settings
+stay).
+
+The activity view is
+`{"smb_running","server":{name,port,start_ms,now_ms},"connections":[`
+`{id,peer,connected_ms,opens,sessions:[{id,user,anonymous,since_ms,`
+`trees:[{id,share,read_only,since_ms}]}]}],"events":[{time_ms,conn_id,`
+`kind,msg}],"stats":{…}}`, events oldest first (up to 512). A connection's
+sessions and trees belong to its own thread, so the view reads copies kept
+under the server lock: `Server.watch` has one row per valid session or tree,
+added in `handshake.zig` (logon, TREE_CONNECT) and removed by LOGOFF,
+TREE_DISCONNECT, and `removeConn`. `opens` counts file and directory handles
+from the node table, and `peer` is the client's address, set when the
+connection is accepted.
+
+Not covered: a share changed while clients are connected (`read_only`,
+path, deletion) applies only to later TREE_CONNECTs, because each `Tree`
+copies the share's settings.
 
 ### Browser UI (`index.html`, partly written)
 
@@ -1085,12 +1102,11 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 | `smb/handshake.zig` | NEGOTIATE, the SMB1 upgrade, SESSION_SETUP, and TREE_CONNECT, unit-tested (SESSION_SETUP against an in-test NTLMv2 client) and fuzzed; not yet tried with real clients. |
 | `smb/files.zig` | Written and unit-tested; macOS 15 `mount_smbfs` mounts a read-only share, lists it, and reads files byte-identical. |
 | macOS 15 interop | Keys and signatures verified independently from a capture. `smbutil view` lists shares through `srvsvc` on port 445; on any other port it fails ("Broken pipe", RPC error `0x16c9a042`) because macOS's RPC layer dials 445 for the pipe. Windows and Linux clients are untested. |
-| `web.Live` over `server.Server` | Not started. |
+| `web.Live` over `server.Server` | Written: activity, kick, and settings reload, with unit tests and a live run (a raw TCP client listed, kicked, and gone; a settings save reloaded), and a macOS `mount_smbfs` session and tree appeared and vanished on unmount. |
 | `web/index.html` | Sign-in and SMB password form; the rest is still to come. |
 
 Planned order of work:
 
 1. Run interoperability tests against Windows and Linux clients.
-2. Connect `web.Live` (activity, kick, and settings reload; until then a
-   settings change needs a restart).
-3. Finish the browser UI.
+2. Finish the browser UI (activity table, kick, shares, users,
+   settings); share changes for connected clients.

@@ -1,7 +1,8 @@
 //! Process-wide server state shared by SMB connection threads and the admin
 //! web server: configuration snapshot, live connection registry, the table of
-//! open file nodes (share modes, delete-pending, byte-range locks) and an
-//! activity log ring.
+//! open file nodes (share modes, delete-pending, byte-range locks), an
+//! activity log ring, and the view of who is signed in to what that the admin
+//! web server shows (`writeActivity`).
 
 const std = @import("std");
 const Io = std.Io;
@@ -66,6 +67,18 @@ pub const Event = struct {
     }
 };
 
+/// One row of the activity view: a valid session (`tree_id` 0, `name` the
+/// user, empty for anonymous) or one of its trees (`name` the share). The
+/// rows mirror `Conn.sessions`, which only the connection's thread may read.
+const Watch = struct {
+    conn_id: u64,
+    session_id: u64,
+    tree_id: u32,
+    name: []u8,
+    read_only: bool,
+    since_ms: i64,
+};
+
 pub const Stats = struct {
     connections_total: std.atomic.Value(u64) = .init(0),
     bytes_in: std.atomic.Value(u64) = .init(0),
@@ -92,6 +105,7 @@ pub const Server = struct {
     events: [512]Event = undefined,
     event_head: usize = 0,
     event_count: usize = 0,
+    watch: std.ArrayList(Watch) = .empty,
 
     stats: Stats = .{},
     next_id: std.atomic.Value(u64) = .init(1),
@@ -185,6 +199,9 @@ pub const Server = struct {
             srv.gpa.destroy(c);
             return e;
         };
+        c.connected_ms = srv.nowMs();
+        const peer = std.fmt.bufPrint(&c.peer, "{f}", .{stream.socket.address}) catch c.peer[0..0];
+        c.peer_len = @intCast(peer.len);
         const t = std.Thread.spawn(.{}, conn_mod.serve, .{c}) catch |e| {
             srv.removeConn(c);
             srv.gpa.destroy(c);
@@ -203,10 +220,151 @@ pub const Server = struct {
     pub fn removeConn(srv: *Server, c: *Conn) void {
         srv.lock();
         defer srv.unlock();
+        srv.dropWatch(c.id, null, null);
         for (srv.conns.items, 0..) |x, i| if (x == c) {
             _ = srv.conns.swapRemove(i);
             break;
         };
+    }
+
+    // ------------------------------------------------------------ activity view
+
+    /// Records a signed-in session (`user` empty for anonymous). Best effort:
+    /// the view is for the admin console only.
+    pub fn watchSession(srv: *Server, conn_id: u64, session_id: u64, user: []const u8) void {
+        srv.addWatch(.{ .conn_id = conn_id, .session_id = session_id, .tree_id = 0, .name = user, .read_only = false });
+    }
+
+    pub fn watchTree(srv: *Server, conn_id: u64, session_id: u64, tree_id: u32, share: []const u8, read_only: bool) void {
+        srv.addWatch(.{ .conn_id = conn_id, .session_id = session_id, .tree_id = tree_id, .name = share, .read_only = read_only });
+    }
+
+    pub fn unwatchSession(srv: *Server, conn_id: u64, session_id: u64) void {
+        srv.lock();
+        defer srv.unlock();
+        srv.dropWatch(conn_id, session_id, null);
+    }
+
+    pub fn unwatchTree(srv: *Server, conn_id: u64, session_id: u64, tree_id: u32) void {
+        srv.lock();
+        defer srv.unlock();
+        srv.dropWatch(conn_id, session_id, tree_id);
+    }
+
+    pub fn deinitMonitor(srv: *Server) void {
+        for (srv.watch.items) |w| srv.gpa.free(w.name);
+        srv.watch.deinit(srv.gpa);
+        srv.watch = .empty;
+    }
+
+    const NewWatch = struct { conn_id: u64, session_id: u64, tree_id: u32, name: []const u8, read_only: bool };
+
+    fn addWatch(srv: *Server, n: NewWatch) void {
+        const name = srv.gpa.dupe(u8, n.name) catch return;
+        const since = srv.nowMs();
+        srv.lock();
+        defer srv.unlock();
+        srv.watch.append(srv.gpa, .{ .conn_id = n.conn_id, .session_id = n.session_id, .tree_id = n.tree_id, .name = name, .read_only = n.read_only, .since_ms = since }) catch srv.gpa.free(name);
+    }
+
+    /// Removes the rows of a connection, of one of its sessions (with its
+    /// trees), or of one tree. Caller holds the lock.
+    fn dropWatch(srv: *Server, conn_id: u64, session_id: ?u64, tree_id: ?u32) void {
+        var i: usize = 0;
+        while (i < srv.watch.items.len) {
+            const w = srv.watch.items[i];
+            const hit = w.conn_id == conn_id and
+                (session_id == null or w.session_id == session_id.?) and
+                (tree_id == null or w.tree_id == tree_id.?);
+            if (hit) {
+                srv.gpa.free(w.name);
+                _ = srv.watch.orderedRemove(i);
+            } else i += 1;
+        }
+    }
+
+    /// Writes the activity view as JSON for the admin console: the server,
+    /// its connections with their sessions and trees, the event log (oldest
+    /// first), and the counters. The caller's `gpa` is scratch space.
+    pub fn writeActivity(srv: *Server, gpa: Allocator, w: *Io.Writer) !void {
+        const now = srv.nowMs();
+        srv.lock();
+        defer srv.unlock();
+        var open_counts: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+        defer open_counts.deinit(gpa);
+        var nodes = srv.nodes.valueIterator();
+        while (nodes.next()) |n| for (n.*.opens.items) |o| {
+            const gop = try open_counts.getOrPut(gpa, o.conn.id);
+            gop.value_ptr.* = if (gop.found_existing) gop.value_ptr.* + 1 else 1;
+        };
+
+        var j: std.json.Stringify = .{ .writer = w };
+        try j.beginObject();
+        try j.objectField("smb_running");
+        try j.write(true);
+        try j.objectField("server");
+        try j.write(.{ .name = srv.cfg.server_name, .port = srv.smb_port, .start_ms = srv.start_ms, .now_ms = now });
+
+        try j.objectField("connections");
+        try j.beginArray();
+        for (srv.conns.items) |c| {
+            try j.beginObject();
+            try j.objectField("id");
+            try j.write(c.id);
+            try j.objectField("peer");
+            try j.write(c.peer[0..c.peer_len]);
+            try j.objectField("connected_ms");
+            try j.write(c.connected_ms);
+            try j.objectField("opens");
+            try j.write(open_counts.get(c.id) orelse 0);
+            try j.objectField("sessions");
+            try j.beginArray();
+            for (srv.watch.items) |s| {
+                if (s.conn_id != c.id or s.tree_id != 0) continue;
+                try j.beginObject();
+                try j.objectField("id");
+                try j.write(s.session_id);
+                try j.objectField("user");
+                try j.write(s.name);
+                try j.objectField("anonymous");
+                try j.write(s.name.len == 0);
+                try j.objectField("since_ms");
+                try j.write(s.since_ms);
+                try j.objectField("trees");
+                try j.beginArray();
+                for (srv.watch.items) |t| {
+                    if (t.conn_id != c.id or t.session_id != s.session_id or t.tree_id == 0) continue;
+                    try j.write(.{ .id = t.tree_id, .share = t.name, .read_only = t.read_only, .since_ms = t.since_ms });
+                }
+                try j.endArray();
+                try j.endObject();
+            }
+            try j.endArray();
+            try j.endObject();
+        }
+        try j.endArray();
+
+        try j.objectField("events");
+        try j.beginArray();
+        const first = (srv.event_head + srv.events.len - srv.event_count) % srv.events.len;
+        for (0..srv.event_count) |k| {
+            const e = &srv.events[(first + k) % srv.events.len];
+            try j.write(.{ .time_ms = e.time_ms, .conn_id = e.conn_id, .kind = e.kindStr(), .msg = e.msgStr() });
+        }
+        try j.endArray();
+
+        try j.objectField("stats");
+        try j.write(.{
+            .connections_now = srv.conns.items.len,
+            .connections_total = srv.stats.connections_total.load(.monotonic),
+            .bytes_in = srv.stats.bytes_in.load(.monotonic),
+            .bytes_out = srv.stats.bytes_out.load(.monotonic),
+            .data_read = srv.stats.data_read.load(.monotonic),
+            .data_written = srv.stats.data_written.load(.monotonic),
+            .requests = srv.stats.requests.load(.monotonic),
+            .logon_failures = srv.stats.logon_failures.load(.monotonic),
+        });
+        try j.endObject();
     }
 
     /// Request that a connection be dropped (from the admin UI).
@@ -301,4 +459,67 @@ test "loadConfig reads yes and no as hand-edited text files write them" {
     try t.srv.loadConfig();
     defer t.srv.cfg.free(testing.allocator);
     try testing.expect(t.srv.cfg.encrypt and !t.srv.cfg.signing_required);
+}
+
+test "the activity view lists connections, sessions, trees, and events" {
+    var t: conn_mod.TestConn = undefined;
+    try t.init();
+    defer t.deinit();
+    const c = t.conn;
+    c.connected_ms = 5;
+    const peer = "127.0.0.1:50000";
+    @memcpy(c.peer[0..peer.len], peer);
+    c.peer_len = peer.len;
+    try t.srv.conns.append(testing.allocator, c);
+    defer t.srv.conns.deinit(testing.allocator);
+    t.srv.watchSession(c.id, 7, "hal");
+    t.srv.watchTree(c.id, 7, 3, "data", true);
+    t.srv.watchSession(c.id, 8, "");
+    t.srv.log(c.id, "auth", "hal logged on from {s}", .{"HAL9000"});
+
+    var aw: Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try t.srv.writeActivity(testing.allocator, &aw.writer);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expect(root.get("smb_running").?.bool);
+    const conn = root.get("connections").?.array.items[0].object;
+    try testing.expectEqualStrings(peer, conn.get("peer").?.string);
+    try testing.expectEqual(@as(i64, 5), conn.get("connected_ms").?.integer);
+    const sessions = conn.get("sessions").?.array.items;
+    try testing.expectEqual(@as(usize, 2), sessions.len);
+    try testing.expectEqualStrings("hal", sessions[0].object.get("user").?.string);
+    try testing.expect(!sessions[0].object.get("anonymous").?.bool and sessions[1].object.get("anonymous").?.bool);
+    const tree = sessions[0].object.get("trees").?.array.items[0].object;
+    try testing.expectEqualStrings("data", tree.get("share").?.string);
+    try testing.expect(tree.get("read_only").?.bool);
+    try testing.expectEqual(@as(usize, 0), sessions[1].object.get("trees").?.array.items.len);
+    const event = root.get("events").?.array.items[0].object;
+    try testing.expectEqualStrings("auth", event.get("kind").?.string);
+    try testing.expectEqualStrings("hal logged on from HAL9000", event.get("msg").?.string);
+    try testing.expectEqual(@as(i64, 1), root.get("stats").?.object.get("connections_now").?.integer);
+
+    // Trees, sessions, and finally the connection drop their rows.
+    t.srv.unwatchTree(c.id, 7, 3);
+    t.srv.unwatchSession(c.id, 8);
+    try testing.expectEqual(@as(usize, 1), t.srv.watch.items.len);
+    t.srv.removeConn(c);
+    try testing.expectEqual(@as(usize, 0), t.srv.watch.items.len);
+}
+
+test "the event log is written oldest first after it wraps" {
+    var t: conn_mod.TestConn = undefined;
+    try t.init();
+    defer t.deinit();
+    for (0..t.srv.events.len + 3) |i| t.srv.log(1, "n", "event {d}", .{i});
+    var aw: Io.Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    try t.srv.writeActivity(testing.allocator, &aw.writer);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, aw.written(), .{});
+    defer parsed.deinit();
+    const events = parsed.value.object.get("events").?.array.items;
+    try testing.expectEqual(t.srv.events.len, events.len);
+    try testing.expectEqualStrings("event 3", events[0].object.get("msg").?.string);
+    try testing.expectEqualStrings("event 514", events[events.len - 1].object.get("msg").?.string);
 }

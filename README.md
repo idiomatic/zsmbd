@@ -42,9 +42,10 @@ zig build test
 
 Add a share and an SMB user, then start the server. `--db` names the SQLite
 database (created on first use) and is required with every command that uses
-it. Port 445 needs root on Linux and macOS. To test without root, give just a
-port, as in `zsmbd --db zsmbd.db serve --smb 4450`; a missing address keeps the
-default.
+it. Only root can listen on SMB's port 445 on Linux and macOS, so the SMB
+port defaults to 445 for root and to 4450 for everyone else. Give `--smb`
+to choose (a bare port keeps the default address), as in
+`zsmbd --db zsmbd.db serve --smb 4455`.
 
 ```bash
 zsmbd --db zsmbd.db share add data /srv/data
@@ -67,7 +68,8 @@ password, from stdin. On first start, zsmbd creates the
 web console user `admin` and prints its random password once. The console is
 at <http://127.0.0.1:8445/>.
 
-Connect from a client:
+Connect from a client. On port 4450, name the port, as in
+`smb://HOST:4450/data` on macOS; other clients have their own port options.
 
 | Client | Command |
 |---|---|
@@ -80,13 +82,15 @@ Connect from a client:
 ```
 zsmbd [--db PATH] [--config FILE] [--users FILE|-] CMD
 
-  serve [--smb [ADDR:]PORT] [--web [ADDR:]PORT]
+  serve [--smb [ADDR:]PORT]
+          default: 0.0.0.0:445 (0.0.0.0:4450 as user)
+        [--web [ADDR:]PORT]
+          default: 127.0.0.1:8445
         [--share NAME:PATH[:OPTIONS[:TEXT]]]
         [--user LOGIN:NT_HASH:WEB_HASH]
         [--smb-user LOGIN:PASSWORD]
         [--web-user LOGIN:PASSWORD]
-      defaults: 0.0.0.0:445 and 127.0.0.1:8445; the
-      --share and user flags are ephemeral
+          the last four are ephemeral, in memory
   user list
   user add LOGIN
       no password: can't sign in until one is set
@@ -152,7 +156,7 @@ The last user with a web password can't be deleted or lose it.
 zsmbd set encrypt yes
 ```
 
-Settings take effect when `serve` restarts.
+Settings saved in the web console take effect at once; changes made with `zsmbd set` or in a file take effect when `serve` restarts.
 
 ## Storage
 
@@ -196,7 +200,8 @@ or `--users -`, skips creating the first-run `admin`.
 **Passwords and hashes on the command line are visible** to other users of the
 host (in `ps`) until `serve` starts, and stay in your shell history and audit
 logs; an NT hash is as good as the password to anyone who sees it. `serve`
-blanks them in its argument list right after parsing and warns, but prefer
+masks them with `x` in its argument list right after parsing (the login
+stays visible, and the length of the secret does) and warns, but prefer
 `--users FILE` or `--users -`. With bash, a leading space keeps a command out
 of the history when `HISTCONTROL=ignorespace`.
 

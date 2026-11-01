@@ -378,6 +378,7 @@ fn setupStep(c: *Conn, s: *Session, client_mode: u8, token: []const u8, out: *Bu
     s.auth.?.deinit();
     s.auth = null;
     s.state = .valid;
+    c.srv.watchSession(c.id, s.id, if (s.anonymous) "" else s.user);
     if (s.anonymous)
         c.srv.log(c.id, "auth", "anonymous logon", .{})
     else
@@ -470,6 +471,7 @@ pub fn treeConnect(c: *Conn, s: *Session, msg: []const u8, out: *Buf) !TreeOutco
         .connected_ms = c.srv.nowMs(),
     };
     try s.trees.put(gpa, id, t);
+    c.srv.watchTree(c.id, s.id, id, share_name, read_only);
 
     var flags: u32 = proto.ShareFlags.no_caching;
     if (s.encrypt or encryptRequired(c)) flags |= proto.ShareFlags.encrypt_data;
