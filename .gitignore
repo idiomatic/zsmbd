@@ -2,6 +2,8 @@
 zig-out/
 .DS_Store
 *.db
+*.db-shm
+*.db-wal
 *~
 AGENTS?*.md
 var/

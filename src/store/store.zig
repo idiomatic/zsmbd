@@ -12,12 +12,13 @@ const textconf = @import("textconf.zig");
 const textusers = @import("textusers.zig");
 
 pub const Error = types.Error;
-pub const Role = types.Role;
+pub const Change = types.Change;
 pub const Share = types.Share;
 pub const User = types.User;
 pub const UserAuth = types.UserAuth;
 pub const freeShares = types.freeShares;
 pub const freeUsers = types.freeUsers;
+pub const userLine = textusers.formatLine;
 
 pub const Db = struct {
     /// Set when either part uses SQLite.
@@ -83,7 +84,7 @@ pub const Db = struct {
 
     // ------------------------------------------------------------ users
 
-    /// NT hash for SMB logins; null for unknown users and for admins.
+    /// NT hash for SMB logins; null for unknown users and users without one.
     pub fn ntHash(db: *Db, name: []const u8) Error!?[16]u8 {
         db.mutex.lockUncancelable(db.io);
         defer db.mutex.unlock(db.io);
@@ -98,13 +99,13 @@ pub const Db = struct {
         return db.sqlite.?.userAuth(gpa, name);
     }
 
-    /// Create or update a user. A null hash leaves that password unchanged
-    /// (absent for a new user); a password the role doesn't use is cleared.
-    pub fn putUser(db: *Db, name: []const u8, role: Role, nt_hash: ?[16]u8, pw_hash: ?[]const u8, now: i64) Error!void {
+    /// Create or update a user, setting, keeping, or clearing each password
+    /// hash; a kept hash of a new user is absent.
+    pub fn putUser(db: *Db, name: []const u8, nt_hash: Change([16]u8), web_hash: Change([]const u8), now: i64) Error!void {
         db.mutex.lockUncancelable(db.io);
         defer db.mutex.unlock(db.io);
-        if (db.users) |t| return t.putUser(name, role, nt_hash, pw_hash, now);
-        return db.sqlite.?.putUser(name, role, nt_hash, pw_hash, now);
+        if (db.users) |t| return t.putUser(name, nt_hash, web_hash, now);
+        return db.sqlite.?.putUser(name, nt_hash, web_hash, now);
     }
 
     pub fn deleteUser(db: *Db, name: []const u8) Error!bool {
@@ -114,12 +115,12 @@ pub const Db = struct {
         return db.sqlite.?.deleteUser(name);
     }
 
-    /// Users who can sign in to the web console (admins and hybrids).
-    pub fn countAdmins(db: *Db) Error!i64 {
+    /// Users who can sign in to the web console (those with a web password).
+    pub fn countWebUsers(db: *Db) Error!i64 {
         db.mutex.lockUncancelable(db.io);
         defer db.mutex.unlock(db.io);
-        if (db.users) |t| return t.countAdmins();
-        return db.sqlite.?.countAdmins();
+        if (db.users) |t| return t.countWebUsers();
+        return db.sqlite.?.countWebUsers();
     }
 
     pub fn listUsers(db: *Db, gpa: Allocator) Error![]User {

@@ -82,7 +82,10 @@ client fallback.
 ```
 
 One process hosts two listeners: SMB (`--smb`, default `0.0.0.0:445`) and
-the admin web server (`--web`). `serve` binds the SMB port first and fails
+the admin web server (`--web`, default `127.0.0.1:8445`). Each flag takes
+`ADDR:PORT` or just `PORT` (or `:PORT`), and a missing address keeps that
+listener's default, so `--smb 4450` still listens on every interface and
+`--web 8099` only on localhost. `serve` binds the SMB port first and fails
 if it cannot, then runs `Server.acceptLoop` on its own thread. Each accepted
 connection, SMB or HTTP, gets its own detached OS thread. The threads share three things: the store
 (`store.Db`: SQLite or plain-text files), the in-memory server state (`server.Server`), and the
@@ -102,9 +105,10 @@ which triggers a reload.
 
 ```
 build.zig              build, test, and cross-target type-check steps
+examples/              example --config and --users files
 src/
   main.zig             entry point: global flags, open the store, run a command
-  cli.zig              commands: serve, user, share, get, set
+  cli.zig              commands: serve, user, share, get, set, hash
   nthash_wasm.zig      crypto.ntHash and strength exported for WebAssembly
                        (at the top so its module can reach shared/ and policy/)
   shared/
@@ -112,8 +116,8 @@ src/
     crypto.zig         MD4, NT hash, RC4, AES-CCM, SP 800-108 KDF, signatures
   store/
     store.zig          Db: picks a backend for each part, serializes access
-    types.zig          Role, User, UserAuth, Share, and the store's errors
-    sqlite.zig         SQLite bindings, schema, migration, and queries
+    types.zig          User, UserAuth, Share, Change, and the store's errors
+    sqlite.zig         SQLite bindings, schema, and queries
     textfile.zig       plain-text file: change detection, atomic replace
     textconf.zig       settings and shares as a text file (--config FILE)
     textusers.zig      users as a text file (--users FILE)
@@ -173,8 +177,7 @@ main ──► cli ──┬──► web ────┐
 settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)
 users(name TEXT PRIMARY KEY COLLATE NOCASE,
       nt_hash BLOB NOT NULL,          -- SMB password: MD4(UTF-16LE(pw)); empty = none
-      pw_hash TEXT NOT NULL,          -- web password: argon2id PHC; empty = none
-      role TEXT NOT NULL DEFAULT 'client',  -- admin | client | hybrid
+      web_hash TEXT NOT NULL,         -- web password: argon2id PHC; empty = none
       created INTEGER NOT NULL)       -- Unix seconds
 shares(name TEXT PRIMARY KEY COLLATE NOCASE,
        path TEXT NOT NULL,            -- absolute host directory
@@ -187,16 +190,34 @@ The schema is created with `CREATE TABLE IF NOT EXISTS` on every open, so a
 new database needs no setup step. Names are case-insensitive to match how
 Windows treats user and share names.
 
-### User roles and passwords
+### Users and passwords
 
 The web console is for administering the server, so most SMB users never
-sign in to it. Each user has exactly one role:
+sign in to it. A user has an SMB password, a web password, both, or neither,
+and each password opens one service: SMB or the web console. Nothing else is
+stored about what a user may do; there is no role field or type. For
+display, `auth.accessName` names the four cases after the `user passwd`
+flags:
 
-| Role | Signs in to | Passwords stored |
+| Name | Passwords | Signs in to |
 |---|---|---|
-| `client` (default) | SMB only | SMB password |
-| `admin` | web console only | web password |
-| `hybrid` (optional) | both | SMB password and a separate web password |
+| `smb` | SMB | SMB only |
+| `web` | web | web console only |
+| `both` | both, kept separate | both |
+| `none` | neither | nothing |
+
+`zsmbd user add LOGIN` creates a user with neither (`auth.addUser`). `user
+passwd LOGIN` sets the SMB password and `user passwd --web LOGIN` the web
+password (`auth.grantPasswords`); `--both` sets both from one password,
+with the identical-passwords warning. `user nopasswd` clears them the same
+way (`auth.revokePasswords`). The web API does the same with
+`smb_password` (or `nt_hash`), `web_password`, `no_smb_password`, and
+`no_web_password`. The users
+file stores exactly the same thing: one line, two hashes, either blank.
+
+The store's `putUser` takes a `Change` for each hash (`keep`, `clear`, or
+`set`), so callers say exactly what changes, and `User` and `UserAuth` carry
+`has_smb` and the web hash (or `has_web`) instead of a role.
 
 - The **SMB password** is stored as its NT hash, because NTLM authentication
   needs it: the server recomputes the client's HMAC-MD5 proof from it. The NT
@@ -206,14 +227,12 @@ sign in to it. Each user has exactly one role:
 - The **web password** is stored as an argon2id hash (t = 2, m = 19 MiB,
   p = 1) and is used only to sign in to the web console.
 
-A role holds only the passwords it uses. `db.putUser` enforces this in SQL:
-writing an `admin` erases `nt_hash` and writing a `client` erases `pw_hash`.
-`db.ntHash` never returns a hash for an admin, so an admin trying SMB fails
-exactly like an unknown user.
+`db.ntHash` returns nothing for a user without an SMB password, so such a
+user trying SMB fails exactly like an unknown user; web sign-in likewise
+requires a non-empty web hash.
 
 The web login carries a password over plain HTTP, so it must never be an SMB
-password. For admins and clients this holds by construction: each has only
-one kind of password. An SMB password crosses the network only when someone
+password. For users with one password this holds by construction. An SMB password crosses the network only when someone
 sets it, either through the CLI, which reads it from stdin on the server
 host, or through the web console.
 
@@ -232,16 +251,16 @@ TLS remains the real protection. Two checks can't happen on the server for a
 pre-hashed password, because the server never sees the plaintext:
 - **Strength rating:** the page rates the password instead, with the same
   estimator (see "Password strength" below).
-- **Hybrid identical-password detection:** the stored web password can't be
+- **Identical-password detection:** the stored web password can't be
   compared with a hash that arrives alone. The check still works when the web
   password is supplied in the same request, since the server can hash that
   one and compare.
 
-Hybrid users are the deliberate exception and come with password hygiene
-warnings. They exist for small installations where the administrator also
-uses the shares. Hybrid is never a default; it must be chosen per user.
-Whenever a hybrid user is created, gets a new password, or is given the role,
-the operation succeeds but returns warnings. The CLI prints them to stderr
+Users with both passwords are the deliberate exception and come with
+password hygiene warnings. They exist for small installations where the
+administrator also uses the shares. This is never a default: it takes giving
+one user both passwords. Whenever a password is set and the user then has both, the
+operation succeeds but returns warnings. The CLI prints them to stderr
 and the API returns them in a `warnings` list.
 
 - **General warning:** use different SMB and web passwords, and keep the web
@@ -273,16 +292,6 @@ passwords in three places:
 - **Web page:** shows a live meter, using the estimator compiled into the
   WebAssembly module.
 
-Changing a role requires any password the new role uses that the user lacks
-(for example, a web password when a client becomes a hybrid), and erases the
-one it no longer uses.
-
-Databases from before roles had an `admin` flag and one password stored in
-both hashes. `Db.open` migrates them once: former admins become hybrids
-(their two passwords are still identical until one is changed), and everyone
-else becomes a client with the web hash erased. The old `admin` column is
-left in place and unused.
-
 ### Access pattern
 
 SQLite is opened with `SQLITE_OPEN_FULLMUTEX`, and `Db` additionally serializes
@@ -313,13 +322,24 @@ backups than the configuration, which might be kept in version control.
 
 - **Configuration file** (`textconf.Conf`): settings as `key = value` lines before the first section,
   then one `[name]` section per share with `path`, `comment`, `read_only`,
-  and `guest_ok` (yes or no, default no). `#` and `;` start comment lines; an
-  optional `[global]` section also holds settings. zsmbd edits it line by
+  and `guest_ok` (yes or no, default no). Boolean settings are yes or no, or
+  true or false; `serve` refuses to start on any other value. `#` and `;`
+  start comment lines; an optional `[global]` section also holds settings. zsmbd edits it line by
   line, so comments, order, and layout survive its changes.
-- **Users file** (`textusers.Users`): one user per line, `name:role:nt_hash:web_hash:created`, with
-  the same rules as the `users` table (an admin has no NT hash, a client no
-  web hash). zsmbd rewrites it whole, with mode 0600, and warns when it is
+- **Users file** (`textusers.Users`): one user per line, `name:nt_hash:web_hash`.
+  A blank hash disables sign-in to that service, and its access follows from
+  the hashes (shown as smb, web, both, or none). The file keeps no creation time. `zsmbd hash
+  LOGIN` reads one password and prints a line with its SMB hash (the
+  default), its web hash (`--web`), or both from that same password
+  (`--both`, with the identical-passwords warning); without LOGIN, `zsmbd
+  hash` or `zsmbd hash --web` prints just the hash. None of these opens a store, without opening any store, so passwords can be
+  hashed on another machine and only hashes copied to the server. Both the
+  command and the file writer format lines with `textusers.formatLine`. zsmbd
+  rewrites it whole, with mode 0600, and warns when it is
   readable by others, since NT hashes are password-equivalent.
+
+Examples: [examples/zsmbd.conf](examples/zsmbd.conf) and
+[examples/users](examples/users).
 
 Every lookup checks its file's inode, size, and modification time and
 rereads a file that changed, so hand edits take effect without a restart
@@ -356,17 +376,14 @@ checked, so the CLI and the web API apply identical rules.
   later rename or removal of the directory fails cleanly
   (`STATUS_BAD_NETWORK_NAME`) instead of serving the wrong place.
 - **Passwords** may be any non-empty string; weak ones produce a warning
-  (section 4, "Password strength"). A user gets exactly the
-  passwords its role uses (`auth.createUser`, `auth.setPassword`,
-  `auth.setRole`); supplying one the role doesn't use is an error.
-- **Safeguards.** The last user who can sign in to the web console (an admin
-  or hybrid with a web password) cannot be deleted or moved to the client
-  role, so the web console can never lock itself out.
-- **Bootstrap.** When nobody can sign in to the web console, `serve` creates
-  user `admin` with the admin role and a random 16-character web password
-  from an unambiguous alphabet, and prints the password once to stderr. If a
-  client named `admin` already exists, it becomes a hybrid and keeps its SMB
-  password.
+  (section 4, "Password strength"). Each is set (`auth.grantPasswords`) or
+  cleared (`auth.revokePasswords`) on its own.
+- **Safeguards.** The last user with a web password can't be deleted or lose
+  it, so the web console can never lock itself out.
+- **Bootstrap.** When nobody can sign in to the web console, `serve` gives
+  user `admin` (creating it if missing) a random 16-character web password
+  from an unambiguous alphabet, and prints the password once to stderr. An
+  existing `admin` keeps its SMB password.
 - **Login timing.** An unknown user name still costs one argon2id hash, so
   response time does not reveal which names exist.
 
@@ -816,12 +833,12 @@ interface is minimal:
 
 ### Security model
 
-- **Login** (`POST /api/login`) accepts admin and hybrid users only and
+- **Login** (`POST /api/login`) accepts only users with a web password and
   verifies their web password, never an SMB password (section 4). Success creates a
   256-bit random session token held in memory and set as `zsmbd_session`
   with `HttpOnly; SameSite=Strict`. Sessions expire after 12 hours of
   inactivity (sliding expiry) and are dropped when their user is deleted,
-  moved to the client role, or given a new web password. Restarting the server logs everyone
+  given a new web password, or has it cleared. Restarting the server logs everyone
   out.
 - **CSRF**: every POST, PUT, and DELETE must carry `X-Zsmbd: 1`. Browsers
   will not add a custom header to a cross-origin request without a CORS
@@ -839,7 +856,7 @@ interface is minimal:
 | `GET /api/activity` | Live connections, recent events, and counters (from `Live.writeActivity`). |
 | `POST /api/kick` | Drop a client connection by ID. |
 | `GET`, `PUT`, `DELETE /api/shares` | List, create or replace, and delete shares. |
-| `GET`, `PUT`, `DELETE /api/users` | List users with their roles; create a user or change its `role`, its SMB password (`password`, or `nt_hash` as 32 hex digits, not both), or its `web_password`; delete a user. A new user defaults to the client role. Empty or absent passwords stay unchanged. The response's `warnings` list carries hybrid and weak-password warnings. |
+| `GET`, `PUT`, `DELETE /api/users` | List users (`name`, `has_smb`, `has_web`, a derived `access` label (`smb`, `web`, `both`, or `none`), and `created`); create a user (with no passwords unless given) or set its SMB password (`smb_password`, or `nt_hash` as 32 hex digits, not both) or `web_password`, or clear them (`no_smb_password`, `no_web_password`); delete a user. Empty or absent passwords stay unchanged, a password can't be both set and cleared, and unknown fields are refused. The response's `warnings` list carries both-passwords and weak-password warnings. |
 | `GET`, `PUT /api/settings` | Read all settings with defaults and help text; update any subset. |
 
 Validation errors come back as HTTP 400 with the same human-readable
@@ -957,7 +974,7 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
   checked against `std`'s 13-byte-nonce implementation), the MS-NLMP 4.2.4
   NTLMv2 vectors, SPNEGO round trips, UTF-16 round trips, path normalization
   and wildcard matching, srvsvc bind plus `NetrShareEnum`/`NetrShareGetInfo`
-  encodings, input validation, cookie and query parsing, user roles and
+  encodings, input validation, cookie and query parsing, user access and
   password warnings against an in-memory database, strength estimates, and
   the WebAssembly exports (run natively against the server's own results),
   the plain-text store (edits that keep comments, the users file and its

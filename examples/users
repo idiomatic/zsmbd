@@ -1,0 +1,20 @@
+# Example zsmbd users: zsmbd serve --users users
+#
+# One user per line: name:nt_hash:web_hash
+#   nt_hash   SMB password as 32 hex digits (NT hash)
+#   web_hash  web console password as an argon2id PHC string
+# A blank hash disables sign-in to that service; `user list` shows each user
+# as smb, web, both, or none.
+#
+# These hashes are of the example passwords below; replace them before use
+# (`zsmbd --users users user passwd NAME`). NT hashes are password-equivalent:
+# keep the real file private (zsmbd writes it with mode 0600).
+#
+#   admin       web: daisy-daisy
+#   hal         SMB: open-the-pod-bay-doors
+#   perihelion  SMB: murderbot, web: obviously
+#   art         no sign-in (both hashes blank)
+admin::$argon2id$v=19$m=19456,t=2,p=1$Z0zbgVDhKDE/aaCVVy1PMV3BwvkLcZ0NppaokdWYSm4$QnES468nzw/LnfTLjOA6Zaix411lZ/oQ2QXqpUWPOug
+hal:942ebbe1a8d15349adc17914761007a3:
+perihelion:b247d7ab20deb42f86c9832d4ccb1d18:$argon2id$v=19$m=19456,t=2,p=1$bVtSCvtbtWpmlaLDAeVk+Eax3PGUO5OUGGeoOStvBVw$rFdf9TzyszUv43Z4pMfnFLDdk2uiE4PwFn902ibuysU
+art::

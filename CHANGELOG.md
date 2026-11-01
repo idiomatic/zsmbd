@@ -3,63 +3,31 @@
 All notable changes to zsmbd. Versions follow [Semantic Versioning](https://semver.org/);
 the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
 
-## Unreleased
-
-### Added
-- SMB request loop (`conn.serve`): frame reading with the 4 MiB + 64 KiB limit, compound chains (related requests inherit the session, tree, and file ID, and fail after a failed predecessor), the credit window with per-payload charges, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL of pending CHANGE_NOTIFY requests, and dispatch to the file commands.
-- SESSION_SETUP (`handshake.sessionSetup`): SPNEGO or raw NTLMSSP with NTLMv2, the per-session preauth hash, 3.1.1 key derivation, mechListMIC checks, a signed final response, anonymous sessions, `signing_required` and `encrypt` policy, and at most 64 sessions per connection; binding and reauthentication are refused.
-- Fixed: credit requests were read from the wrong header offset, so every response granted one credit and macOS could not send compound requests (it gave up after TREE_CONNECT).
-- SMB connections log why they end: a read or write failure, or a request that closes the connection.
-- `serve` runs the SMB listener (`--smb ADDR:PORT`, default `0.0.0.0:445`), one thread per connection; it fails clearly when the port can't be bound.
-- Decryption (`conn.handleFrame`): transform frames are checked, decrypted with AES-128-GCM or AES-128-CCM, and answered sealed; any failure closes the connection, and every unrelated request inside must name the transform's session.
-- Signature verification (`conn.signatureValid`): requests on signing sessions, or flagged signed, need a valid AES-CMAC signature, compared in constant time; anonymous and unfinished sessions never verify.
-- NEGOTIATE (`smb/handshake.zig`): 3.1.1 only, with the preauthentication hash (SHA-512 required), AES-128-GCM or AES-128-CCM by context, AES-CMAC signing, and the SMB1 upgrade through the wildcard dialect.
-- TREE_CONNECT: share lookup with `realpath`, synthesized `IPC$`, read-only maximal access, guest rules for anonymous sessions, and at most 256 trees per session.
-
-### Changed
-- SMB 3.1.1 is the minimum dialect: 2.0.2, 2.1, 3.0, and 3.0.2 are no longer negotiated, preauthentication integrity is required, and HMAC-SHA256 signing, the 3.0 key labels, and the VALIDATE_NEGOTIATE_INFO check are gone. Windows 8.1 and Server 2012 R2 and older, old Samba clients, and embedded clients limited to 2.x or 3.0 can no longer connect.
-
 ## 0.1.0 (2026-10-31)
 
 First version.
 
-### Security
-- Fixed: an RPC request whose auth length exceeded its fragment crashed the server (integer overflow), and fragments without the last flag could grow memory without limit (now capped at 64 KiB).
-- Fixed: READ, WRITE, and set-size offsets of 2^63 or more panicked the whole process; they now return `STATUS_INVALID_PARAMETER`.
-- Fixed: the wildcard matcher took exponential time on patterns like `*a*a*a*b` (client-controlled in QUERY_DIRECTORY); it is now linear in pattern × name.
-- Fixed: editing `zsmbd.conf` had no effect when a key appeared twice in a section or a setting also appeared in a `[global]` section.
-
-### Changed
-- Source tree regrouped into components: `store/` (the `Db` facade, record types, SQLite, and the text files; `db.zig` split three ways), `policy/` (`auth.zig`, `strength.zig`), `shared/` (`crypto.zig`, `wire.zig`), `smb/server.zig` (was `state.zig`), `smb/auth/` (NTLM and SPNEGO), and `cli.zig` (the commands, out of `main.zig`). `policy/` and `web/` no longer import anything from `smb/`.
-- The plain-text store is split into `textfile.zig` (shared file handling), `textconf.zig`, and `textusers.zig`.
-- Share paths and comments may not contain control characters.
-- [AGENTS.md](AGENTS.md) rewritten as a short list of requirements, build commands, and decisions; details live in [ARCHITECTURE.md](ARCHITECTURE.md).
-- Password strength is now reported instead of enforced: the 8-character minimum is gone (only empty passwords are refused). The CLI prints each password's estimated strength, the web page shows a live strength meter, and the API warns about weak passwords.
-- `PUT /api/users` returns a `warnings` list instead of a single `warning`.
-- Users now have a role: `client` (SMB only, the default), `admin` (web console only), or `hybrid` (both, optional). Each role stores only the passwords it uses, so the web login never carries an SMB password.
-- Hybrid users get password hygiene warnings, including a stronger warning when their SMB and web passwords are identical.
-- CLI: `user add --role`, `user role NAME ROLE` (replaces `user admin NAME on|off`), and `user passwd --web` for hybrids; `user list` shows roles. Passwords are read one per line from a single stdin reader.
-- `PUT /api/users` takes `role`, `password` (SMB), and `web_password` (replacing `admin`) and returns any `warning`; `GET /api/users` reports roles.
-- Existing databases are migrated on open: admins become hybrids, other users clients.
-- The first-run `admin` user has the admin role (web password only).
-- Changing a user's web password, or moving them to the client role, ends their web sessions.
-
-### Fixed
-- CLI output redirected to a file no longer overwrites itself (stdout is written as a stream).
-
 ### Added
-- [REFERENCES.md](REFERENCES.md) indexes the specifications behind zsmbd (Microsoft Open Specifications, RFCs, and NIST papers), with copies in `docs/references/`.
-- `zsmbd --version`; the server logs its version at startup.
-- [SECURITY.md](SECURITY.md): trust boundaries, their guards and tests, secrets, a review checklist, and known gaps.
+- SMB 3.1.1 only: 2.0.2, 2.1, 3.0, and 3.0.2 are not negotiated, preauthentication integrity is required, and signing is AES-CMAC.
+- NEGOTIATE (`smb/handshake.zig`): the preauthentication hash (SHA-512 required), AES-128-GCM or AES-128-CCM by context, and the SMB1 upgrade through the wildcard dialect.
+- SESSION_SETUP (`handshake.sessionSetup`): SPNEGO or raw NTLMSSP with NTLMv2, the per-session preauth hash, 3.1.1 key derivation, mechListMIC checks, a signed final response, anonymous sessions, `signing_required` and `encrypt` policy, and at most 64 sessions per connection; binding and reauthentication are refused.
+- TREE_CONNECT: share lookup with `realpath`, synthesized `IPC$`, read-only maximal access, guest rules for anonymous sessions, and at most 256 trees per session.
+- Signature verification (`conn.signatureValid`): requests on signing sessions, or flagged signed, need a valid AES-CMAC signature, compared in constant time; anonymous and unfinished sessions never verify.
+- Decryption (`conn.handleFrame`): transform frames are checked, decrypted with AES-128-GCM or AES-128-CCM, and answered sealed; any failure closes the connection, and every unrelated request inside must name the transform's session.
+- SMB request loop (`conn.serve`): frame reading with the 4 MiB + 64 KiB limit, compound chains (related requests inherit the session, tree, and file ID, and fail after a failed predecessor), the credit window with per-payload charges, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL of pending CHANGE_NOTIFY requests, dispatch to the file commands, and a log line saying why each connection ended.
+- `serve` runs the SMB listener (`--smb [ADDR:]PORT`, default `0.0.0.0:445`), one thread per connection, and the web console (`--web [ADDR:]PORT`, default `127.0.0.1`); it fails clearly when a port can't be bound.
+- SMB file commands (`src/smb/files.zig`): CREATE, CLOSE, FLUSH, READ, WRITE, LOCK, IOCTL (validate negotiate, pipe transceive, server-side copy, set sparse), QUERY_DIRECTORY, CHANGE_NOTIFY, QUERY_INFO, and SET_INFO, with share modes, delete-on-close, byte-range locks, and rename.
+- Connection core in `src/smb/conn.zig`: reference counting, the open-handle table, the CHANGE_NOTIFY queue, and signed or encrypted message writes.
+- SMB building blocks: protocol constants, wire codec, MD4/RC4/AES-CCM/KDF, SPNEGO, NTLMv2 verification, share-confined file system layer, and srvsvc share enumeration.
+- Users have an SMB password, a web password, both, or neither; `smb`, `web`, `both`, and `none` are display names. Users with both get password hygiene warnings, and a stronger one when the passwords match.
+- Password strength is reported, not enforced (only empty passwords are refused): the CLI prints it, the web page shows a live meter, and the API warns about weak passwords.
+- CLI: `user list|add|passwd [--web|--both]|nopasswd [--web|--both]|del`, `share list|add|comment|readonly|readwrite|guest|noguest|del`, `get`, `set`, `hash`, `help`, and `--version`. Passwords come from one line of stdin and aren't echoed at a terminal; a usage error prints that command's synopsis and exits with status 2, and an unknown command opens no store.
+- `zsmbd hash` hashes one password from stdin without opening a store, for a users file on another machine: `hash [--web] [LOGIN]` prints the SMB (or web) hash, or with LOGIN a users-file line, and `hash --both LOGIN` a line with both hashes.
+- SQLite-backed store for users, shares, and settings.
+- Plain-text storage, independently for each part: `--config FILE` keeps settings and shares in an INI-style file, and `--users FILE` keeps users in a `name:nt_hash:web_hash` file (mode 0600); a blank hash disables sign-in to that service. Either, both, or neither may replace the SQLite database. The files may be edited by hand, and changes are picked up without a restart.
+- Admin web server JSON API with argon2id login, session cookies, and a CSRF header guard. `PUT /api/users` takes `smb_password`, `nt_hash`, `web_password`, `no_smb_password`, and `no_web_password`, and returns `warnings`; `GET /api/users` reports `has_smb`, `has_web`, and `access`. Changing a user's web password ends their web sessions.
+- Web console page with sign-in and an SMB password form that hashes the password in the browser using the server's NT hash code compiled to WebAssembly (`/nthash.wasm`), falling back to server-side hashing when WebAssembly is unavailable.
+- The first-run `admin` user gets a random web password, printed once.
 - Fuzz targets for SMB file commands, NTLM, SPNEGO, DCE/RPC, UTF-16, path normalization, wildcards, the text configuration and users files, and the web cookie and query parsers, on a shared harness that also runs under `zig build test --fuzz`.
 - CI workflow: Fedora and Alpine (x86_64, aarch64) and macOS builds and tests, Linux type checks, and fuzzing.
-- Plain-text storage, independently for each part: `--config FILE` keeps settings and shares in an INI-style file, and `--users FILE` keeps users in a `name:role:nt_hash:web_hash:created` file (mode 0600). Either, both, or neither may replace the SQLite database. The files may be edited by hand, and changes are picked up without a restart.
-- SMB file commands (`src/smb/files.zig`): CREATE, CLOSE, FLUSH, READ, WRITE, LOCK, IOCTL (validate negotiate, pipe transceive, server-side copy, set sparse), QUERY_DIRECTORY, CHANGE_NOTIFY, QUERY_INFO, and SET_INFO, with share modes, delete-on-close, byte-range locks, and rename, plus unit tests.
-- Connection core in `src/smb/conn.zig`: reference counting, the open-handle table, the CHANGE_NOTIFY queue, and signed or encrypted message writes. `state.zig` now compiles.
-- `zig build check` also type-checks the tests.
-- Web console page with sign-in and an SMB password form that hashes the password in the browser using the server's NT hash code compiled to WebAssembly (`/nthash.wasm`), falling back to server-side hashing when WebAssembly is unavailable.
-- `PUT /api/users` accepts `nt_hash` (32 hex digits) in place of `password`.
-- [ARCHITECTURE.md](ARCHITECTURE.md): long-form description of the process and thread model, modules, data model, SMB protocol stack, admin web server, concurrency rules, and roadmap. It absorbs the former connection handler spec (`docs/conn-handler-spec.md`).
-- SQLite-backed store for users, shares, and settings; CLI for managing them.
-- Admin web server JSON API with argon2id login, session cookies, and a CSRF header guard.
-- SMB building blocks: protocol constants, wire codec, MD4/RC4/AES-CCM/KDF, SPNEGO, NTLMv2 verification, share-confined file system layer, and srvsvc share enumeration.
+- Documentation: [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), [SECURITY.md](SECURITY.md) (trust boundaries, guards, secrets, review checklist, known gaps), [REFERENCES.md](REFERENCES.md) (specifications, copied to `docs/references/`), and the example files [examples/zsmbd.conf](examples/zsmbd.conf) and [examples/users](examples/users).

@@ -5,7 +5,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("types.zig");
 const Error = types.Error;
-const Role = types.Role;
+const Change = types.Change;
 const Share = types.Share;
 const User = types.User;
 const UserAuth = types.UserAuth;
@@ -74,10 +74,6 @@ const Stmt = struct {
     }
 };
 
-fn roleOf(s: []const u8) Role {
-    return Role.parse(s) orelse .client;
-}
-
 pub const Sqlite = struct {
     handle: *sqlite3,
 
@@ -87,8 +83,7 @@ pub const Sqlite = struct {
         \\CREATE TABLE IF NOT EXISTS users(
         \\  name TEXT PRIMARY KEY COLLATE NOCASE,
         \\  nt_hash BLOB NOT NULL,  -- SMB password; empty = none
-        \\  pw_hash TEXT NOT NULL,  -- web password; empty = none
-        \\  role TEXT NOT NULL DEFAULT 'client',  -- admin | client | hybrid
+        \\  web_hash TEXT NOT NULL,  -- web password; empty = none
         \\  created INTEGER NOT NULL);
         \\CREATE TABLE IF NOT EXISTS shares(
         \\  name TEXT PRIMARY KEY COLLATE NOCASE,
@@ -110,35 +105,7 @@ pub const Sqlite = struct {
             db.close();
             return error.Sqlite;
         }
-        db.migrate() catch |e| {
-            db.close();
-            return e;
-        };
         return db;
-    }
-
-    /// Databases from before roles have an `admin` flag instead: admins become
-    /// hybrids (they had one password for both) and other users clients.
-    fn migrate(db: *Sqlite) Error!void {
-        const st = try db.prepare("SELECT count(*) FROM pragma_table_info('users') WHERE name='role'");
-        const has_role = blk: {
-            defer st.deinit();
-            _ = try st.step();
-            break :blk st.int(0) != 0;
-        };
-        if (has_role) return;
-        const sql =
-            \\BEGIN;
-            \\ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'client';
-            \\UPDATE users SET role = CASE WHEN admin=1 THEN 'hybrid' ELSE 'client' END;
-            \\UPDATE users SET pw_hash='' WHERE role='client';
-            \\COMMIT;
-        ;
-        if (sqlite3_exec(db.handle, sql, null, null, null) != SQLITE_OK) {
-            std.log.err("sqlite migration: {s}", .{sqlite3_errmsg(db.handle)});
-            _ = sqlite3_exec(db.handle, "ROLLBACK", null, null, null);
-            return error.Sqlite;
-        }
     }
 
     pub fn close(db: *Sqlite) void {
@@ -181,9 +148,9 @@ pub const Sqlite = struct {
 
     // ------------------------------------------------------------ users
 
-    /// NT hash for SMB logins; null for unknown users and for admins.
+    /// NT hash for SMB logins; null for unknown users and users without one.
     pub fn ntHash(db: *Sqlite, name: []const u8) Error!?[16]u8 {
-        const st = try db.prepare("SELECT nt_hash FROM users WHERE name=? AND role<>'admin'");
+        const st = try db.prepare("SELECT nt_hash FROM users WHERE name=?");
         defer st.deinit();
         st.bind(.{name});
         if (!try st.step()) return null;
@@ -193,35 +160,36 @@ pub const Sqlite = struct {
     }
 
     pub fn userAuth(db: *Sqlite, gpa: Allocator, name: []const u8) Error!?UserAuth {
-        const st = try db.prepare("SELECT name, role, pw_hash, length(nt_hash)=16 FROM users WHERE name=?");
+        const st = try db.prepare("SELECT name, web_hash, length(nt_hash)=16 FROM users WHERE name=?");
         defer st.deinit();
         st.bind(.{name});
         if (!try st.step()) return null;
         const n = try gpa.dupe(u8, st.text(0));
         errdefer gpa.free(n);
-        return .{ .name = n, .role = roleOf(st.text(1)), .pw_hash = try gpa.dupe(u8, st.text(2)), .has_smb = st.int(3) != 0 };
+        return .{ .name = n, .web_hash = try gpa.dupe(u8, st.text(1)), .has_smb = st.int(2) != 0 };
     }
 
-    /// Create or update a user. A null hash leaves that password unchanged
-    /// (absent for a new user); a password the role doesn't use is cleared.
-    pub fn putUser(db: *Sqlite, name: []const u8, role: Role, nt_hash: ?[16]u8, pw_hash: ?[]const u8, now: i64) Error!void {
-        // Unbound parameters are NULL.
+    /// Create or update a user, setting, keeping, or clearing each password
+    /// hash; a kept hash of a new user is absent.
+    pub fn putUser(db: *Sqlite, name: []const u8, nt_hash: Change([16]u8), web_hash: Change([]const u8), now: i64) Error!void {
+        // Unbound parameters are NULL, which keeps the stored value.
         const st = try db.prepare(
-            \\INSERT INTO users(name,nt_hash,pw_hash,role,created) VALUES(?1,
-            \\  CASE WHEN ?4='admin' THEN x'' ELSE coalesce(?2,x'') END,
-            \\  CASE WHEN ?4='client' THEN '' ELSE coalesce(?3,'') END, ?4, ?5)
-            \\ON CONFLICT(name) DO UPDATE SET
-            \\  nt_hash=CASE WHEN ?4='admin' THEN x'' ELSE coalesce(?2,nt_hash) END,
-            \\  pw_hash=CASE WHEN ?4='client' THEN '' ELSE coalesce(?3,pw_hash) END,
-            \\  role=?4
+            \\INSERT INTO users(name,nt_hash,web_hash,created) VALUES(?1, coalesce(?2,x''), coalesce(?3,''), ?4)
+            \\ON CONFLICT(name) DO UPDATE SET nt_hash=coalesce(?2,nt_hash), web_hash=coalesce(?3,web_hash)
         );
         defer st.deinit();
-        const r = @tagName(role);
         _ = sqlite3_bind_text(st.s, 1, name.ptr, @intCast(name.len), SQLITE_TRANSIENT);
-        if (nt_hash) |h| _ = sqlite3_bind_blob(st.s, 2, &h, 16, SQLITE_TRANSIENT);
-        if (pw_hash) |h| _ = sqlite3_bind_text(st.s, 3, h.ptr, @intCast(h.len), SQLITE_TRANSIENT);
-        _ = sqlite3_bind_text(st.s, 4, r.ptr, @intCast(r.len), SQLITE_TRANSIENT);
-        _ = sqlite3_bind_int64(st.s, 5, now);
+        switch (nt_hash) {
+            .keep => {},
+            .clear => _ = sqlite3_bind_blob(st.s, 2, "", 0, SQLITE_TRANSIENT),
+            .set => |h| _ = sqlite3_bind_blob(st.s, 2, &h, 16, SQLITE_TRANSIENT),
+        }
+        switch (web_hash) {
+            .keep => {},
+            .clear => _ = sqlite3_bind_text(st.s, 3, "", 0, SQLITE_TRANSIENT),
+            .set => |h| _ = sqlite3_bind_text(st.s, 3, h.ptr, @intCast(h.len), SQLITE_TRANSIENT),
+        }
+        _ = sqlite3_bind_int64(st.s, 4, now);
         _ = try st.step();
     }
 
@@ -229,16 +197,16 @@ pub const Sqlite = struct {
         return try db.execArgs("DELETE FROM users WHERE name=?", .{name}) > 0;
     }
 
-    /// Users who can sign in to the web console (admins and hybrids).
-    pub fn countAdmins(db: *Sqlite) Error!i64 {
-        const st = try db.prepare("SELECT count(*) FROM users WHERE role<>'client' AND pw_hash<>''");
+    /// Users who can sign in to the web console (those with a web password).
+    pub fn countWebUsers(db: *Sqlite) Error!i64 {
+        const st = try db.prepare("SELECT count(*) FROM users WHERE web_hash<>''");
         defer st.deinit();
         _ = try st.step();
         return st.int(0);
     }
 
     pub fn listUsers(db: *Sqlite, gpa: Allocator) Error![]User {
-        const st = try db.prepare("SELECT name, role, created FROM users ORDER BY name");
+        const st = try db.prepare("SELECT name, length(nt_hash)=16, web_hash<>'', created FROM users ORDER BY name");
         defer st.deinit();
         var out: std.ArrayList(User) = .empty;
         errdefer {
@@ -246,7 +214,7 @@ pub const Sqlite = struct {
             out.deinit(gpa);
         }
         while (try st.step()) {
-            try out.append(gpa, .{ .name = try gpa.dupe(u8, st.text(0)), .role = roleOf(st.text(1)), .created = st.int(2) });
+            try out.append(gpa, .{ .name = try gpa.dupe(u8, st.text(0)), .has_smb = st.int(1) != 0, .has_web = st.int(2) != 0, .created = st.int(3) });
         }
         return out.toOwnedSlice(gpa);
     }

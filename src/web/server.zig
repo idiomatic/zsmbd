@@ -264,7 +264,7 @@ pub const Admin = struct {
         const In = struct { user: []const u8, password: []const u8 };
         const in = std.json.parseFromSliceLeaky(In, arena, body, .{ .ignore_unknown_fields = true }) catch
             return respondError(req, .bad_request, "expected {\"user\",\"password\"}");
-        const name = try auth.checkAdminLogin(a.gpa, a.io, a.db, in.user, in.password) orelse {
+        const name = try auth.checkWebLogin(a.gpa, a.io, a.db, in.user, in.password) orelse {
             // Slow down password guessing.
             a.io.sleep(.fromMilliseconds(750), .awake) catch {};
             return respondError(req, .unauthorized, "wrong user name or password, or no web console access");
@@ -318,43 +318,51 @@ pub const Admin = struct {
 
     fn listUsers(a: *Admin, req: *http.Server.Request, arena: Allocator) !void {
         const users = try a.db.listUsers(arena);
-        return respondJson(req, arena, users);
+        const Out = struct { name: []const u8, access: []const u8, has_smb: bool, has_web: bool, created: i64 };
+        const out = try arena.alloc(Out, users.len);
+        for (users, out) |u, *o| o.* = .{ .name = u.name, .access = auth.accessName(u.has_smb, u.has_web), .has_smb = u.has_smb, .has_web = u.has_web, .created = u.created };
+        return respondJson(req, arena, out);
     }
 
     fn putUser(a: *Admin, req: *http.Server.Request, arena: Allocator, body: []const u8) !void {
-        // `password` is the SMB password, or `nt_hash` its NT hash computed in
+        // `smb_password` is the SMB password, or `nt_hash` its NT hash computed in
         // the browser (32 hex digits); `web_password` is the web console
-        // password. Empty or absent means unchanged. `role` defaults to
-        // "client" for new users and to the current role otherwise.
-        const In = struct { name: []const u8, role: ?[]const u8 = null, password: ?[]const u8 = null, nt_hash: ?[]const u8 = null, web_password: ?[]const u8 = null };
-        const in = std.json.parseFromSliceLeaky(In, arena, body, .{ .ignore_unknown_fields = true }) catch
-            return respondError(req, .bad_request, "expected {\"name\",\"role\",\"password\" or \"nt_hash\",\"web_password\"}");
-        const role: ?auth.Role = if (in.role) |r| auth.Role.parse(r) orelse return respondError(req, .bad_request, auth.describe(error.InvalidRole)) else null;
-        var smb_nt: ?[16]u8 = null;
+        // password. Empty or absent means unchanged. `no_smb_password` and
+        // `no_web_password` clear them. A missing user is created first.
+        // Unknown fields are refused, so a misspelled password isn't silently
+        // dropped.
+        const In = struct { name: []const u8, smb_password: ?[]const u8 = null, nt_hash: ?[]const u8 = null, web_password: ?[]const u8 = null, no_smb_password: bool = false, no_web_password: bool = false };
+        const in = std.json.parseFromSliceLeaky(In, arena, body, .{}) catch
+            return respondError(req, .bad_request, "expected {\"name\",\"smb_password\" or \"nt_hash\",\"web_password\",\"no_smb_password\",\"no_web_password\"}");
+        var nt_hash: ?[16]u8 = null;
         if (in.nt_hash) |h| if (h.len > 0) {
             var nt: [16]u8 = undefined;
             const ok = h.len == 32 and if (std.fmt.hexToBytes(&nt, h)) |_| true else |_| false;
             if (!ok) return respondError(req, .bad_request, auth.describe(error.InvalidNtHash));
-            smb_nt = nt;
+            nt_hash = nt;
         };
         const pw: auth.Passwords = .{
-            .smb = if (in.password) |p| (if (p.len > 0) p else null) else null,
-            .smb_nt = smb_nt,
+            .smb = if (in.smb_password) |p| (if (p.len > 0) p else null) else null,
+            .nt_hash = nt_hash,
             .web = if (in.web_password) |p| (if (p.len > 0) p else null) else null,
         };
+        if ((in.no_smb_password and pw.hasSmb()) or (in.no_web_password and pw.web != null))
+            return respondError(req, .bad_request, "a password can't be both set and cleared");
         const existing = try a.db.userAuth(arena, in.name);
-        const warning = blk: {
-            const u = existing orelse
-                break :blk auth.createUser(a.gpa, a.io, a.db, in.name, role orelse .client, pw);
-            const new_role = role orelse u.role;
-            if (new_role != u.role) break :blk auth.setRole(a.gpa, a.io, a.db, u.name, new_role, pw);
-            break :blk auth.setPasswords(a.gpa, a.io, a.db, u.name, pw);
-        } catch |e| return respondError(req, .bad_request, auth.describe(e));
-        if (existing) |u| if ((role != null and !role.?.web()) or pw.web != null) a.endUserSessions(u.name);
+        const warning = a.changeUser(in.name, existing == null, in.no_smb_password, in.no_web_password, pw) catch |e|
+            return respondError(req, .bad_request, auth.describe(e));
+        if (existing) |u| if (in.no_web_password or pw.web != null) a.endUserSessions(u.name);
         var texts: std.ArrayList([]const u8) = .empty;
         var it = warning.iterator();
         while (it.next()) |w| try texts.append(arena, w.text());
         return respondJson(req, arena, .{ .ok = true, .warnings = texts.items });
+    }
+
+    /// Create (when `create`), then clear, then set passwords.
+    fn changeUser(a: *Admin, name: []const u8, create: bool, no_smb: bool, no_web: bool, pw: auth.Passwords) !auth.Warnings {
+        if (create) try auth.addUser(a.io, a.db, name);
+        if (no_smb or no_web) try auth.revokePasswords(a.gpa, a.io, a.db, name, no_smb, no_web);
+        return auth.grantPasswords(a.gpa, a.io, a.db, name, pw);
     }
 
     fn deleteUser(a: *Admin, req: *http.Server.Request, arena: Allocator, query: []const u8) !void {

@@ -7,6 +7,7 @@ const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Db = @import("../store/store.zig").Db;
+const auth = @import("../policy/auth.zig");
 const conn_mod = @import("conn.zig");
 const Conn = conn_mod.Conn;
 const Open = conn_mod.Open;
@@ -129,7 +130,12 @@ pub const Server = struct {
     fn boolSetting(srv: *Server, key: []const u8, default: bool) !bool {
         const v = (try srv.db.getSetting(srv.gpa, key)) orelse return default;
         defer srv.gpa.free(v);
-        return std.mem.eql(u8, v, "1") or std.ascii.eqlIgnoreCase(v, "true");
+        // Hand-edited text files skip the CLI and web checks.
+        const n = auth.normalizeSetting(key, v) catch {
+            std.log.err("setting {s} = {s}: expected yes or no", .{ key, v });
+            return error.InvalidSetting;
+        };
+        return n[0] == 't';
     }
 
     /// Copy of the current configuration; caller frees with Config.free.
@@ -280,4 +286,19 @@ fn defaultServerName(gpa: Allocator) ![]u8 {
     const h = std.posix.gethostname(&buf) catch return gpa.dupe(u8, "ZSMBD");
     const short = h[0 .. std.mem.indexOfScalar(u8, h, '.') orelse h.len];
     return gpa.dupe(u8, short[0..@min(short.len, 15)]);
+}
+
+// ---------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+test "loadConfig reads yes and no as hand-edited text files write them" {
+    var t: conn_mod.TestConn = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.db.setSetting("encrypt", "yes");
+    try t.db.setSetting("signing_required", "No");
+    try t.srv.loadConfig();
+    defer t.srv.cfg.free(testing.allocator);
+    try testing.expect(t.srv.cfg.encrypt and !t.srv.cfg.signing_required);
 }

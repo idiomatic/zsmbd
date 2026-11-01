@@ -28,7 +28,7 @@ issue.
 |---|---|---|
 | SMB password | NT hash (MD4 of UTF-16LE) | Password-equivalent ("pass the hash"). SQLite or the users file (mode 0600, with a warning when others can read it). The web console hashes it in the browser (`nthash_wasm.zig`). |
 | Web password | argon2id (t=2, m=19 MiB) | `policy/auth.zig`: `hashPassword`, `verifyPassword`. |
-| Session token | 256 random bits, in memory | Looked up in a hash map; a 12-hour sliding expiry; ended by a web password change or a move to the client role. |
+| Session token | 256 random bits, in memory | Looked up in a hash map; a 12-hour sliding expiry; ended by a web password change or clearing, or deletion of the user. |
 | SMB session keys | in memory | Derived with `crypto.kdf`; copied into each pending `Notify` so another thread can sign or seal. |
 
 Plaintext passwords are wiped (`secureZero`) after use in the CLI, the

@@ -28,42 +28,29 @@ pub const Share = struct {
     }
 };
 
-/// What a user may sign in to. Each role has only the passwords it uses.
-pub const Role = enum {
-    /// Web console only (web password).
-    admin,
-    /// SMB only (SMB password).
-    client,
-    /// Both, with separate passwords.
-    hybrid,
+/// How `putUser` treats one stored password hash.
+pub fn Change(comptime T: type) type {
+    return union(enum) { keep, clear, set: T };
+}
 
-    pub fn web(r: Role) bool {
-        return r != .client;
-    }
-    pub fn smb(r: Role) bool {
-        return r != .admin;
-    }
-    pub fn parse(s: []const u8) ?Role {
-        return std.meta.stringToEnum(Role, s);
-    }
-};
-
+/// A user signs in to SMB with an SMB password and to the web console with a
+/// web password; a user may have either, both, or neither.
 pub const User = struct {
     name: []const u8,
-    role: Role,
+    has_smb: bool,
+    has_web: bool,
     created: i64,
 };
 
 pub const UserAuth = struct {
     name: []u8,
-    role: Role,
     /// argon2id PHC string; empty when the user has no web password.
-    pw_hash: []u8,
+    web_hash: []u8,
     has_smb: bool,
 
     pub fn free(u: UserAuth, gpa: Allocator) void {
         gpa.free(u.name);
-        gpa.free(u.pw_hash);
+        gpa.free(u.web_hash);
     }
 };
 

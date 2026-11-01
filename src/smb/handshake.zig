@@ -862,7 +862,7 @@ test "SESSION_SETUP: NTLMv2 through SPNEGO, keys, MICs, and the signed response"
     try t.init();
     defer t.deinit();
     t.srv.cfg.signing_required = true;
-    try t.db.putUser("hal", .client, try crypto.ntHash(gpa, "daisy"), null, 0);
+    try t.db.putUser("hal", .{ .set = try crypto.ntHash(gpa, "daisy") }, .keep, 0);
     var out = Buf.init(gpa);
     defer out.deinit();
     const mech_types = try spnego.mechTypesNtlm(gpa);
@@ -935,8 +935,8 @@ test "SESSION_SETUP: failures, anonymous logons, and policy" {
     var t: TestConn = undefined;
     try t.init();
     defer t.deinit();
-    try t.db.putUser("hal", .client, try crypto.ntHash(gpa, "daisy"), null, 0);
-    try t.db.putUser("art", .admin, null, "x", 0);
+    try t.db.putUser("hal", .{ .set = try crypto.ntHash(gpa, "daisy") }, .keep, 0);
+    try t.db.putUser("art", .keep, .{ .set = "x" }, 0);
     var out = Buf.init(gpa);
     defer out.deinit();
 

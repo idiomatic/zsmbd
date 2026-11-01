@@ -52,7 +52,7 @@
 <main>
   <section id="login-view">
     <h2>Sign in</h2>
-    <p class="note">Admin and hybrid users sign in with their web password.</p>
+    <p class="note">Users with a web password sign in with it.</p>
     <form id="login-form">
       <label for="login-user">User name</label>
       <input id="login-user" autocomplete="username" required>
@@ -196,7 +196,7 @@ $("smb-form").addEventListener("submit", async (ev) => {
   if (pw !== $("smb-pw2").value) return show(msg, "The passwords don't match.", "err");
   const body = { name: $("smb-user").value };
   const hash = hasher ? ntHashWith(hasher, pw) : null;
-  if (hash) body.nt_hash = hash; else body.password = pw;
+  if (hash) body.nt_hash = hash; else body.smb_password = pw;
   try {
     const r = await api("PUT", "/api/users", body);
     $("smb-pw").value = $("smb-pw2").value = "";

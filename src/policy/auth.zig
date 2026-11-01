@@ -48,13 +48,11 @@ pub fn describe(err: anyerror) []const u8 {
         error.InvalidPath => "the share path may not contain control characters",
         error.InvalidComment => "share comments are at most 256 characters, without control characters",
         error.InvalidSetting => "unknown setting or invalid value",
-        error.LastAdmin => "at least one admin or hybrid user with a web password must remain",
-        error.PasswordRequired => "admins need a web password, clients an SMB password, and hybrids both",
-        error.PasswordNotForRole => "admins have only a web password and clients only an SMB password",
-        error.InvalidRole => "roles are admin, client, and hybrid",
+        error.LastWebUser => "at least one user must keep a web password, so the web console stays reachable",
         error.InvalidPassword => "give the SMB password either as a password or as a 32-digit hex NT hash, not both",
         error.InvalidNtHash => "an NT hash is 32 hexadecimal digits",
         error.NotFound => "not found",
+        error.UserExists => "user exists; set its passwords with `user passwd [--web]`",
         else => @errorName(err),
     };
 }
@@ -121,14 +119,20 @@ pub fn findSetting(key: []const u8) ?Setting {
     return null;
 }
 
+/// yes, true, or 1; no, false, or 0 (case-insensitive).
+pub fn parseBool(value: []const u8) ?bool {
+    if (std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "yes")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "false") or std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "no")) return false;
+    return null;
+}
+
 /// Validates and normalizes a setting value (booleans become "true"/"false").
 pub fn normalizeSetting(key: []const u8, value: []const u8) ValidationError![]const u8 {
     const s = findSetting(key) orelse return error.InvalidSetting;
     switch (s.kind) {
         .boolean => {
-            if (std.ascii.eqlIgnoreCase(value, "true") or std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "yes")) return "true";
-            if (std.ascii.eqlIgnoreCase(value, "false") or std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "no")) return "false";
-            return error.InvalidSetting;
+            const b = parseBool(value) orelse return error.InvalidSetting;
+            return if (b) "true" else "false";
         },
         .text => {
             if (hasBadChar(value, "\\/:*?\"<>|")) return error.InvalidSetting;
@@ -145,29 +149,32 @@ pub fn nowSeconds(io: Io) i64 {
     return Io.Clock.real.now(io).toSeconds();
 }
 
-pub const Role = db_mod.Role;
+/// What a user may sign in to, as `user list` and the web API show it, named
+/// like the `user passwd` flags: "smb", "web", "both", or "none".
+pub fn accessName(has_smb: bool, has_web: bool) []const u8 {
+    if (has_smb and has_web) return "both";
+    if (has_smb) return "smb";
+    return if (has_web) "web" else "none";
+}
 
-/// SMB passwords are stored as the NT hash NTLM needs; web passwords as
-/// argon2id. They are never the same secret by design, so a web login sent
-/// over the network does not reveal SMB credentials.
-pub const PasswordKind = enum { smb, web };
-
-/// Passwords supplied for a create or role change; null means not supplied.
-/// The SMB password may instead arrive already hashed (`smb_nt`), as the web
-/// page does when it can hash in the browser.
+/// Passwords to set; null means unchanged. SMB passwords are stored as the
+/// NT hash NTLM needs and web passwords as argon2id; they are never the same
+/// secret by design, so a web login sent over the network does not reveal SMB
+/// credentials. The SMB password may instead arrive already hashed
+/// (`nt_hash`), as the web page does when it can hash in the browser.
 pub const Passwords = struct {
     smb: ?[]const u8 = null,
-    smb_nt: ?[16]u8 = null,
+    nt_hash: ?[16]u8 = null,
     web: ?[]const u8 = null,
 
-    fn hasSmb(pw: Passwords) bool {
-        return pw.smb != null or pw.smb_nt != null;
+    pub fn hasSmb(pw: Passwords) bool {
+        return pw.smb != null or pw.nt_hash != null;
     }
 };
 
 /// Password hygiene warnings. The operation they come from still succeeds.
 pub const Warning = enum {
-    hybrid,
+    both_passwords,
     same_password,
     weak_smb,
     weak_web,
@@ -176,7 +183,7 @@ pub const Warning = enum {
         return switch (w) {
             .weak_smb => "the SMB password is weak: a longer passphrase is much harder to guess",
             .weak_web => "the web password is weak: a longer passphrase is much harder to guess",
-            .hybrid => "hybrid users sign in to both SMB and the web console: give them different SMB and web passwords, and keep the web console on localhost or behind TLS",
+            .both_passwords => "users with both passwords sign in to SMB and the web console: give them different passwords, and keep the web console on localhost or behind TLS",
             .same_password => "the SMB and web passwords are identical: anyone who captures the web login can also connect over SMB; set different passwords",
         };
     }
@@ -184,99 +191,88 @@ pub const Warning = enum {
 
 pub const Warnings = std.EnumSet(Warning);
 
-fn checkSupplied(role: Role, pw: Passwords) !void {
-    if (pw.smb != null and pw.smb_nt != null) return error.InvalidPassword;
-    if (pw.hasSmb() and !role.smb()) return error.PasswordNotForRole;
-    if (pw.web != null and !role.web()) return error.PasswordNotForRole;
-    if (pw.smb) |p| try validatePassword(p);
-    if (pw.web) |p| try validatePassword(p);
+/// Create a user with no passwords, who can't sign in until one is set.
+pub fn addUser(io: Io, db: *Db, name: []const u8) !void {
+    try validateUserName(name);
+    try db.putUser(name, .keep, .keep, nowSeconds(io));
 }
 
-/// Hash and store; returns the hygiene warning, judged against the stored
-/// passwords before the write.
-fn store(gpa: Allocator, io: Io, db: *Db, name: []const u8, role: Role, pw: Passwords, stored_pw_hash: []const u8) !Warnings {
+/// Set any of a user's passwords; returns the hygiene warnings, judged
+/// against the stored passwords before the write.
+pub fn grantPasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, pw: Passwords) !Warnings {
+    if (pw.smb != null and pw.nt_hash != null) return error.InvalidPassword;
+    if (pw.smb) |p| try validatePassword(p);
+    if (pw.web) |p| try validatePassword(p);
+    const u = (try db.userAuth(gpa, name)) orelse return error.NotFound;
+    defer u.free(gpa);
+    if (!pw.hasSmb() and pw.web == null) return .empty;
     var warnings: Warnings = .empty;
     // Only plaintext can be rated; a pre-hashed password was rated in the browser.
     if (pw.smb) |p| if (strength.estimate(p).level == .weak) warnings.insert(.weak_smb);
     if (pw.web) |p| if (strength.estimate(p).level == .weak) warnings.insert(.weak_web);
-    if (role == .hybrid) {
-        warnings.insert(.hybrid);
+    if ((pw.hasSmb() or u.has_smb) and (pw.web != null or u.web_hash.len > 0)) {
+        warnings.insert(.both_passwords);
         const same = blk: {
             if (pw.web) |w| {
                 if (pw.smb) |p| break :blk std.mem.eql(u8, p, w);
-                const smb_nt = pw.smb_nt orelse (try db.ntHash(name)) orelse break :blk false;
-                break :blk std.crypto.timing_safe.eql([16]u8, smb_nt, try crypto.ntHash(gpa, w));
+                const stored_nt = pw.nt_hash orelse (try db.ntHash(u.name)) orelse break :blk false;
+                break :blk std.crypto.timing_safe.eql([16]u8, stored_nt, try crypto.ntHash(gpa, w));
             }
-            if (pw.smb) |p| break :blk stored_pw_hash.len > 0 and verifyPassword(gpa, io, stored_pw_hash, p);
+            if (pw.smb) |p| break :blk u.web_hash.len > 0 and verifyPassword(gpa, io, u.web_hash, p);
             // A pre-hashed SMB password can't be checked against argon2id.
             break :blk false;
         };
         if (same) warnings.insert(.same_password);
     }
-    const nt: ?[16]u8 = if (pw.smb) |p| try crypto.ntHash(gpa, p) else pw.smb_nt;
+    const nt: ?[16]u8 = if (pw.smb) |p| try crypto.ntHash(gpa, p) else pw.nt_hash;
     const phc: ?[]u8 = if (pw.web) |p| try hashPassword(gpa, io, p) else null;
     defer if (phc) |h| gpa.free(h);
-    try db.putUser(name, role, nt, phc, nowSeconds(io));
+    try db.putUser(u.name, if (nt) |h| .{ .set = h } else .keep, if (phc) |h| .{ .set = h } else .keep, nowSeconds(io));
     return warnings;
 }
 
-/// Create a user with the passwords its role needs: admins a web password,
-/// clients an SMB password, hybrids both.
-pub fn createUser(gpa: Allocator, io: Io, db: *Db, name: []const u8, role: Role, pw: Passwords) !Warnings {
-    try validateUserName(name);
-    try checkSupplied(role, pw);
-    if ((role.smb() and !pw.hasSmb()) or (role.web() and pw.web == null)) return error.PasswordRequired;
-    return store(gpa, io, db, name, role, pw, "");
-}
-
-/// Set one of an existing user's passwords; the role must use it.
-pub fn setPassword(gpa: Allocator, io: Io, db: *Db, name: []const u8, kind: PasswordKind, password: []const u8) !Warnings {
-    return setPasswords(gpa, io, db, name, if (kind == .smb) .{ .smb = password } else .{ .web = password });
-}
-
-/// Set any of an existing user's passwords; the role must use each one.
-pub fn setPasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, pw: Passwords) !Warnings {
-    const u = (try db.userAuth(gpa, name)) orelse return error.NotFound;
-    if (!pw.hasSmb() and pw.web == null) {
-        u.free(gpa);
-        return .empty;
-    }
-    defer u.free(gpa);
-    try checkSupplied(u.role, pw);
-    return store(gpa, io, db, u.name, u.role, pw, u.pw_hash);
-}
-
-/// Change a user's role. Passwords the new role uses but the user lacks must
-/// be supplied; passwords it doesn't use are erased.
-pub fn setRole(gpa: Allocator, io: Io, db: *Db, name: []const u8, role: Role, pw: Passwords) !Warnings {
+/// Clear a user's SMB password, web password, or both, closing those
+/// services to them. The last web password can't be cleared.
+pub fn revokePasswords(gpa: Allocator, io: Io, db: *Db, name: []const u8, smb: bool, web: bool) !void {
     const u = (try db.userAuth(gpa, name)) orelse return error.NotFound;
     defer u.free(gpa);
-    try checkSupplied(role, pw);
-    if (role.smb() and !u.has_smb and !pw.hasSmb()) return error.PasswordRequired;
-    if (role.web() and u.pw_hash.len == 0 and pw.web == null) return error.PasswordRequired;
-    if (u.role.web() and !role.web() and try db.countAdmins() <= 1) return error.LastAdmin;
-    return store(gpa, io, db, u.name, role, pw, u.pw_hash);
+    if (web and u.web_hash.len > 0 and try db.countWebUsers() <= 1) return error.LastWebUser;
+    try db.putUser(u.name, if (smb) .clear else .keep, if (web) .clear else .keep, nowSeconds(io));
 }
 
 /// Delete a user, refusing to remove the last web console user.
 pub fn deleteUser(gpa: Allocator, db: *Db, name: []const u8) !void {
     const u = (try db.userAuth(gpa, name)) orelse return error.NotFound;
     defer u.free(gpa);
-    if (u.role.web() and try db.countAdmins() <= 1) return error.LastAdmin;
+    if (u.web_hash.len > 0 and try db.countWebUsers() <= 1) return error.LastWebUser;
     _ = try db.deleteUser(name);
 }
 
-/// Returns the canonical user name when `password` is the web password of an
-/// admin or hybrid user.
-pub fn checkAdminLogin(gpa: Allocator, io: Io, db: *Db, name: []const u8, password: []const u8) !?[]u8 {
+/// Hash passwords without a store, for a users file on another machine
+/// (`zsmbd hash`). Supplied passwords must be non-empty; the caller frees
+/// `web`. Only the identical-passwords warning applies: strength is rated as
+/// passwords are read.
+pub fn hashPasswords(gpa: Allocator, io: Io, pw: Passwords) !struct { nt: ?[16]u8, web: ?[]u8, same: bool } {
+    if (pw.smb) |p| try validatePassword(p);
+    if (pw.web) |p| try validatePassword(p);
+    const same = pw.smb != null and pw.web != null and std.mem.eql(u8, pw.smb.?, pw.web.?);
+    return .{
+        .nt = if (pw.smb) |p| try crypto.ntHash(gpa, p) else null,
+        .web = if (pw.web) |p| try hashPassword(gpa, io, p) else null,
+        .same = same,
+    };
+}
+
+/// Returns the canonical user name when `password` is the user's web password.
+pub fn checkWebLogin(gpa: Allocator, io: Io, db: *Db, name: []const u8, password: []const u8) !?[]u8 {
     const u = (try db.userAuth(gpa, name)) orelse {
         // Spend comparable time so unknown names aren't distinguishable.
         const dummy = try hashPassword(gpa, io, password);
         gpa.free(dummy);
         return null;
     };
-    defer gpa.free(u.pw_hash);
-    if (!u.role.web() or u.pw_hash.len == 0 or !verifyPassword(gpa, io, u.pw_hash, password)) {
+    defer gpa.free(u.web_hash);
+    if (u.web_hash.len == 0 or !verifyPassword(gpa, io, u.web_hash, password)) {
         gpa.free(u.name);
         return null;
     }
@@ -293,18 +289,13 @@ pub fn randomPassword(io: Io, buf: *[16]u8) []const u8 {
 }
 
 /// First-run setup: when nobody can sign in to the web console, give user
-/// "admin" a random web password and return it (caller prints it once).
-/// A new "admin" is an admin; an existing client "admin" becomes a hybrid.
-/// Returns null otherwise.
+/// "admin" (created if missing) a random web password and return it (caller
+/// prints it once). Returns null otherwise.
 pub fn bootstrap(gpa: Allocator, io: Io, db: *Db, pw_buf: *[16]u8) !?[]const u8 {
-    if (try db.countAdmins() > 0) return null;
+    if (try db.countWebUsers() > 0) return null;
     const pw = randomPassword(io, pw_buf);
-    if (try db.userAuth(gpa, "admin")) |u| {
-        defer u.free(gpa);
-        _ = try setRole(gpa, io, db, u.name, if (u.role == .client) .hybrid else u.role, .{ .web = pw });
-    } else {
-        _ = try createUser(gpa, io, db, "admin", .admin, .{ .web = pw });
-    }
+    if (try db.userAuth(gpa, "admin")) |u| u.free(gpa) else try addUser(io, db, "admin");
+    _ = try grantPasswords(gpa, io, db, "admin", .{ .web = pw });
     return pw;
 }
 
@@ -325,59 +316,63 @@ fn testDb() !Db {
 }
 
 fn canWebLogin(db: *Db, name: []const u8, pw: []const u8) !bool {
-    const n = (try checkAdminLogin(std.testing.allocator, std.testing.io, db, name, pw)) orelse return false;
+    const n = (try checkWebLogin(std.testing.allocator, std.testing.io, db, name, pw)) orelse return false;
     std.testing.allocator.free(n);
     return true;
 }
 
-test "roles get only their own passwords" {
+/// A new user with these passwords.
+fn newUser(db: *Db, name: []const u8, pw: Passwords) !Warnings {
+    try addUser(std.testing.io, db, name);
+    return grantPasswords(std.testing.allocator, std.testing.io, db, name, pw);
+}
+
+test "passwords open and close each service" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var db = try testDb();
     defer db.close();
 
-    try std.testing.expectEqual(0, (try createUser(gpa, io, &db, "ann", .admin, .{ .web = "web-secret" })).count());
-    try std.testing.expectEqual(0, (try createUser(gpa, io, &db, "cal", .client, .{ .smb = "smb-secret" })).count());
-    try std.testing.expectError(error.PasswordNotForRole, createUser(gpa, io, &db, "x", .client, .{ .smb = "smb-secret", .web = "web-secret" }));
-    try std.testing.expectError(error.PasswordRequired, createUser(gpa, io, &db, "x", .hybrid, .{ .smb = "smb-secret" }));
-    try std.testing.expectError(error.PasswordNotForRole, setPassword(gpa, io, &db, "ann", .smb, "smb-secret"));
-    try std.testing.expectError(error.PasswordNotForRole, setPassword(gpa, io, &db, "cal", .web, "web-secret"));
-
-    // Admins can't use SMB; clients can't use the web console.
+    try std.testing.expectEqual(0, (try newUser(&db, "ann", .{ .web = "web-secret" })).count());
+    try std.testing.expectEqual(0, (try newUser(&db, "cal", .{ .smb = "smb-secret" })).count());
     try std.testing.expect((try db.ntHash("ann")) == null);
     try std.testing.expect((try db.ntHash("cal")) != null);
     try std.testing.expect(try canWebLogin(&db, "ann", "web-secret"));
     try std.testing.expect(!try canWebLogin(&db, "cal", "smb-secret"));
 
-    // Client -> hybrid needs a web password; hybrid -> admin erases the SMB one.
-    try std.testing.expectError(error.PasswordRequired, setRole(gpa, io, &db, "cal", .hybrid, .{}));
-    try std.testing.expect((try setRole(gpa, io, &db, "cal", .hybrid, .{ .web = "web-other" })).contains(.hybrid));
+    // Adding a web password gives both; clearing the SMB one leaves web.
+    try std.testing.expect((try grantPasswords(gpa, io, &db, "cal", .{ .web = "web-other" })).contains(.both_passwords));
     try std.testing.expect(try canWebLogin(&db, "cal", "web-other"));
-    _ = try setRole(gpa, io, &db, "cal", .admin, .{});
+    try revokePasswords(gpa, io, &db, "cal", true, false);
     try std.testing.expect((try db.ntHash("cal")) == null);
-    try std.testing.expectError(error.PasswordRequired, setRole(gpa, io, &db, "cal", .hybrid, .{}));
+    try std.testing.expect(try canWebLogin(&db, "cal", "web-other"));
 
-    // The last web console user can't be removed or demoted.
+    // The last web console user can't be removed or lose the web password.
+    try revokePasswords(gpa, io, &db, "cal", false, true);
+    try std.testing.expect(!try canWebLogin(&db, "cal", "web-other"));
+    try std.testing.expectError(error.LastWebUser, revokePasswords(gpa, io, &db, "ann", false, true));
+    try std.testing.expectError(error.LastWebUser, deleteUser(gpa, &db, "ann"));
     try deleteUser(gpa, &db, "cal");
-    try std.testing.expectError(error.LastAdmin, deleteUser(gpa, &db, "ann"));
-    try std.testing.expectError(error.LastAdmin, setRole(gpa, io, &db, "ann", .client, .{ .smb = "smb-secret" }));
+    try std.testing.expectError(error.NotFound, revokePasswords(gpa, io, &db, "cal", true, true));
 
     const users = try db.listUsers(gpa);
     defer db_mod.freeUsers(gpa, users);
-    try std.testing.expectEqual(Role.admin, users[0].role);
+    try std.testing.expect(!users[0].has_smb and users[0].has_web);
+    try std.testing.expectEqualStrings("web", accessName(users[0].has_smb, users[0].has_web));
+    try std.testing.expectEqualStrings("none", accessName(false, false));
 }
 
-test "hybrid users are warned about identical passwords" {
+test "users with both passwords are warned about identical passwords" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var db = try testDb();
     defer db.close();
 
-    try std.testing.expect((try createUser(gpa, io, &db, "hal", .hybrid, .{ .smb = "same-secret", .web = "same-secret" })).contains(.same_password));
-    try std.testing.expect((try setPassword(gpa, io, &db, "hal", .web, "web-secret")).contains(.hybrid));
+    try std.testing.expect((try newUser(&db, "hal", .{ .smb = "same-secret", .web = "same-secret" })).contains(.same_password));
+    try std.testing.expect((try grantPasswords(gpa, io, &db, "hal", .{ .web = "web-secret" })).contains(.both_passwords));
     // Matching the stored web password (argon2id) or SMB password (NT hash).
-    try std.testing.expect((try setPassword(gpa, io, &db, "hal", .smb, "web-secret")).contains(.same_password));
-    try std.testing.expect((try setPassword(gpa, io, &db, "hal", .web, "web-secret")).contains(.same_password));
+    try std.testing.expect((try grantPasswords(gpa, io, &db, "hal", .{ .smb = "web-secret" })).contains(.same_password));
+    try std.testing.expect((try grantPasswords(gpa, io, &db, "hal", .{ .web = "web-secret" })).contains(.same_password));
 }
 
 test "SMB passwords may arrive pre-hashed" {
@@ -387,14 +382,13 @@ test "SMB passwords may arrive pre-hashed" {
     defer db.close();
 
     const nt = try crypto.ntHash(gpa, "smb-secret");
-    try std.testing.expectEqual(0, (try createUser(gpa, io, &db, "cal", .client, .{ .smb_nt = nt })).count());
+    try std.testing.expectEqual(0, (try newUser(&db, "cal", .{ .nt_hash = nt })).count());
     try std.testing.expectEqual(nt, (try db.ntHash("cal")).?);
-    try std.testing.expectError(error.InvalidPassword, setPasswords(gpa, io, &db, "cal", .{ .smb = "smb-secret", .smb_nt = nt }));
-    try std.testing.expectError(error.PasswordNotForRole, createUser(gpa, io, &db, "ann", .admin, .{ .smb_nt = nt, .web = "web-secret" }));
+    try std.testing.expectError(error.InvalidPassword, grantPasswords(gpa, io, &db, "cal", .{ .smb = "smb-secret", .nt_hash = nt }));
 
-    // A hybrid's pre-hashed SMB password is still compared with a new web password.
-    try std.testing.expect((try createUser(gpa, io, &db, "hal", .hybrid, .{ .smb_nt = nt, .web = "smb-secret" })).contains(.same_password));
-    try std.testing.expect((try setPasswords(gpa, io, &db, "hal", .{ .smb_nt = try crypto.ntHash(gpa, "other-secret") })).contains(.hybrid));
+    // A pre-hashed SMB password is still compared with a new web password.
+    try std.testing.expect((try newUser(&db, "hal", .{ .nt_hash = nt, .web = "smb-secret" })).contains(.same_password));
+    try std.testing.expect((try grantPasswords(gpa, io, &db, "hal", .{ .nt_hash = try crypto.ntHash(gpa, "other-secret") })).contains(.both_passwords));
 }
 
 test "weak passwords are reported, not refused" {
@@ -403,12 +397,12 @@ test "weak passwords are reported, not refused" {
     var db = try testDb();
     defer db.close();
 
-    try std.testing.expect((try createUser(gpa, io, &db, "cal", .client, .{ .smb = "abc" })).contains(.weak_smb));
+    try std.testing.expect((try newUser(&db, "cal", .{ .smb = "abc" })).contains(.weak_smb));
     try std.testing.expect((try db.ntHash("cal")) != null);
-    try std.testing.expect((try createUser(gpa, io, &db, "ann", .admin, .{ .web = "Password1!" })).contains(.weak_web));
+    try std.testing.expect((try newUser(&db, "ann", .{ .web = "Password1!" })).contains(.weak_web));
     try std.testing.expect(try canWebLogin(&db, "ann", "Password1!"));
-    try std.testing.expectEqual(0, (try setPassword(gpa, io, &db, "cal", .smb, "correct horse battery staple")).count());
-    try std.testing.expectError(error.EmptyPassword, setPassword(gpa, io, &db, "cal", .smb, ""));
+    try std.testing.expectEqual(0, (try grantPasswords(gpa, io, &db, "cal", .{ .smb = "correct horse battery staple" })).count());
+    try std.testing.expectError(error.EmptyPassword, grantPasswords(gpa, io, &db, "cal", .{ .smb = "" }));
 }
 
 test "bootstrap creates an admin" {
@@ -421,4 +415,32 @@ test "bootstrap creates an admin" {
     try std.testing.expect((try db.ntHash("admin")) == null);
     try std.testing.expect(try canWebLogin(&db, "admin", pw));
     try std.testing.expect((try bootstrap(gpa, io, &db, &buf)) == null);
+}
+
+test "hashPasswords without a store" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const h = try hashPasswords(gpa, io, .{ .smb = "open-the-pod-bay-doors", .web = "open-the-pod-bay-doors" });
+    defer gpa.free(h.web.?);
+    try std.testing.expect(h.same and verifyPassword(gpa, io, h.web.?, "open-the-pod-bay-doors"));
+    try std.testing.expectEqual(try crypto.ntHash(gpa, "open-the-pod-bay-doors"), h.nt.?);
+    const line = try db_mod.userLine(gpa, "hal", h.nt, "");
+    defer gpa.free(line);
+    try std.testing.expectEqualStrings("hal:942ebbe1a8d15349adc17914761007a3:\n", line);
+    try std.testing.expectError(error.EmptyPassword, hashPasswords(gpa, io, .{ .web = "" }));
+}
+
+test "a new user has no passwords" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var db = try testDb();
+    defer db.close();
+    try addUser(io, &db, "hal");
+    try std.testing.expectEqual(null, try db.ntHash("hal"));
+    try std.testing.expect(!try canWebLogin(&db, "hal", ""));
+    try std.testing.expectError(error.NotFound, grantPasswords(gpa, io, &db, "skynet", .{ .smb = "x" }));
+    const both = try grantPasswords(gpa, io, &db, "hal", .{ .smb = "murderbot", .web = "murderbot" });
+    try std.testing.expect(both.contains(.both_passwords) and both.contains(.same_password));
+    try std.testing.expect(try canWebLogin(&db, "hal", "murderbot"));
+    try std.testing.expectEqual(try crypto.ntHash(gpa, "murderbot"), (try db.ntHash("hal")).?);
 }

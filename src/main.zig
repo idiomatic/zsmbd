@@ -45,26 +45,37 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
-    if (db_given and !loc.usesSqlite()) {
+    if (std.mem.eql(u8, args[i], "help")) return out.writeAll(usage);
+    if (!cli.isCommand(args[i])) usageExit(args[i]);
+    // `hash` makes users-file lines for another machine, so it opens no store.
+    const no_store = std.mem.eql(u8, args[i], "hash");
+    if (db_given and !loc.usesSqlite() and !no_store) {
         std.log.err("--db is unused when both --config and --users are given", .{});
         std.process.exit(1);
     }
-    var db = Db.openAt(gpa, io, loc) catch |e| {
+    var db: Db = undefined;
+    if (!no_store) db = Db.openAt(gpa, io, loc) catch |e| {
         std.log.err("cannot open the store: {s}", .{@errorName(e)});
         std.process.exit(1);
     };
-    defer db.close();
+    defer if (!no_store) db.close();
 
     var c: cli.Cli = .{ .gpa = gpa, .io = io, .db = &db, .out = out, .args = args[i..] };
     cli.run(&c) catch |e| {
         out.flush() catch {};
-        if (e == error.Usage) {
-            std.debug.print("{s}", .{usage});
-        } else {
-            std.debug.print("zsmbd: {s}\n", .{auth.describe(e)});
-        }
+        if (e == error.Usage) usageExit(args[i]);
+        std.debug.print("zsmbd: {s}\n", .{auth.describe(e)});
         std.process.exit(1);
     };
+}
+
+/// Prints the usage of `cmd` to stderr and exits with status 2.
+fn usageExit(cmd: []const u8) noreturn {
+    var buf: [1024]u8 = undefined;
+    const w = std.debug.lockStderr(&buf);
+    cli.printUsage(&w.file_writer.interface, cmd) catch {};
+    std.debug.unlockStderr();
+    std.process.exit(2);
 }
 
 test {

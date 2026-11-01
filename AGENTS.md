@@ -6,7 +6,7 @@
 * Embedded admin web server: settings, shares (names and directory paths), user credentials, and live activity.
 * All code in Zig 0.17.0 or later; this is non-negotiable.
 * SQLite may store data (hashed passwords, configuration).
-* Keep this file, [ARCHITECTURE.md](ARCHITECTURE.md), and [CHANGELOG.md](CHANGELOG.md) current with each change.
+* Keep this file, [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), and [CHANGELOG.md](CHANGELOG.md) current with each change.
 
 ## Build
 * `zig build` makes `zsmbd`; `zig build test` runs the unit tests.
@@ -25,14 +25,14 @@
 * Not supported: oplocks and leases, multichannel, DFS, and named streams.
 * Shares are confined to their real path: `..` and stream names are rejected, symlinks are followed only inside the share, and lookups fall back to case-insensitive matching.
 * Settings (the complete list): server_name, workgroup, signing_required, encrypt. Settings with shares, and users, each live in SQLite or in a plain-text file (`--config FILE`, `--users FILE`), in any combination; CLI flags exist only for these locations and listen addresses.
-* User roles: client (SMB only, the default), admin (web console only), and hybrid (both; optional). Each role stores only its own passwords (NT hash for SMB, argon2id for web).
-* Hybrid users have separate passwords and get a hygiene warning on every change, and a stronger one when the two passwords match.
+* Users have an SMB password (NT hash), a web password (argon2id), both (optional), or neither; each opens one service. No role is stored; smb, web, both, and none are display names only.
+* Users with both passwords should keep them separate and get a hygiene warning on every change, and a stronger one when the two passwords match.
 * Password strength is reported, never enforced; only empty passwords are refused.
 * SMB passwords cross the network only from the CLI (stdin) or the web console, which hashes them in the browser with WebAssembly and falls back to server hashing.
-* CLI: `serve [--smb ADDR:PORT] [--web ADDR:PORT]`, `user list|add [--role R]|passwd [--web]|role NAME R|del`, `share list|add|del`, `get`, `set KEY VALUE`, and `--db PATH`, `--config FILE`, and `--users FILE` for all; passwords come from stdin, one per line, SMB first.
-* First run creates admin-role user `admin` with a random web password, printed once.
-* Web console: admin and hybrid users only; session cookie; every POST, PUT, and DELETE must send `X-Zsmbd: 1`; no CORS.
-* The last web console admin user can't be deleted nor demoted to client.
+* CLI: `serve [--smb [ADDR:]PORT] [--web [ADDR:]PORT]` (ADDR defaults: 0.0.0.0 and 127.0.0.1), `user list|add LOGIN|passwd [--web|--both] LOGIN|nopasswd [--web|--both] LOGIN|del LOGIN` (flags before or after LOGIN; `add` sets no password), `share list|add SHARE PATH|comment SHARE TEXT|readonly|readwrite|guest|noguest|del SHARE`, `get [KEY]`, `set KEY VALUE`, `hash [--web] [LOGIN]` and `hash --both LOGIN` (one password; a users-file line with LOGIN, else the hash; opens no store), `help`, and `--db PATH`, `--config FILE`, and `--users FILE` for the rest; each password comes from one line of stdin, unechoed at a terminal. Usage errors print that command's synopsis and exit 2; unknown commands open no store.
+* First run gives user `admin` (created if missing) a random web password, printed once.
+* Web console: users with a web password only; session cookie; every POST, PUT, and DELETE must send `X-Zsmbd: 1`; no CORS.
+* The last user with a web password can't be deleted nor lose it.
 
 ## Status
 * See [ARCHITECTURE.md](ARCHITECTURE.md) section 13. Next: interoperability tests with real clients, then `web.Live`.

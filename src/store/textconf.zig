@@ -3,11 +3,13 @@
 //! next lookup. zsmbd's own edits keep everything they don't change
 //! (comments, order, layout):
 //!
-//!     server_name = FILES        # settings come before the first section
-//!     [data]                     # one section per share
+//!     # Settings come before the first section; comments are whole lines.
+//!     server_name = FILES
+//!     # One section per share; read_only and guest_ok default to no.
+//!     [data]
 //!     path = /srv/data
 //!     comment = Team files
-//!     read_only = yes            # read_only and guest_ok default to no
+//!     read_only = yes
 //!
 //! Callers serialize access (Db.mutex).
 
