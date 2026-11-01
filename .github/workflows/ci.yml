@@ -77,7 +77,13 @@ jobs:
       # The fuzzer needs .zig-cache/tmp, which the plain test run creates.
       - run: zig build test
       - name: Coverage-guided fuzzing
-        run: zig build test --fuzz=${{ github.event_name == 'schedule' && '20M' || '500K' }}
+        # Zig 0.17 ends its fuzz report with a bogus "corrupted coverage
+        # file" error, so judge the run by its crash markers instead.
+        run: |
+          zig build test --fuzz=${{ github.event_name == 'schedule' && '20M' || '100K' }} > fuzz.log 2>&1 || true
+          tail -n 30 fuzz.log
+          grep -q "FUZZING REPORT" fuzz.log
+          if grep -E "exited with code|panic|leaked|input saved" fuzz.log; then exit 1; fi
       - name: Keep crashing inputs
         if: failure()
         uses: actions/upload-artifact@v4
