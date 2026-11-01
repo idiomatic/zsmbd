@@ -4,6 +4,14 @@ A small SMB 3.1.1 file server for Linux and macOS hosts, written in Zig. One
 binary holds the SMB server, an admin web console, and a command-line tool.
 It has four settings, all with working defaults.
 
+> **USE AT YOUR OWN RISK &mdash; DO NOT USE IN PRODUCTION YET**
+>
+> This is largely written in a pre-1.0 language: Zig 0.17.
+
+> **USE AT YOUR OWN RISK &mdash; DO NOT USE IN PRODUCTION YET**
+>
+> Significant portions of this code have been authored by AI.
+
 > **Status:** early. macOS 15 mounts and reads a share; Windows and Linux
 > clients are untested, and the web console is minimal. See
 > [ARCHITECTURE.md](ARCHITECTURE.md) section 13.
@@ -299,3 +307,11 @@ paste into an existing line.
 - [SECURITY.md](SECURITY.md): attack surface and secrets.
 - [REFERENCES.md](REFERENCES.md): protocol specifications.
 - [CHANGELOG.md](CHANGELOG.md): changes by version.
+
+## How it was made
+
+zsmbd was written with [Claude Code](https://claude.com/claude-code).
+
+## License
+
+[BSD 3-Clause](LICENSE)
