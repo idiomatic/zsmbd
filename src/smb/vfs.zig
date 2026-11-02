@@ -289,23 +289,25 @@ pub fn chmod(fd: Fd, mode: u32) Error!void {
 }
 
 /// Refuses a symlink on every platform (macOS would change the link's own
-/// mode), then asks the libc not to follow one either; musl implements that
-/// flag through /proc and reports it unsupported without it, as glibc does
-/// on a link, and then the check above is the only guard.
+/// mode), then asks the libc not to follow one either. glibc and musl
+/// implement that flag through /proc: without it, glibc reports the flag
+/// unsupported and musl reports ENOENT, and the plain call is used, with
+/// the check above as the only guard (the file really being gone fails
+/// that call the same way).
 pub fn chmodPath(path: [:0]const u8, mode: u32) Error!void {
     if ((try lstatPath(path)).kind == .symlink) return error.AccessDenied;
     const m: c.mode_t = @intCast(mode & 0o7777);
     const rc = c.fchmodat(c.AT.FDCWD, path.ptr, m, c.AT.SYMLINK_NOFOLLOW);
     if (rc != -1) return;
     const e = c.errno(rc);
-    if (!isNotSupported(e)) return mapErrno(e);
+    if (!flagUnsupported(e)) return mapErrno(e);
     try check(c.fchmodat(c.AT.FDCWD, path.ptr, m, 0));
 }
 
-fn isNotSupported(e: c.E) bool {
+fn flagUnsupported(e: c.E) bool {
     const op = if (@hasField(c.E, "OPNOTSUPP")) e == .OPNOTSUPP else false;
     const ns = if (@hasField(c.E, "NOTSUP")) e == .NOTSUP else false;
-    return op or ns;
+    return op or ns or e == .NOENT;
 }
 
 fn timespecs(atime_nt: ?u64, mtime_nt: ?u64) [2]c.timespec {
@@ -645,6 +647,24 @@ test "chmodPath refuses a symlink" {
     const link = try std.fmt.allocPrintSentinel(gpa, "{s}/link", .{dir}, 0);
     defer gpa.free(link);
     try std.testing.expectError(error.AccessDenied, chmodPath(link, 0o644));
+}
+
+test "chmodPath changes a regular file's mode" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "art.txt", .data = "hal" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const path = try std.fmt.allocPrintSentinel(gpa, "{s}/art.txt", .{dir}, 0);
+    defer gpa.free(path);
+    try chmodPath(path, 0o600);
+    try std.testing.expectEqual(@as(u32, 0o600), (try lstatPath(path)).mode & 0o7777);
+    try chmodPath(path, 0o644);
+    try std.testing.expectEqual(@as(u32, 0o644), (try lstatPath(path)).mode & 0o7777);
+    const gone = try std.fmt.allocPrintSentinel(gpa, "{s}/gone.txt", .{dir}, 0);
+    defer gpa.free(gone);
+    try std.testing.expectError(error.NotFound, chmodPath(gone, 0o644));
 }
 
 test "wildcards" {

@@ -587,7 +587,8 @@ signed, must carry a valid AES-CMAC signature (`signatureValid`, constant-time
 compare; sessions without a key never verify), or they get
 `STATUS_ACCESS_DENIED`. Replies are signed on signing sessions, whenever the
 request was signed, and for the final SESSION_SETUP and LOGOFF (whose key
-is copied before the session is freed). A transform frame
+is copied before the session is freed); an error reply uses the session the
+chain had found. A transform frame
 (`transformSession`, `unseal`)
 must name a session with keys, give `OriginalMessageSize` equal to its
 payload, flag AES encryption, and arrive after a cipher was negotiated; it

@@ -83,6 +83,7 @@ Fuzzing found, and these were fixed:
 - **Host-side races.** A local process could swap a directory for a symlink
   between resolution and open, or a file for a symlink between `chmodPath`'s
   check and its `chmod` on hosts where `fchmodat(AT_SYMLINK_NOFOLLOW)` is
-  unsupported; byte-range locks are advisory among SMB clients only.
+  unsupported (glibc and musl without /proc); byte-range locks are advisory
+  among SMB clients only.
 - **Text-file writes** from two processes at the same moment can lose one
   change.

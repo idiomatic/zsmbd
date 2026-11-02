@@ -64,8 +64,9 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-latest
+    container: fedora:latest
     steps:
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
+      - run: dnf install -y --setopt=install_weak_deps=False sqlite-devel tar xz git
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:

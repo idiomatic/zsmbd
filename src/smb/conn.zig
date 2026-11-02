@@ -519,8 +519,8 @@ const Result = struct {
     status: u32,
     /// The session whose key signs the response.
     session: ?*Session = null,
-    /// Sign even though the session does not (the final SESSION_SETUP);
-    /// with `key`, whether that session signed.
+    /// Sign even though the session alone would not: the final
+    /// SESSION_SETUP, or (with `key`) a signing session that is gone.
     sign: bool = false,
     /// The signing key of a session that is gone (LOGOFF).
     key: ?[16]u8 = null,
@@ -570,7 +570,7 @@ fn walkChain(c: *Conn, frame: []const u8, out: *Buf, enc_sid: ?u64) !bool {
         var res = if (cmd == .negotiate) blk: {
             const n = try handshake.negotiate(c, msg, &one);
             break :blk Result{ .status = n.status, .disconnect = n.disconnect };
-        } else handle(c, cmd, msg, &chain, &one) catch |e| Result{ .status = vfs.status(e) };
+        } else handle(c, cmd, msg, &chain, &one) catch |e| Result{ .status = vfs.status(e), .session = chain.session };
         if (res.notify) |n| {
             if (c.queueNotify(n)) |async_id| {
                 wire.put32(one.items(), 16, wire.get32(one.items(), 16) | proto.Flags.async_command);
@@ -596,14 +596,9 @@ fn walkChain(c: *Conn, frame: []const u8, out: *Buf, enc_sid: ?u64) !bool {
         // A sealed chain is authenticated by the cipher, not signed. A
         // signed request gets a signed reply (MS-SMB2 3.3.4.1.1).
         const signed_req = flags & proto.Flags.signed != 0;
-        const key: ?[16]u8 = if (chain.encrypted)
-            null
-        else if (res.key) |k|
-            (if (res.sign or signed_req) k else null)
-        else if (res.session) |s|
-            (if (s.sign or res.sign or (signed_req and s.hasKey())) s.signing_key else null)
-        else
-            null;
+        const avail: ?[16]u8 = res.key orelse if (res.session) |s| (if (s.hasKey()) s.signing_key else null) else null;
+        const signs = res.sign or signed_req or (if (res.session) |s| s.sign else false);
+        const key: ?[16]u8 = if (!chain.encrypted and signs) avail else null;
         try spans.append(c.gpa, .{ .start = out.len(), .len = one.len(), .key = key });
         try out.bytes(one.items());
         if (!keep) break;
@@ -672,12 +667,13 @@ fn handle(c: *Conn, cmd: Command, msg: []const u8, chain: *Chain, out: *Buf) !Re
     if (s.encrypt and !chain.encrypted) return .{ .status = Status.access_denied, .session = s };
 
     if (cmd == .logoff) {
+        // The body is written first, so a failure still finds the session.
+        try out.u16_(4);
+        try out.u16_(0);
         const key = s.signing_key;
         const signs = s.sign;
         logoff(c, s);
         chain.session = null;
-        try out.u16_(4);
-        try out.u16_(0);
         return .{ .status = Status.success, .key = key, .sign = signs };
     }
 

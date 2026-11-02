@@ -522,7 +522,7 @@ pub const Admin = struct {
                 else => return respondError(req, .bad_request, "setting values must be strings or booleans"),
             };
             const v = auth.normalizeSetting(e.key_ptr.*, raw) catch |err|
-                return respondError(req, .bad_request, auth.describe(err));
+                return respondError(req, .bad_request, try std.fmt.allocPrint(arena, "{s}: {s}", .{ e.key_ptr.*, auth.describe(err) }));
             try values.append(arena, .{ .key = e.key_ptr.*, .value = v });
         }
         for (values.items) |kv| try a.db.setSetting(kv.key, kv.value);
