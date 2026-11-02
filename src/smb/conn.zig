@@ -521,6 +521,9 @@ const Result = struct {
     session: ?*Session = null,
     /// Sign even though the session does not (the final SESSION_SETUP).
     sign: bool = false,
+    /// The signing key of a session that is gone (LOGOFF), when its reply
+    /// must be signed.
+    key: ?[16]u8 = null,
     /// The session whose preauth hash takes the finished response.
     preauth: ?*Session = null,
     notify: ?Notify = null,
@@ -590,8 +593,13 @@ fn walkChain(c: *Conn, frame: []const u8, out: *Buf, enc_sid: ?u64) !bool {
         }
 
         try out.alignTo(8);
-        // A sealed chain is authenticated by the cipher, not signed.
-        const key: ?[16]u8 = if (chain.encrypted) null else if (res.session) |s| (if (s.sign or res.sign) s.signing_key else null) else null;
+        // A sealed chain is authenticated by the cipher, not signed. A
+        // signed request gets a signed reply (MS-SMB2 3.3.4.1.1).
+        const signed_req = flags & proto.Flags.signed != 0;
+        const key: ?[16]u8 = if (chain.encrypted) null else if (res.key) |k| k else if (res.session) |s|
+            (if (s.sign or res.sign or (signed_req and s.hasKey())) s.signing_key else null)
+        else
+            null;
         try spans.append(c.gpa, .{ .start = out.len(), .len = one.len(), .key = key });
         try out.bytes(one.items());
         if (!keep) break;
@@ -660,11 +668,12 @@ fn handle(c: *Conn, cmd: Command, msg: []const u8, chain: *Chain, out: *Buf) !Re
     if (s.encrypt and !chain.encrypted) return .{ .status = Status.access_denied, .session = s };
 
     if (cmd == .logoff) {
+        const key: ?[16]u8 = if (s.sign or flagged) s.signing_key else null;
         logoff(c, s);
         chain.session = null;
         try out.u16_(4);
         try out.u16_(0);
-        return .{ .status = Status.success };
+        return .{ .status = Status.success, .key = key };
     }
 
     if (cmd == .tree_connect) {

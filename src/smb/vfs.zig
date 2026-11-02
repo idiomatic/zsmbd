@@ -288,8 +288,23 @@ pub fn chmod(fd: Fd, mode: u32) Error!void {
     try check(c.fchmod(fd, @intCast(mode & 0o7777)));
 }
 
+/// Never follows a symlink. musl implements the flag through /proc and
+/// reports it unsupported without it, as glibc does on a link; then the
+/// entry is checked by hand.
 pub fn chmodPath(path: [:0]const u8, mode: u32) Error!void {
-    try check(c.fchmodat(c.AT.FDCWD, path.ptr, @intCast(mode & 0o7777), 0));
+    const m: c.mode_t = @intCast(mode & 0o7777);
+    const rc = c.fchmodat(c.AT.FDCWD, path.ptr, m, c.AT.SYMLINK_NOFOLLOW);
+    if (rc != -1) return;
+    const e = c.errno(rc);
+    if (!isNotSupported(e)) return mapErrno(e);
+    if ((try lstatPath(path)).kind == .symlink) return error.AccessDenied;
+    try check(c.fchmodat(c.AT.FDCWD, path.ptr, m, 0));
+}
+
+fn isNotSupported(e: c.E) bool {
+    const op = if (@hasField(c.E, "OPNOTSUPP")) e == .OPNOTSUPP else false;
+    const ns = if (@hasField(c.E, "NOTSUP")) e == .NOTSUP else false;
+    return op or ns;
 }
 
 fn timespecs(atime_nt: ?u64, mtime_nt: ?u64) [2]c.timespec {

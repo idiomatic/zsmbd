@@ -116,21 +116,26 @@ pub const Buf = struct {
     }
 };
 
+const Decoded = struct { cp: u21, adv: usize };
+
+/// The code point starting at `s[i]` and its length in bytes; an invalid or
+/// truncated sequence yields U+FFFD for one byte.
+fn decodeOne(s: []const u8, i: usize) Decoded {
+    if (std.unicode.utf8ByteSequenceLength(s[i])) |n| {
+        if (i + n <= s.len) {
+            if (std.unicode.utf8Decode(s[i .. i + n])) |cp| return .{ .cp = cp, .adv = n } else |_| {}
+        }
+    } else |_| {}
+    return .{ .cp = 0xFFFD, .adv = 1 };
+}
+
 /// Append UTF-8 text encoded as UTF-16LE bytes. Invalid sequences become U+FFFD.
 pub fn appendUtf16(gpa: Allocator, list: *std.ArrayList(u8), s: []const u8) !void {
     var i: usize = 0;
     while (i < s.len) {
-        var cp: u21 = 0xFFFD;
-        var adv: usize = 1;
-        if (std.unicode.utf8ByteSequenceLength(s[i])) |n| {
-            if (i + n <= s.len) {
-                if (std.unicode.utf8Decode(s[i .. i + n])) |c| {
-                    cp = c;
-                    adv = n;
-                } else |_| {}
-            }
-        } else |_| {}
-        i += adv;
+        const d = decodeOne(s, i);
+        const cp = d.cp;
+        i += d.adv;
         if (cp >= 0x10000) {
             const v = cp - 0x10000;
             try appendU16(gpa, list, @intCast(0xD800 + (v >> 10)));
@@ -147,13 +152,14 @@ fn appendU16(gpa: Allocator, list: *std.ArrayList(u8), v: u16) !void {
     try list.appendSlice(gpa, &t);
 }
 
+/// Bytes `appendUtf16` writes for `s`.
 pub fn utf16Len(s: []const u8) usize {
     var n: usize = 0;
     var i: usize = 0;
     while (i < s.len) {
-        const l = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-        n += if (l == 4) 4 else 2;
-        i += l;
+        const d = decodeOne(s, i);
+        n += if (d.cp >= 0x10000) 4 else 2;
+        i += d.adv;
     }
     return n;
 }
@@ -204,6 +210,16 @@ test "utf16 roundtrip" {
     const back = try utf16ToUtf8(gpa, list.items);
     defer gpa.free(back);
     try std.testing.expectEqualStrings("héllo 😀", back);
+}
+
+test "utf16Len matches appendUtf16 on invalid UTF-8" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "\xe9t", "a\xe9", "\xf0\x9f", "\xc3\x28x", "\xed\xa0\x80" }) |s| {
+        var list: std.ArrayList(u8) = .empty;
+        defer list.deinit(gpa);
+        try appendUtf16(gpa, &list, s);
+        try std.testing.expectEqual(list.items.len, utf16Len(s));
+    }
 }
 
 test "fuzz: UTF-16 decoding round-trips" {

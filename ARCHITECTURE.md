@@ -469,7 +469,7 @@ reach. It compiles against the `Conn` core and is exercised by the
 
 | Field | Purpose |
 |---|---|
-| `cfg: Config` | Snapshot of the four settings, refreshed by `loadConfig`. NEGOTIATE and TREE_CONNECT read it under the lock; SESSION_SETUP uses the signing rule the NEGOTIATE response promised (`Negotiated.signing_required`) so a reload never changes rules mid-handshake. |
+| `cfg: Config` | Snapshot of the four settings, refreshed by `loadConfig`. NEGOTIATE reads it under the lock; SESSION_SETUP and TREE_CONNECT use the signing rule the NEGOTIATE response promised (`Negotiated.signing_required`) so a reload never changes rules mid-handshake (`encrypt` is read live). |
 | `guid`, `start_ms` | Server GUID and start time, reported in NEGOTIATE responses. |
 | `conns` | Registry of live connections, for the monitor, kicking, and change notification. |
 | `nodes` | Open-file table keyed by `(st_dev, st_ino)`; see below. |
@@ -658,7 +658,8 @@ The negotiate contexts are processed as follows:
   AES-128-CCM. The 256-bit ciphers are not offered. With no cipher in
   common, the response names cipher 0, the session is unencrypted, and it
   is refused when `encrypt` is on.
-- **Signing:** AES-CMAC, whatever the client lists.
+- **Signing:** AES-CMAC; a signing context that omits it gets
+  `STATUS_SMB_NO_SIGNING_ALGORITHM_OVERLAP`.
 - **Compression, RDMA, transport, and netname** contexts are ignored. A
   repeated encryption, signing, compression, or RDMA context gets
   `STATUS_INVALID_PARAMETER`.

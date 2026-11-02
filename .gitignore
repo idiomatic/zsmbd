@@ -7,3 +7,5 @@ zig-out/
 *~
 AGENTS?*.md
 var/
+
+*.draft.md

@@ -5,6 +5,18 @@ the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
 
 ## Unreleased
 
+### Fixed
+- Directory entries and other UTF-16 length fields for names that are not valid UTF-8 (`wire.utf16Len` now counts what `appendUtf16` writes).
+- The reply to a request the client signed is signed, even on a session that does not require signing, and so is the reply to LOGOFF on a signing session.
+- A session's signing mode follows what NEGOTIATE advertised, not the setting as it is at SESSION_SETUP or TREE_CONNECT.
+- NEGOTIATE answers STATUS_SMB_NO_SIGNING_ALGORITHM_OVERLAP when the client's signing context omits AES-CMAC.
+- Web logins for users without a web password take as long as other failures.
+- Setting attributes on a handle without a file descriptor no longer follows a symlink.
+- A rejected DCE/RPC PDU is dropped instead of blocking every later write on the pipe.
+- Web error bodies are complete JSON however long the message.
+- `treeConnect` no longer leaks the share name when allocation fails.
+- The CI fuzz job refreshes the apt index before installing `libsqlite3-dev`.
+
 ### Changed
 - CI installs Zig with `mlugg/setup-zig`; the fuzz job runs on Ubuntu with the system `libsqlite3-dev`.
 - README attributes the authorship to Claude.

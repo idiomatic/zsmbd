@@ -156,8 +156,9 @@ pub fn negotiate(c: *Conn, msg: []const u8, out: *Buf) !Outcome {
             },
             proto.NegCtx.signing => {
                 if (signing != null or d.len < 4 or wire.get16(d, 0) == 0) return .{ .status = Status.invalid_parameter };
-                _ = wire.slice(d, 2, @as(usize, wire.get16(d, 0)) * 2) catch return .{ .status = Status.invalid_parameter };
-                // AES-CMAC is the only algorithm, and the default without overlap.
+                const ids = wire.slice(d, 2, @as(usize, wire.get16(d, 0)) * 2) catch return .{ .status = Status.invalid_parameter };
+                // AES-CMAC is the only algorithm.
+                if (!hasId(ids, proto.SigningAlg.aes_cmac)) return .{ .status = Status.no_signing_algorithm_overlap };
                 signing = proto.SigningAlg.aes_cmac;
             },
             proto.NegCtx.compression => {
@@ -360,7 +361,7 @@ fn setupStep(c: *Conn, s: *Session, client_mode: u8, token: []const u8, out: *Bu
         s.signing_key = crypto.kdf(&s.session_key, "SMBSigningKey\x00", &s.preauth);
         s.enc_key = crypto.kdf(&s.session_key, "SMBS2CCipherKey\x00", &s.preauth);
         s.dec_key = crypto.kdf(&s.session_key, "SMBC2SCipherKey\x00", &s.preauth);
-        s.sign = signingRequired(c) or client_mode & proto.SecurityMode.signing_required != 0;
+        s.sign = c.neg.signing_required or client_mode & proto.SecurityMode.signing_required != 0;
         s.encrypt = encrypt;
         if (encrypt) flags |= proto.SessionFlags.encrypt_data;
     }
@@ -437,7 +438,7 @@ pub fn treeConnect(c: *Conn, s: *Session, msg: []const u8, out: *Buf) !TreeOutco
     } else {
         // An anonymous session cannot sign, so with signing required it
         // reaches only IPC$.
-        if (s.anonymous and signingRequired(c)) return .{ .status = Status.access_denied };
+        if (s.anonymous and c.neg.signing_required) return .{ .status = Status.access_denied };
         const shares = try c.srv.db.listShares(gpa);
         defer {
             for (shares) |sh| sh.free(gpa);
@@ -457,6 +458,7 @@ pub fn treeConnect(c: *Conn, s: *Session, msg: []const u8, out: *Buf) !TreeOutco
         const info = vfs.statPath(root) catch return .{ .status = Status.bad_network_name };
         if (!info.isDir()) return .{ .status = Status.bad_network_name };
         share_name = try gpa.dupe(u8, sh.name);
+        errdefer gpa.free(share_name);
         configured = try gpa.dupe(u8, sh.path);
         read_only = sh.read_only;
     }
@@ -622,17 +624,18 @@ test "NEGOTIATE refusals" {
     defer t.deinit();
     var out = Buf.init(gpa);
     defer out.deinit();
-    const Case = struct { dialects: []const u16, alg: ?u16, ciphers: []const u16 = &.{}, status: u32, keep: bool };
+    const Case = struct { dialects: []const u16, alg: ?u16, ciphers: []const u16 = &.{}, signing: []const u16 = &.{}, status: u32, keep: bool };
     const cases = [_]Case{
         .{ .dialects = &.{ 0x0202, 0x0300 }, .alg = sha512_id, .status = Status.not_supported, .keep = false },
         .{ .dialects = &.{0x0311}, .alg = null, .status = Status.invalid_parameter, .keep = true },
         .{ .dialects = &.{0x0311}, .alg = 0x0002, .status = Status.no_preauth_integrity_hash_overlap, .keep = true },
+        .{ .dialects = &.{0x0311}, .alg = sha512_id, .signing = &.{proto.SigningAlg.aes_gmac}, .status = Status.no_signing_algorithm_overlap, .keep = true },
         .{ .dialects = &.{}, .alg = sha512_id, .status = Status.invalid_parameter, .keep = true },
     };
     for (cases) |cs| {
         t.conn.neg = .{};
         t.conn.credits = .{};
-        const req = try negotiateRequest(gpa, 0, cs.dialects, cs.alg, cs.ciphers, &.{});
+        const req = try negotiateRequest(gpa, 0, cs.dialects, cs.alg, cs.ciphers, cs.signing);
         defer gpa.free(req);
         try testing.expectEqual(cs.keep, try run(&t, req, &out));
         try testing.expectEqual(cs.status, conn_mod.statusAt(&out, 0));
@@ -868,7 +871,7 @@ test "SESSION_SETUP: NTLMv2 through SPNEGO, keys, MICs, and the signed response"
     var t: TestConn = undefined;
     try t.init();
     defer t.deinit();
-    t.srv.cfg.signing_required = true;
+    t.conn.neg.signing_required = true;
     try t.db.putUser("hal", .{ .set = try crypto.ntHash(gpa, "daisy") }, .keep, 0);
     var out = Buf.init(gpa);
     defer out.deinit();
@@ -935,6 +938,51 @@ test "SESSION_SETUP: NTLMv2 through SPNEGO, keys, MICs, and the signed response"
     defer gpa.free(again);
     _ = try run(&t, again, &out);
     try testing.expectEqual(Status.request_not_accepted, conn_mod.statusAt(&out, 0));
+}
+
+test "a signed request gets a signed reply on a session that does not sign" {
+    const gpa = testing.allocator;
+    var t: TestConn = undefined;
+    try t.init();
+    defer t.deinit();
+    try t.db.putUser("hal", .{ .set = try crypto.ntHash(gpa, "daisy") }, .keep, 0);
+    var out = Buf.init(gpa);
+    defer out.deinit();
+    try testing.expectEqual(Status.success, try logon(&t, 0, "hal", "daisy", &out));
+    const sid = wire.get64(out.items(), 40);
+    const s = t.conn.sessions.get(sid).?;
+    try testing.expect(!s.sign);
+    const sk = s.signing_key;
+
+    // Unsigned request, unsigned reply.
+    const plain = try treeRequest(gpa, 2, "\\\\hal9000\\IPC$");
+    defer gpa.free(plain);
+    wire.put64(plain, 40, sid);
+    _ = try run(&t, plain, &out);
+    try testing.expectEqual(Status.success, conn_mod.statusAt(&out, 0));
+    try testing.expect(wire.get32(out.items(), 16) & proto.Flags.signed == 0);
+
+    // Signed request, signed reply.
+    const signed = try treeRequest(gpa, 3, "\\\\hal9000\\IPC$");
+    defer gpa.free(signed);
+    wire.put64(signed, 40, sid);
+    conn_mod.signMessage(signed, sk);
+    _ = try run(&t, signed, &out);
+    try testing.expectEqual(Status.success, conn_mod.statusAt(&out, 0));
+    try testing.expect(wire.get32(out.items(), 16) & proto.Flags.signed != 0);
+    try testing.expectEqualSlices(u8, &crypto.cmacSigZeroed(&sk, out.items()), out.items()[48..64]);
+
+    // A signed LOGOFF is answered signed although the session is gone.
+    var off: [hdr + 4]u8 = @splat(0);
+    conn_mod.testHeader(&off, .logoff, 4, 0, 0);
+    wire.put64(&off, 40, sid);
+    wire.put16(&off, hdr, 4);
+    conn_mod.signMessage(&off, sk);
+    _ = try run(&t, &off, &out);
+    try testing.expectEqual(Status.success, conn_mod.statusAt(&out, 0));
+    try testing.expect(wire.get32(out.items(), 16) & proto.Flags.signed != 0);
+    try testing.expectEqualSlices(u8, &crypto.cmacSigZeroed(&sk, out.items()), out.items()[48..64]);
+    try testing.expect(t.conn.sessions.get(sid) == null);
 }
 
 test "SESSION_SETUP: failures, anonymous logons, and policy" {
@@ -1059,7 +1107,7 @@ test "TREE_CONNECT: shares, IPC$, read-only, and anonymous sessions" {
     // Anonymous: IPC$ always; shares only when signing is optional and the
     // share allows guests.
     s.anonymous = true;
-    t.srv.cfg.signing_required = true;
+    t.conn.neg.signing_required = true;
     const anon = [_]Case{
         .{ .path = "\\\\hal9000\\IPC$", .status = Status.success },
         .{ .path = "\\\\hal9000\\pub", .status = Status.access_denied },
@@ -1071,7 +1119,7 @@ test "TREE_CONNECT: shares, IPC$, read-only, and anonymous sessions" {
         _ = try run(&t, req, &out);
         try testing.expectEqual(cs.status, conn_mod.statusAt(&out, 0));
     }
-    t.srv.cfg.signing_required = false;
+    t.conn.neg.signing_required = false;
     for ([_]Case{
         .{ .path = "\\\\hal9000\\pub", .status = Status.success },
         .{ .path = "\\\\hal9000\\data", .status = Status.access_denied },

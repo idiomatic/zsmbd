@@ -72,6 +72,8 @@ pub const Pipe = struct {
         try p.in.appendSlice(p.gpa, data);
         while (p.in.items.len >= 16) {
             const frag_len = wire.get16(p.in.items, 8);
+            // A rejected PDU is dropped, so the next write starts clean.
+            errdefer p.in.clearRetainingCapacity();
             if (frag_len < 16) return error.Malformed;
             if (p.in.items.len < frag_len) break;
             try p.handlePdu(p.in.items[0..frag_len], shares);

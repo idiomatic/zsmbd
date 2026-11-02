@@ -547,9 +547,13 @@ fn respondJson(req: *http.Server.Request, arena: Allocator, value: anytype) !voi
 }
 
 fn respondError(req: *http.Server.Request, status: http.Status, msg: []const u8) !void {
-    var buf: [512]u8 = undefined;
+    // Escaping grows a message at most sixfold; the cut keeps it in `buf`,
+    // and lands between characters so the string stays valid UTF-8.
+    var buf: [4096]u8 = undefined;
+    var cut: usize = @min(msg.len, 512);
+    while (cut < msg.len and cut > 0 and msg[cut] & 0xC0 == 0x80) cut -= 1;
     var w: Io.Writer = .fixed(&buf);
-    std.json.Stringify.value(.{ .@"error" = msg }, .{}, &w) catch {};
+    std.json.Stringify.value(.{ .@"error" = msg[0..cut] }, .{}, &w) catch {};
     return req.respond(w.buffered(), .{ .status = status, .extra_headers = &json_headers });
 }
 

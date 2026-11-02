@@ -65,7 +65,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - run: sudo apt-get install -y --no-install-recommends libsqlite3-dev
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsqlite3-dev
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:

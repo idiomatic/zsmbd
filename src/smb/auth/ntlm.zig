@@ -53,8 +53,8 @@ pub const Server = struct {
         io.random(&s.challenge);
 
         var flags = (cflags & supported) | Flag.target_type_server | Flag.target_info | Flag.ntlm | Flag.unicode;
-        if (cflags & Flag.extended_session_security == 0) flags &= ~Flag.extended_session_security;
         if (cflags & Flag.version == 0) flags &= ~Flag.version;
+        // Always demanded: only NTLMv2 responses are accepted.
         flags |= Flag.extended_session_security;
         s.flags = flags;
 
