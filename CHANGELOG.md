@@ -3,6 +3,12 @@
 All notable changes to zsmbd. Versions follow [Semantic Versioning](https://semver.org/);
 the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
 
+## Unreleased
+
+### Changed
+- CI installs Zig with `mlugg/setup-zig`; the fuzz job runs on Ubuntu with the system `libsqlite3-dev`.
+- README attributes the authorship to Claude.
+
 ## 0.1.0 (2026-10-31)
 
 First version.

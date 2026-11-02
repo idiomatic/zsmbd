@@ -313,7 +313,7 @@ paste into an existing line.
 
 ## How it was made
 
-zsmbd was written with [Claude Code](https://claude.com/claude-code).
+zsmbd was written with [Claude](https://claude.com/).
 
 ## License
 

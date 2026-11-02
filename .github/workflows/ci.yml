@@ -23,10 +23,9 @@ jobs:
     steps:
       - run: dnf install -y --setopt=install_weak_deps=False sqlite-devel tar xz git
       - uses: actions/checkout@v4
-      - name: Install Zig
-        run: |
-          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /opt
-          echo "/opt/zig-$(uname -m)-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
       - run: zig build test --summary all
       - run: zig build
 
@@ -52,10 +51,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Zig
-        run: |
-          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-aarch64-macos-$ZIG_VERSION.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/zig-aarch64-macos-$ZIG_VERSION" >> "$GITHUB_PATH"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
       - run: zig build test --summary all
       - run: zig build
       - name: Linux type checks
@@ -66,14 +64,12 @@ jobs:
 
   fuzz:
     runs-on: ubuntu-latest
-    container: fedora:latest
     steps:
-      - run: dnf install -y --setopt=install_weak_deps=False sqlite-devel tar xz git
+      - run: sudo apt-get install -y --no-install-recommends libsqlite3-dev
       - uses: actions/checkout@v4
-      - name: Install Zig
-        run: |
-          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /opt
-          echo "/opt/zig-$(uname -m)-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
       # The fuzzer needs .zig-cache/tmp, which the plain test run creates.
       - run: zig build test
       - name: Coverage-guided fuzzing
