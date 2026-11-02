@@ -436,6 +436,13 @@ test "bind then NetrShareEnum level 1" {
         .{ .name = "public", .comment = "Public files" },
         .{ .name = "IPC$", .comment = "IPC Service", .kind = stype_ipc_special },
     };
+    // A rejected PDU is dropped and does not block the bind that follows.
+    var bad: [16]u8 = @splat(0);
+    bad[0] = 4;
+    wire.put16(&bad, 8, 16);
+    try std.testing.expectError(error.Malformed, p.write(&bad, &shares));
+    try std.testing.expectEqual(@as(usize, 0), p.in.items.len);
+
     const bind_pdu = try testBind(gpa);
     defer gpa.free(bind_pdu);
     // Deliver the bind in two pieces to exercise reassembly.

@@ -521,8 +521,8 @@ pub const Admin = struct {
                 .bool => |b| if (b) "true" else "false",
                 else => return respondError(req, .bad_request, "setting values must be strings or booleans"),
             };
-            const v = auth.normalizeSetting(e.key_ptr.*, raw) catch
-                return respondError(req, .bad_request, try std.fmt.allocPrint(arena, "invalid value for {s}", .{e.key_ptr.*}));
+            const v = auth.normalizeSetting(e.key_ptr.*, raw) catch |err|
+                return respondError(req, .bad_request, auth.describe(err));
             try values.append(arena, .{ .key = e.key_ptr.*, .value = v });
         }
         for (values.items) |kv| try a.db.setSetting(kv.key, kv.value);
@@ -547,14 +547,19 @@ fn respondJson(req: *http.Server.Request, arena: Allocator, value: anytype) !voi
 }
 
 fn respondError(req: *http.Server.Request, status: http.Status, msg: []const u8) !void {
-    // Escaping grows a message at most sixfold; the cut keeps it in `buf`,
-    // and lands between characters so the string stays valid UTF-8.
+    // Escaping grows a message at most sixfold; the cut keeps it in `buf`.
     var buf: [4096]u8 = undefined;
-    var cut: usize = @min(msg.len, 512);
-    while (cut < msg.len and cut > 0 and msg[cut] & 0xC0 == 0x80) cut -= 1;
     var w: Io.Writer = .fixed(&buf);
-    std.json.Stringify.value(.{ .@"error" = msg[0..cut] }, .{}, &w) catch {};
+    std.json.Stringify.value(.{ .@"error" = cutUtf8(msg, 512) }, .{}, &w) catch {};
     return req.respond(w.buffered(), .{ .status = status, .extra_headers = &json_headers });
+}
+
+/// At most `max` bytes of `s`, cut between characters so the result stays
+/// valid UTF-8.
+fn cutUtf8(s: []const u8, max: usize) []const u8 {
+    var cut = @min(s.len, max);
+    while (cut < s.len and cut > 0 and s[cut] & 0xC0 == 0x80) cut -= 1;
+    return s[0..cut];
 }
 
 fn cookieValue(header: []const u8, name: []const u8) ?[]const u8 {
@@ -588,6 +593,14 @@ fn queryParam(arena: Allocator, query: []const u8, key: []const u8) !?[]u8 {
         return out[0..n];
     }
     return null;
+}
+
+test "cutUtf8 cuts between characters" {
+    try std.testing.expectEqualStrings("ab", cutUtf8("ab\xc3\xa9", 3));
+    try std.testing.expectEqualStrings("ab\xc3\xa9", cutUtf8("ab\xc3\xa9", 4));
+    try std.testing.expectEqualStrings("a", cutUtf8("a\xf0\x9f\x98\x80", 4));
+    try std.testing.expectEqualStrings("a\xf0\x9f\x98\x80", cutUtf8("a\xf0\x9f\x98\x80", 9));
+    try std.testing.expectEqualStrings("", cutUtf8("\xc3\xa9", 1));
 }
 
 test "cookie and query parsing" {

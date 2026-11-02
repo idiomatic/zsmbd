@@ -11,9 +11,9 @@ the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
 - A session's signing mode follows what NEGOTIATE advertised, not the setting as it is at SESSION_SETUP or TREE_CONNECT.
 - NEGOTIATE answers STATUS_SMB_NO_SIGNING_ALGORITHM_OVERLAP when the client's signing context omits AES-CMAC.
 - Web logins for users without a web password take as long as other failures.
-- Setting attributes on a handle without a file descriptor no longer follows a symlink.
+- Setting attributes on a handle without a file descriptor refuses a symlink, on every host alike.
 - A rejected DCE/RPC PDU is dropped instead of blocking every later write on the pipe.
-- Web error bodies are complete JSON however long the message.
+- Web error bodies are complete JSON however long the message, and an unknown setting is reported without echoing its name.
 - `treeConnect` no longer leaks the share name when allocation fails.
 - The CI fuzz job refreshes the apt index before installing `libsqlite3-dev`.
 

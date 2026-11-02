@@ -77,10 +77,12 @@ Fuzzing found, and these were fixed:
 - **CHANGE_NOTIFY completions** follow the session's `encrypt` flag, so on a
   session that does not require encryption, a notify requested encrypted
   completes plain.
-- **The NTLM AUTHENTICATE MIC** (MS-NLMP 3.2.5.1.2) is not checked; the
-  SPNEGO mechListMIC and the preauth-bound keys cover tampering instead.
+- **The NTLM AUTHENTICATE MIC** (MS-NLMP 3.2.5.1.2) is verified only when
+  the client says it sent one (MsvAvFlags); for the rest, the SPNEGO
+  mechListMIC and the preauth-bound keys cover tampering.
 - **Host-side races.** A local process could swap a directory for a symlink
-  between resolution and open; byte-range locks are advisory among SMB
-  clients only.
+  between resolution and open, or a file for a symlink between `chmodPath`'s
+  check and its `chmod` on hosts where `fchmodat(AT_SYMLINK_NOFOLLOW)` is
+  unsupported; byte-range locks are advisory among SMB clients only.
 - **Text-file writes** from two processes at the same moment can lose one
   change.

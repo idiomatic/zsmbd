@@ -270,7 +270,6 @@ pub fn hashPasswords(gpa: Allocator, io: Io, pw: Passwords) !struct { nt: ?[16]u
     };
 }
 
-/// Returns the canonical user name when `password` is the user's web password.
 /// Spend the time of a password check, so a failure takes as long whether
 /// or not the user exists or has web access.
 fn burnHash(gpa: Allocator, io: Io, password: []const u8) !void {
@@ -278,6 +277,7 @@ fn burnHash(gpa: Allocator, io: Io, password: []const u8) !void {
     gpa.free(dummy);
 }
 
+/// Returns the canonical user name when `password` is the user's web password.
 pub fn checkWebLogin(gpa: Allocator, io: Io, db: *Db, name: []const u8, password: []const u8) !?[]u8 {
     const u = (try db.userAuth(gpa, name)) orelse {
         try burnHash(gpa, io, password);

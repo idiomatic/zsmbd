@@ -288,16 +288,17 @@ pub fn chmod(fd: Fd, mode: u32) Error!void {
     try check(c.fchmod(fd, @intCast(mode & 0o7777)));
 }
 
-/// Never follows a symlink. musl implements the flag through /proc and
-/// reports it unsupported without it, as glibc does on a link; then the
-/// entry is checked by hand.
+/// Refuses a symlink on every platform (macOS would change the link's own
+/// mode), then asks the libc not to follow one either; musl implements that
+/// flag through /proc and reports it unsupported without it, as glibc does
+/// on a link, and then the check above is the only guard.
 pub fn chmodPath(path: [:0]const u8, mode: u32) Error!void {
+    if ((try lstatPath(path)).kind == .symlink) return error.AccessDenied;
     const m: c.mode_t = @intCast(mode & 0o7777);
     const rc = c.fchmodat(c.AT.FDCWD, path.ptr, m, c.AT.SYMLINK_NOFOLLOW);
     if (rc != -1) return;
     const e = c.errno(rc);
     if (!isNotSupported(e)) return mapErrno(e);
-    if ((try lstatPath(path)).kind == .symlink) return error.AccessDenied;
     try check(c.fchmodat(c.AT.FDCWD, path.ptr, m, 0));
 }
 
@@ -632,6 +633,18 @@ pub fn wildcardMatch(pat: []const u8, name: []const u8) bool {
         std.mem.swap([]bool, &next, &cur);
     }
     return next[0];
+}
+
+test "chmodPath refuses a symlink" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.symLink(std.testing.io, "target", "link", .{});
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    const link = try std.fmt.allocPrintSentinel(gpa, "{s}/link", .{dir}, 0);
+    defer gpa.free(link);
+    try std.testing.expectError(error.AccessDenied, chmodPath(link, 0o644));
 }
 
 test "wildcards" {
