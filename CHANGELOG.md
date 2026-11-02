@@ -3,6 +3,23 @@
 All notable changes to zsmbd. Versions follow [Semantic Versioning](https://semver.org/);
 the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
 
+## 0.1.1 (2026-11-02)
+
+### Fixed
+- Directory entries and other UTF-16 length fields for names that are not valid UTF-8 (`wire.utf16Len` now counts what `appendUtf16` writes).
+- The reply to a request the client signed is signed, even on a session that does not require signing, and so are the reply to LOGOFF on a signing session and an error reply on one.
+- A session's signing mode follows what NEGOTIATE advertised, not the setting as it is at SESSION_SETUP or TREE_CONNECT.
+- NEGOTIATE answers STATUS_SMB_NO_SIGNING_ALGORITHM_OVERLAP when the client's signing context omits AES-CMAC.
+- Web logins for users without a web password take as long as other failures.
+- Setting attributes on a handle without a file descriptor refuses a symlink, on every host alike, and works on musl hosts without /proc.
+- A rejected DCE/RPC PDU is dropped instead of blocking every later write on the pipe.
+- Web error bodies are complete JSON however long the message, and a rejected setting is reported by name.
+- `treeConnect` no longer leaks the share name when allocation fails.
+
+### Changed
+- CI installs Zig with `mlugg/setup-zig`.
+- README attributes the authorship to Claude.
+
 ## 0.1.0 (2026-10-31)
 
 First version.
