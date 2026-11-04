@@ -295,7 +295,7 @@ paste into an existing line.
 
 - NT hashes are password-equivalent. zsmbd writes the users file with mode
   0600 and warns when others can read it; protect the database the same way.
-- The web console listens on localhost only and has no TLS. To reach it
+- The web console listens on localhost by default and has no TLS. To reach it
   remotely, use an SSH tunnel (`ssh -L 8445:127.0.0.1:8445 HOST`) or a TLS
   proxy.
 - The console hashes SMB passwords in the browser with WebAssembly, and falls
@@ -308,7 +308,7 @@ paste into an existing line.
 - [ARCHITECTURE.md](ARCHITECTURE.md): design, modules, and status.
 - [AGENTS.md](AGENTS.md): requirements and decisions.
 - [SECURITY.md](SECURITY.md): attack surface and secrets.
-- [REFERENCES.md](REFERENCES.md): protocol specifications.
+- [docs/specifications](docs/specifications/README.md): protocol specifications.
 - [CHANGELOG.md](CHANGELOG.md): changes by version.
 
 ## How it was made
