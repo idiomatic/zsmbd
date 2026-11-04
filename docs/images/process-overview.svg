@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 980" width="900" height="980" role="img" aria-labelledby="title desc">
+  <title id="title">zsmbd process overview</title>
+  <desc id="desc">The zsmbd serve process with its SMB listener, connection threads, SMB modules, shared server state, admin web server, control listener, and store; the CLI runs as a separate process on the same store and notifies serve through the control socket.</desc>
+  <style>
+    text { font: 12px system-ui, -apple-system, "Segoe UI", sans-serif; fill: #1f2328; }
+    .mono { font: 11px ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+    .bold { font-weight: 600; }
+    .label { font-size: 11px; fill: #57606a; font-style: italic; }
+    .c { text-anchor: middle; }
+    .frame { fill: none; stroke: #8c959f; stroke-width: 1.5; stroke-dasharray: 6 4; }
+    .box { fill: #f6f8fa; stroke: #57606a; }
+    .ext { fill: #ddf4ff; stroke: #0969da; }
+    .disk { fill: #fff8c5; stroke: #9a6700; }
+    .line { fill: none; stroke: #57606a; stroke-width: 1.3; marker-end: url(#arrow); }
+    .ctl { stroke-dasharray: 5 3; }
+    .head { fill: #57606a; }
+    .bg { fill: #ffffff; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #e6edf3; }
+      .label { fill: #9198a1; }
+      .frame { stroke: #6e7681; }
+      .box { fill: #161b22; stroke: #8b949e; }
+      .ext { fill: #0c2d6b; stroke: #4493f8; }
+      .disk { fill: #3b2e00; stroke: #d29922; }
+      .line { stroke: #8b949e; }
+      .head { fill: #8b949e; }
+      .bg { fill: #0d1117; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0,0 L10,5 L0,10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" width="900" height="980"/>
+
+  <!-- zsmbd serve -->
+  <rect class="frame" x="180" y="20" width="500" height="760" rx="10"/>
+  <text class="bold" x="194" y="42">zsmbd serve</text>
+
+  <!-- SMB side -->
+  <rect class="ext" x="20" y="60" width="130" height="44" rx="6"/>
+  <text class="c" x="85" y="78">SMB clients</text>
+  <text class="c label" x="85" y="94">TCP 445</text>
+  <path class="line" d="M150,82 H200"/>
+
+  <rect class="box" x="200" y="60" width="140" height="44" rx="6"/>
+  <text class="c mono" x="270" y="78">SMB listener</text>
+  <text class="c mono" x="270" y="94">:445 or :4450</text>
+  <path class="line" d="M270,104 V140"/>
+  <text class="label" x="278" y="126">accept</text>
+
+  <rect class="box" x="200" y="140" width="140" height="36" rx="6"/>
+  <text class="c mono" x="270" y="162">conn thread ×N</text>
+  <path class="line" d="M270,176 V210"/>
+  <path class="line" d="M200,158 H188 V492 H200"/>
+
+  <rect class="box" x="200" y="210" width="140" height="36" rx="6"/>
+  <text class="c mono" x="270" y="232">smb/conn.zig</text>
+  <path class="line" d="M270,246 V290"/>
+  <path class="line" d="M270,268 H430 V290"/>
+  <path class="line" d="M270,268 H590 V290"/>
+
+  <rect class="box" x="200" y="290" width="140" height="44" rx="6"/>
+  <text class="c mono" x="270" y="316">smb/files.zig</text>
+  <rect class="box" x="360" y="290" width="140" height="44" rx="6"/>
+  <text class="c mono" x="430" y="308">smb/rpc.zig</text>
+  <text class="c label" x="430" y="324">IPC$ srvsvc</text>
+  <rect class="box" x="520" y="290" width="140" height="44" rx="6"/>
+  <text class="c mono" x="590" y="308">ntlm, spnego,</text>
+  <text class="c mono" x="590" y="324">crypto</text>
+  <path class="line" d="M270,334 V370"/>
+
+  <rect class="box" x="200" y="370" width="140" height="36" rx="6"/>
+  <text class="c mono" x="270" y="392">smb/vfs.zig</text>
+  <path class="line" d="M340,388 H720"/>
+  <rect class="disk" x="720" y="370" width="110" height="36" rx="6"/>
+  <text class="c" x="775" y="392">host FS</text>
+
+  <!-- Shared state -->
+  <rect class="box" x="200" y="450" width="460" height="84" rx="6"/>
+  <text class="c mono bold" x="430" y="474">server.Server</text>
+  <text class="c label" x="430" y="496">config snapshot · connection registry · open-file nodes</text>
+  <text class="c label" x="430" y="514">activity ring · counters</text>
+
+  <!-- Web console and control socket -->
+  <rect class="ext" x="20" y="593" width="130" height="44" rx="6"/>
+  <text class="c" x="85" y="611">Browser</text>
+  <text class="c label" x="85" y="627">HTTP</text>
+  <path class="line" d="M150,615 H200"/>
+
+  <rect class="box" x="200" y="590" width="220" height="50" rx="6"/>
+  <text class="c mono" x="310" y="610">admin web server</text>
+  <text class="c label" x="310" y="628">web/server.zig · 127.0.0.1:PORT</text>
+  <path class="line" d="M310,590 V534"/>
+  <text class="label" x="318" y="558">web.Live hooks</text>
+  <text class="label" x="318" y="572">activity, kick, reload</text>
+
+  <rect class="box" x="440" y="590" width="220" height="50" rx="6"/>
+  <text class="c mono" x="550" y="610">control listener</text>
+  <text class="c label" x="550" y="628">control/control.zig</text>
+  <path class="line" d="M490,590 V534"/>
+  <text class="label" x="498" y="558">control.Hooks</text>
+  <text class="label" x="498" y="572">reconcile, web start/stop</text>
+
+  <!-- Store -->
+  <path class="line" d="M310,640 V680"/>
+  <text class="label" x="318" y="664">thread per connection</text>
+  <rect class="box" x="250" y="680" width="120" height="32" rx="6"/>
+  <text class="c mono" x="310" y="700">policy/auth</text>
+  <path class="line" d="M370,696 H390"/>
+  <rect class="box" x="390" y="680" width="100" height="32" rx="6"/>
+  <text class="c mono" x="440" y="700">store</text>
+  <path class="line" d="M440,712 V732"/>
+  <path class="line" d="M440,722 H585 V732"/>
+  <rect class="box" x="390" y="732" width="100" height="30" rx="6"/>
+  <text class="c mono" x="440" y="751">sqlite.zig</text>
+  <rect class="box" x="510" y="732" width="150" height="30" rx="6"/>
+  <text class="c mono" x="585" y="751">textconf, textusers</text>
+
+  <!-- On disk -->
+  <path class="line" d="M440,762 V810"/>
+  <path class="line" d="M585,762 V810"/>
+  <rect class="disk" x="385" y="810" width="110" height="30" rx="6"/>
+  <text class="c mono" x="440" y="829">zsmbd.db</text>
+  <rect class="disk" x="530" y="810" width="110" height="30" rx="6"/>
+  <text class="c" x="585" y="829">text files</text>
+
+  <!-- CLI -->
+  <rect class="frame" x="180" y="870" width="500" height="90" rx="10"/>
+  <text class="bold" x="194" y="892">zsmbd user | share | get | set</text>
+  <text class="label" x="400" y="892">a separate process</text>
+  <rect class="box" x="200" y="908" width="100" height="32" rx="6"/>
+  <text class="c mono" x="250" y="928">cli</text>
+  <path class="line" d="M300,924 H330"/>
+  <rect class="box" x="330" y="908" width="120" height="32" rx="6"/>
+  <text class="c mono" x="390" y="928">policy/auth</text>
+  <path class="line" d="M450,924 H480"/>
+  <rect class="box" x="480" y="908" width="100" height="32" rx="6"/>
+  <text class="c mono" x="530" y="928">store</text>
+  <path class="line" d="M510,908 V855 H440 V840"/>
+  <path class="line" d="M555,908 V840"/>
+
+  <path class="line ctl" d="M680,915 H700 V615 H660"/>
+  <text class="label" x="708" y="760">control socket</text>
+  <text class="label" x="708" y="775">PATH.sock</text>
+</svg>

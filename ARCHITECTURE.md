@@ -53,46 +53,8 @@ client fallback.
 
 ## 2. Process overview
 
-```
-                 ┌──────── zsmbd serve ────────┐
-                 │                             │
- SMB clients ───►│ SMB listener (:445)         │
- (TCP 445)       │   │ accept                  │
-                 │   ▼                         │
-                 │ conn thread ×N              │
-                 │   ├► smb/conn.zig           │
-                 │   │    ├► smb/files.zig     │
-                 │   │    │    └► smb/vfs.zig  │
-                 │   │    │         └► host FS │
-                 │   │    ├► smb/rpc.zig       │
-                 │   │    │    (IPC$ srvsvc)   │
-                 │   │    └► ntlm, spnego,     │
-                 │   │       crypto            │
-                 │   ▼                         │
-                 │ server.Server               │
-                 │   config snapshot,          │
-                 │   connection registry,      │
-                 │   open-file nodes,          │
-                 │   activity ring, counters   │
-                 │   ▲                         │
-                 │   │ web.Live hooks          │
-                 │   │ (activity, kick,        │
-                 │   │  reload)                │
- Browser ───────►│ admin web server            │
- (HTTP)          │   127.0.0.1:8445,           │
-                 │   web/server.zig            │
-                 │   │ thread per connection   │
-                 │   ▼                         │
-                 │ policy/auth ──► store       │
-                 │     ├► sqlite.zig ► zsmbd.db│
-                 │     └► textconf, textusers  │
-                 │          ──► files          │
-                 └─────────────────────────────┘
-
- zsmbd user|share|get|set ──► cli
-   ──► policy/auth ──► store
-   (a separate process)
-```
+![Process overview: zsmbd serve and the CLI sharing a
+store](docs/images/process-overview.svg)
 
 One process hosts up to two listeners: SMB (`--smb`, default `0.0.0.0:445`,
 or `0.0.0.0:4450` unless run as root) and the admin web server, which runs
