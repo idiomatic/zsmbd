@@ -2070,6 +2070,15 @@ test "fuzz: file commands against a temporary share" {
             // Each input starts from the same state: one open file with data.
             closeAll(fx.conn, null, null);
             fx.ctx.related = null;
+            // `--fuzz` checks each input for leaks: drop retained
+            // capacity on every path out, early returns included.
+            defer {
+                closeAll(fx.conn, null, null);
+                fx.srv.nodes.clearAndFree(testing.allocator);
+                fx.conn.opens.map.clearAndFree(testing.allocator);
+                fx.out.list.clearAndFree(testing.allocator);
+                fx.ctx.related = null;
+            }
             const dir = try fx.create("perihelion", Access.read_data, share_all, Disposition.open_if, CreateOptions.directory_file);
             const base = try fx.create("perihelion\\art.txt", rw | Access.delete | Access.write_attributes, share_all, Disposition.overwrite_if, 0);
             if (base.status != Status.success) return;
@@ -2095,11 +2104,6 @@ test "fuzz: file commands against a temporary share" {
             // The node table only holds files with open handles.
             closeAll(fx.conn, null, null);
             try testing.expectEqual(@as(u32, 0), fx.srv.nodes.count());
-            // `--fuzz` checks each input for leaks: drop retained capacity.
-            fx.srv.nodes.clearAndFree(testing.allocator);
-            fx.conn.opens.map.clearAndFree(testing.allocator);
-            fx.out.list.clearAndFree(testing.allocator);
-            fx.ctx.related = null;
         }
     }.one, seeds);
 }
