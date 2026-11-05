@@ -642,7 +642,10 @@ fn signatureValid(s: *const Session, msg: []const u8) bool {
 fn handle(c: *Conn, cmd: Command, msg: []const u8, chain: *Chain, out: *Buf) !Result {
     const related = wire.get32(msg, 16) & proto.Flags.related_operations != 0;
     if (related and chain.first) return .{ .status = Status.invalid_parameter };
-    if (related and chain.status != Status.success) return .{ .status = chain.status };
+    if (related and chain.status != Status.success) {
+        if (cmd == .close) if (chain.fid) |f| if (chain.session) |s| if (chain.tree) |t| files.closeRelated(c, s.id, t, f);
+        return .{ .status = chain.status };
+    }
     if (requiredCharge(cmd, msg[hdr..]) > @max(wire.get16(msg, 6), 1)) return .{ .status = Status.invalid_parameter };
 
     switch (cmd) {

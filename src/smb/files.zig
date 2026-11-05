@@ -610,6 +610,16 @@ pub fn closeOpen(conn: *Conn, o: *Open) void {
     gpa.destroy(o);
 }
 
+/// Closes the handle a failed compound chain left open. A related CLOSE
+/// after a failure is itself failed, so without this the kernel client's
+/// rmdir (open, set-info, close) of a non-empty directory leaks the handle
+/// and its delete-pending state blocks the real delete later.
+pub fn closeRelated(conn: *Conn, session_id: u64, tree: *Tree, fid: FileId) void {
+    const o = conn.opens.map.get(fid.volatile_) orelse return;
+    if (o.persistent_id != fid.persistent or o.session_id != session_id or o.tree != tree) return;
+    closeOpen(conn, o);
+}
+
 /// Close every open of a session and/or tree (null matches any), for
 /// TREE_DISCONNECT, LOGOFF, and connection teardown.
 pub fn closeAll(conn: *Conn, session_id: ?u64, tree: ?*Tree) void {
@@ -1065,6 +1075,9 @@ fn queryFile(ctx: *Ctx, o: *Open, class: u8, out: *Buf) !?u32 {
         },
         FileInfo.normalized_name => try nameInfo(gpa, out, o.rel_path, false),
         FileInfo.name => try nameInfo(gpa, out, o.rel_path, true),
+        // Extended attributes aren't stored; the kernel client lists them
+        // for `ls -l` and reads this status as "none" (anything else is EIO).
+        FileInfo.full_ea => return Status.no_eas_on_file,
         else => return Status.invalid_info_class,
     }
     return null;
@@ -1733,6 +1746,13 @@ test "directories, rename, and non-empty delete" {
     const x = try f.create("perihelion\\art.txt", rw | Access.delete, share_all, Disposition.create, 0);
     try testing.expectEqual(Status.success, x.status);
     try testing.expectEqual(Status.directory_not_empty, try f.setInfo(d.fid, FileInfo.disposition, &.{1}));
+    // The failed compound's related CLOSE is itself failed; the server still
+    // releases the handle.
+    const d2 = try f.create("perihelion", Access.read_data | Access.delete, share_all, Disposition.open, CreateOptions.directory_file);
+    try testing.expectEqual(Status.success, d2.status);
+    try testing.expectEqual(Status.directory_not_empty, try f.setInfo(d2.fid, FileInfo.disposition, &.{1}));
+    closeRelated(f.conn, f.session.id, &f.tree, d2.fid);
+    try testing.expectEqual(Status.file_closed, try f.close(d2.fid));
 
     const gpa = testing.allocator;
     var b = Buf.init(gpa);
@@ -1808,6 +1828,7 @@ test "query info sizes and read-only shares" {
     try testing.expect(wire.get64(f.body(), 8) > 0);
     try testing.expectEqual(Status.success, try f.queryInfo(a.fid, proto.InfoType.security, 0, 4096));
     try testing.expectEqual(Status.invalid_info_class, try f.queryInfo(a.fid, proto.InfoType.file, 99, 4096));
+    try testing.expectEqual(Status.no_eas_on_file, try f.queryInfo(a.fid, proto.InfoType.file, FileInfo.full_ea, 4096));
     try testing.expectEqual(Status.success, try f.setInfo(a.fid, FileInfo.end_of_file, &.{ 3, 0, 0, 0, 0, 0, 0, 0 }));
     try testing.expectEqual(Status.success, try f.read(a.fid, 0, 100));
     try testing.expectEqualStrings("I'm", f.body()[16..]);
