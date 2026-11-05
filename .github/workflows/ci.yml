@@ -1,8 +1,8 @@
 # Builds and tests zsmbd on its supported hosts: Fedora and Alpine Linux
 # (x86_64 and aarch64) and macOS, plus Linux type checks and a short
 # coverage-guided fuzz run. The Linux jobs also run the interoperability
-# tests (test/interop), which mount CIFS and so need a privileged
-# container. See SECURITY.md.
+# tests (test/interop), which mount CIFS: each runs in a privileged
+# container on a host that has loaded the cifs module. See SECURITY.md.
 name: CI
 
 on:
@@ -21,20 +21,21 @@ jobs:
       matrix:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    # Privileged, so the interop tests can mount CIFS with the host's kernel.
-    container:
-      image: fedora:latest
-      options: --privileged
     steps:
-      - run: dnf install -y --setopt=install_weak_deps=False sqlite-devel tar xz git samba-client cifs-utils rsync diffutils python3 util-linux kmod
       - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      - run: zig build test --summary all
-      - run: zig build
-      - name: Interoperability tests
-        run: INTEROP_REQUIRE_KERNEL=1 sh test/interop/run.sh
+      - name: Load the CIFS kernel module on the host
+        run: sudo modprobe cifs || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe cifs; }
+      # A privileged container shares the host's kernel, so the interop tests
+      # can mount CIFS; a job-level container can't load the module first.
+      - name: Build, test, and run the interoperability tests on Fedora
+        run: |
+          docker run --rm --privileged -v "$PWD:/src" -w /src -e ZIG_VERSION fedora:latest sh -euc '
+            dnf install -y --setopt=install_weak_deps=False sqlite-devel curl tar xz git samba-client cifs-utils rsync diffutils python3 util-linux kmod
+            curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /opt
+            export PATH="/opt/zig-$(uname -m)-linux-$ZIG_VERSION:$PATH"
+            zig build test --summary all
+            zig build
+            INTEROP_REQUIRE_KERNEL=1 sh test/interop/run.sh'
 
   alpine:
     strategy:
@@ -44,8 +45,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+      - name: Load the CIFS kernel module on the host
+        run: sudo modprobe cifs || { sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe cifs; }
       # JavaScript actions can't run in Alpine containers, so run it directly.
-      - name: Build and test on Alpine
+      - name: Build, test, and run the interoperability tests on Alpine
         run: |
           docker run --rm --privileged -v "$PWD:/src" -w /src -e ZIG_VERSION alpine:latest sh -euc '
             apk add --no-cache sqlite-dev curl tar xz git samba-client cifs-utils rsync diffutils python3 util-linux coreutils kmod
