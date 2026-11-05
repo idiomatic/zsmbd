@@ -17,6 +17,7 @@ const ephemeral = @import("ephemeral.zig");
 pub const Error = types.Error;
 pub const Change = types.Change;
 pub const Share = types.Share;
+pub const Kick = types.Kick;
 pub const User = types.User;
 pub const UserAuth = types.UserAuth;
 pub const freeShares = types.freeShares;

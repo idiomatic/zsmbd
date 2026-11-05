@@ -33,8 +33,9 @@ pub const usage =
     \\  share add SHARE PATH
     \\  share comment SHARE TEXT
     \\  share readonly SHARE
-    \\  share readwrite SHARE
-    \\  share guest SHARE              allow guests (no sign-in)
+    \\  share readwrite [--kick] SHARE   --kick: drop clients still read-only
+    \\  share guest [--kick] SHARE     allow guests (no sign-in); --kick: drop
+    \\                                 clients already refused
     \\  share noguest SHARE
     \\  share del SHARE
     \\  web start [[ADDR:]PORT]        start the web console of a running serve
@@ -279,7 +280,15 @@ fn shareCmd(c: *Cli) !void {
         }
         return;
     }
-    const name = try c.need();
+    // `readwrite` and `guest` take --kick (before or after SHARE): once
+    // the change is made, drop the clients still acting on the old rules.
+    const relaxes = std.mem.eql(u8, sub, "readwrite") or std.mem.eql(u8, sub, "guest");
+    var kick = false;
+    var name = try c.need();
+    if (relaxes and std.mem.eql(u8, name, "--kick")) {
+        kick = true;
+        name = try c.need();
+    }
     if (std.mem.eql(u8, sub, "add")) {
         const path = try c.need();
         if (c.next() != null) return error.Usage;
@@ -292,6 +301,7 @@ fn shareCmd(c: *Cli) !void {
     } else {
         // Changes to one option of an existing share.
         const comment = if (std.mem.eql(u8, sub, "comment")) try c.need() else null;
+        if (relaxes and !kick) kick = if (c.next()) |a| (if (std.mem.eql(u8, a, "--kick")) true else return error.Usage) else false;
         if (c.next() != null) return error.Usage;
         const shares = try c.db.listShares(c.gpa);
         defer db_mod.freeShares(c.gpa, shares);
@@ -308,7 +318,7 @@ fn shareCmd(c: *Cli) !void {
         else return error.Usage;
         try c.db.putShare(share);
     }
-    tell(c, "share", name);
+    tell(c, if (!kick) "share" else if (std.mem.eql(u8, sub, "guest")) "share-kick guests" else "share-kick writable", name);
 }
 
 /// Tells a running `serve` on this store (through its control socket) about
@@ -447,6 +457,7 @@ fn serve(c: *Cli) !void {
         .cfg = .{ .server_name = &.{}, .workgroup = &.{}, .signing_required = true, .encrypt = false },
     };
     try srv.loadConfig();
+    srv.warnGuestSigning(null);
     var listener = saddr.listen(c.io, .{ .reuse_address = true }) catch |e| {
         std.log.err("cannot listen for SMB on {f}: {s} (ports below 1024 need root; try --smb 4450)", .{ saddr, @errorName(e) });
         return e;
@@ -484,8 +495,8 @@ fn serving(ctx: ?*anyopaque) *Serving {
     return @ptrCast(@alignCast(ctx.?));
 }
 
-fn ctlShare(ctx: ?*anyopaque, name: []const u8) usize {
-    return serving(ctx).srv.reconcileShare(name);
+fn ctlShare(ctx: ?*anyopaque, name: []const u8, kick: db_mod.Kick) usize {
+    return serving(ctx).srv.reconcileShare(name, kick);
 }
 
 fn ctlUser(ctx: ?*anyopaque, name: []const u8) usize {
@@ -533,8 +544,8 @@ fn liveKick(ctx: ?*anyopaque, conn_id: u64) bool {
     return liveServer(ctx).kick(conn_id);
 }
 
-fn liveShareChanged(ctx: ?*anyopaque, share: []const u8) usize {
-    return liveServer(ctx).reconcileShare(share);
+fn liveShareChanged(ctx: ?*anyopaque, share: []const u8, kick: db_mod.Kick) usize {
+    return liveServer(ctx).reconcileShare(share, kick);
 }
 
 fn liveUserChanged(ctx: ?*anyopaque, name: []const u8) usize {
@@ -543,7 +554,9 @@ fn liveUserChanged(ctx: ?*anyopaque, name: []const u8) usize {
 
 /// Settings changed in the store; a bad value keeps the old ones.
 fn liveReload(ctx: ?*anyopaque) void {
-    liveServer(ctx).loadConfig() catch |e| std.log.warn("settings not reloaded: {s}", .{@errorName(e)});
+    const srv = liveServer(ctx);
+    srv.loadConfig() catch |e| return std.log.warn("settings not reloaded: {s}", .{@errorName(e)});
+    srv.warnGuestSigning(null);
 }
 
 /// Adds the login of `--user`, `--smb-user`, or `--web-user` to `spec`,

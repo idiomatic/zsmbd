@@ -10,6 +10,7 @@ const Allocator = std.mem.Allocator;
 const db_mod = @import("../store/store.zig");
 const Db = db_mod.Db;
 const Share = db_mod.Share;
+const Kick = db_mod.Kick;
 const auth = @import("../policy/auth.zig");
 const conn_mod = @import("conn.zig");
 const Conn = conn_mod.Conn;
@@ -386,8 +387,11 @@ pub const Server = struct {
     /// (`cur`; null when it is gone) no longer allows: a tree opened writable
     /// on a share now read-only, a tree on a share that moved, or an
     /// anonymous session on a share without guests. Relaxing a share makes
-    /// none stale. Caller frees the slice.
-    pub fn staleOnShare(srv: *Server, gpa: Allocator, share: []const u8, cur: ?Share) ![]u64 {
+    /// none stale, unless `relax` asks for them: `.writable` adds the trees
+    /// opened read-only on a share now writable, `.guests` the connections
+    /// with an anonymous session on a share now open to guests. Caller frees
+    /// the slice.
+    pub fn staleOnShare(srv: *Server, gpa: Allocator, share: []const u8, cur: ?Share, relax: Kick) ![]u64 {
         srv.lock();
         defer srv.unlock();
         var ids: std.ArrayList(u64) = .empty;
@@ -396,11 +400,16 @@ pub const Server = struct {
             if (t.tree_id == 0 or !std.ascii.eqlIgnoreCase(t.name, share)) continue;
             const stale = if (cur) |c|
                 (!t.read_only and c.read_only) or !std.mem.eql(u8, t.path, c.path) or
-                    (!c.guest_ok and srv.sessionIsAnonymous(t.conn_id, t.session_id))
+                    (!c.guest_ok and srv.sessionIsAnonymous(t.conn_id, t.session_id)) or
+                    (relax == .writable and t.read_only and !c.read_only)
             else
                 true;
             if (stale and std.mem.indexOfScalar(u64, ids.items, t.conn_id) == null) try ids.append(gpa, t.conn_id);
         }
+        // A refused anonymous session has no tree, so it is found by name.
+        if (relax == .guests) if (cur) |c| if (c.guest_ok) for (srv.watch.items) |s| {
+            if (s.tree_id == 0 and s.name.len == 0 and std.mem.indexOfScalar(u64, ids.items, s.conn_id) == null) try ids.append(gpa, s.conn_id);
+        };
         return ids.toOwnedSlice(gpa);
     }
 
@@ -412,16 +421,34 @@ pub const Server = struct {
         return false;
     }
 
+    /// Warns about each guest share (only `name`, if given) while signing
+    /// is required: anonymous sessions can't sign, so they reach only IPC$.
+    pub fn warnGuestSigning(srv: *Server, name: ?[]const u8) void {
+        srv.lock();
+        const signing = srv.cfg.signing_required;
+        srv.unlock();
+        if (!signing) return;
+        const shares = srv.db.listShares(srv.gpa) catch return;
+        defer db_mod.freeShares(srv.gpa, shares);
+        for (shares) |sh| {
+            if (!sh.guest_ok) continue;
+            if (name) |n| if (!std.ascii.eqlIgnoreCase(sh.name, n)) continue;
+            std.log.warn("share {s} allows guests, but signing is required and anonymous sessions can't sign, so guests are refused; set signing_required = no to admit them", .{sh.name});
+        }
+    }
+
     /// Call after share `name` changed in the store (or was deleted): drops
     /// the connections whose access it now tightens, so each client
-    /// reconnects under the new rules. Returns how many were dropped.
-    pub fn reconcileShare(srv: *Server, name: []const u8) usize {
+    /// reconnects under the new rules (`relax`: see staleOnShare). Returns how
+    /// many were dropped.
+    pub fn reconcileShare(srv: *Server, name: []const u8, relax: Kick) usize {
         const shares = srv.db.listShares(srv.gpa) catch return 0;
         defer db_mod.freeShares(srv.gpa, shares);
         const cur: ?Share = for (shares) |sh| {
             if (std.ascii.eqlIgnoreCase(sh.name, name)) break sh;
         } else null;
-        const ids = srv.staleOnShare(srv.gpa, name, cur) catch return 0;
+        if (cur) |c| if (c.guest_ok) srv.warnGuestSigning(name);
+        const ids = srv.staleOnShare(srv.gpa, name, cur, relax) catch return 0;
         defer srv.gpa.free(ids);
         const n = srv.kickAll(ids);
         if (n > 0) srv.log(0, "share", "{s} changed: {d} connection(s) dropped", .{ name, n });
@@ -639,32 +666,52 @@ test "which connections a changed share leaves stale" {
 
     const open: Share = .{ .name = "data", .path = "/srv/data", .guest_ok = true };
     // Unchanged, or relaxed, leaves nobody stale.
-    const same = try srv.staleOnShare(gpa, "DATA", open);
+    const same = try srv.staleOnShare(gpa, "DATA", open, .none);
     defer gpa.free(same);
     try testing.expectEqual(@as(usize, 0), same.len);
     // Read-only turned on: the writable trees (connection 1 only).
     var cur = open;
     cur.read_only = true;
-    const ro = try srv.staleOnShare(gpa, "data", cur);
+    const ro = try srv.staleOnShare(gpa, "data", cur, .none);
     defer gpa.free(ro);
     try testing.expectEqualSlices(u64, &.{1}, ro);
     // Guests turned off: only the guest session's connection.
     cur = open;
     cur.guest_ok = false;
-    const noguest = try srv.staleOnShare(gpa, "data", cur);
+    const noguest = try srv.staleOnShare(gpa, "data", cur, .none);
     defer gpa.free(noguest);
     try testing.expectEqualSlices(u64, &.{1}, noguest);
     // Moved, or deleted: every connection using it.
     cur = open;
     cur.path = "/srv/elsewhere";
-    const moved = try srv.staleOnShare(gpa, "data", cur);
+    const moved = try srv.staleOnShare(gpa, "data", cur, .none);
     defer gpa.free(moved);
     try testing.expectEqualSlices(u64, &.{ 1, 2 }, moved);
-    const gone = try srv.staleOnShare(gpa, "data", null);
+    const gone = try srv.staleOnShare(gpa, "data", null, .none);
     defer gpa.free(gone);
     try testing.expectEqualSlices(u64, &.{ 1, 2 }, gone);
+    // Kicking after a relaxing change: connection 2 holds a read-only tree
+    // (found once the share is writable); connections with an anonymous
+    // session (1) are found once the share admits guests. Each kick finds
+    // only its own kind, and none at all while the share is unchanged.
+    const rw = try srv.staleOnShare(gpa, "data", open, .writable);
+    defer gpa.free(rw);
+    try testing.expectEqualSlices(u64, &.{2}, rw);
+    var tight = open;
+    tight.read_only = true;
+    const rw_tight = try srv.staleOnShare(gpa, "data", tight, .writable);
+    defer gpa.free(rw_tight);
+    try testing.expectEqualSlices(u64, &.{1}, rw_tight);
+    const guests = try srv.staleOnShare(gpa, "data", open, .guests);
+    defer gpa.free(guests);
+    try testing.expectEqualSlices(u64, &.{1}, guests);
+    var closed = open;
+    closed.guest_ok = false;
+    const guests_closed = try srv.staleOnShare(gpa, "data", closed, .guests);
+    defer gpa.free(guests_closed);
+    try testing.expectEqualSlices(u64, &.{1}, guests_closed); // the usual noguest rule
     // Nothing is registered as a live connection, so nothing is dropped.
-    try testing.expectEqual(@as(usize, 0), srv.reconcileShare("data"));
+    try testing.expectEqual(@as(usize, 0), srv.reconcileShare("data", .none));
 
     const art = try srv.connectionsOfUser(gpa, "ART");
     defer gpa.free(art);

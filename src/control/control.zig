@@ -5,6 +5,9 @@
 //! one request line per connection and one reply line:
 //!
 //!     share NAME   a share changed or was deleted
+//!     share-kick writable|guests NAME   the same, and after a change that
+//!                  relaxed it, drop the clients still acting on the old
+//!                  rules (read-only trees, or anonymous sessions)
 //!     user NAME    a user changed or was deleted
 //!     settings     reload the settings
 //!     web start [[ADDR:]PORT]   start the web console
@@ -23,6 +26,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const net = Io.net;
 const Allocator = std.mem.Allocator;
+const Kick = @import("../store/store.zig").Kick;
 
 pub const max_line = 256;
 pub const suffix = ".sock";
@@ -30,7 +34,7 @@ pub const suffix = ".sock";
 pub const max_path = 100;
 
 pub const Request = union(enum) {
-    share: []const u8,
+    share: struct { name: []const u8, kick: Kick = .none },
     user: []const u8,
     settings,
     /// The address argument, if any.
@@ -54,7 +58,16 @@ pub fn parse(line: []const u8) ?Request {
     const arg = l[space + 1 ..];
     if (arg.len == 0 or arg.len > 128) return null;
     for (arg) |ch| if (ch < 0x20 or ch == 0x7f) return null;
-    if (std.mem.eql(u8, l[0..space], "share")) return .{ .share = arg };
+    if (std.mem.eql(u8, l[0..space], "share")) return .{ .share = .{ .name = arg } };
+    if (std.mem.eql(u8, l[0..space], "share-kick")) {
+        const sp = std.mem.indexOfScalar(u8, arg, ' ') orelse return null;
+        const name = arg[sp + 1 ..];
+        if (name.len == 0) return null;
+        const kick: Kick = if (std.mem.eql(u8, arg[0..sp], "writable")) .writable //
+        else if (std.mem.eql(u8, arg[0..sp], "guests")) .guests //
+        else return null;
+        return .{ .share = .{ .name = name, .kick = kick } };
+    }
     if (std.mem.eql(u8, l[0..space], "user")) return .{ .user = arg };
     return null;
 }
@@ -92,7 +105,7 @@ pub fn parseReply(line: []const u8) ?Reply {
 /// returns how many connections it dropped.
 pub const Hooks = struct {
     ctx: ?*anyopaque = null,
-    share: *const fn (ctx: ?*anyopaque, name: []const u8) usize,
+    share: *const fn (ctx: ?*anyopaque, name: []const u8, kick: Kick) usize,
     user: *const fn (ctx: ?*anyopaque, name: []const u8) usize,
     settings: *const fn (ctx: ?*anyopaque) void,
     /// Starts (with an optional address) or stops the web console; the
@@ -107,7 +120,7 @@ pub const reply_max = 320;
 pub fn handle(h: Hooks, line: []const u8, buf: []u8) Reply {
     const req = parse(line) orelse return .{ .err = "unknown command" };
     return switch (req) {
-        .share => |name| .{ .ok = h.share(h.ctx, name) },
+        .share => |s| .{ .ok = h.share(h.ctx, s.name, s.kick) },
         .user => |name| .{ .ok = h.user(h.ctx, name) },
         .settings => blk: {
             h.settings(h.ctx);
@@ -309,7 +322,14 @@ const testing = std.testing;
 const long: [200]u8 = @splat('x');
 
 test "requests parse, and everything else is refused" {
-    try testing.expectEqualStrings("docs", parse("share docs").?.share);
+    try testing.expectEqualStrings("docs", parse("share docs").?.share.name);
+    try testing.expectEqual(Kick.none, parse("share docs").?.share.kick);
+    try testing.expectEqual(Kick.writable, parse("share-kick writable Team files").?.share.kick);
+    try testing.expectEqualStrings("Team files", parse("share-kick guests Team files").?.share.name);
+    try testing.expect(parse("share-kick") == null);
+    try testing.expect(parse("share-kick writable") == null);
+    try testing.expect(parse("share-kick writable ") == null);
+    try testing.expect(parse("share-kick everyone docs") == null);
     try testing.expectEqualStrings("hal 9000", parse("user hal 9000\r").?.user);
     try testing.expect(parse("settings").? == .settings);
     try testing.expect(parse("settings now") == null);
@@ -341,6 +361,7 @@ const Count = struct {
     shares: usize = 0,
     users: usize = 0,
     reloads: usize = 0,
+    kick: Kick = .none,
     last: [32]u8 = undefined,
     last_len: usize = 0,
 
@@ -351,9 +372,10 @@ const Count = struct {
         c.last_len = @min(name.len, c.last.len);
         @memcpy(c.last[0..c.last_len], name[0..c.last_len]);
     }
-    fn share(ctx: ?*anyopaque, name: []const u8) usize {
+    fn share(ctx: ?*anyopaque, name: []const u8, kick: Kick) usize {
         const c = from(ctx);
         c.shares += 1;
+        c.kick = kick;
         c.note(name);
         return 2;
     }
@@ -381,13 +403,16 @@ test "requests run the hooks" {
     var hb: [reply_max]u8 = undefined;
     try testing.expectEqual(@as(usize, 2), handle(h, "share docs", &hb).ok);
     try testing.expectEqualStrings("docs", c.last[0..c.last_len]);
+    try testing.expectEqual(Kick.none, c.kick);
+    try testing.expectEqual(@as(usize, 2), handle(h, "share-kick guests docs", &hb).ok);
+    try testing.expectEqual(Kick.guests, c.kick);
     try testing.expectEqual(@as(usize, 1), handle(h, "user art", &hb).ok);
     try testing.expectEqual(@as(usize, 0), handle(h, "settings", &hb).ok);
     try testing.expectEqualStrings("unknown command", handle(h, "reboot", &hb).err);
     try testing.expectEqualStrings("up on 127.0.0.1:9", handle(h, "web start 127.0.0.1:9", &hb).text);
     try testing.expectEqualStrings("up on ?", handle(h, "web start", &hb).text);
     try testing.expectEqualStrings("stopped", handle(h, "web stop", &hb).text);
-    try testing.expectEqual(@as(usize, 1), c.shares);
+    try testing.expectEqual(@as(usize, 2), c.shares);
     try testing.expectEqual(@as(usize, 1), c.users);
     try testing.expectEqual(@as(usize, 1), c.reloads);
 }
@@ -467,11 +492,12 @@ test "fuzz: control requests and replies" {
     try @import("../shared/fuzz.zig").run({}, struct {
         fn one(_: void, in: []const u8) !void {
             if (parse(in)) |req| switch (req) {
-                .share, .user => |name| try testing.expect(name.len > 0 and name.len <= 128),
+                .share => |s| try testing.expect(s.name.len > 0 and s.name.len <= 128),
+                .user => |name| try testing.expect(name.len > 0 and name.len <= 128),
                 .settings, .web_stop => {},
                 .web_start => |a| if (a) |x| try testing.expect(x.len > 0 and x.len <= 64),
             };
             _ = parseReply(in);
         }
-    }.one, &.{ "share docs", "user hal\r", "settings", "ok 12\n", "err nope" });
+    }.one, &.{ "share docs", "share-kick writable Team files", "user hal\r", "settings", "ok 12\n", "err nope" });
 }

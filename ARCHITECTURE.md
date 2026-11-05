@@ -964,7 +964,12 @@ client reconnects under the new rules. Stale means: the share is now
 read-only and the tree was writable, or its path changed, or it was deleted
 (every connection using it), or guests are now off (only connections whose
 session on that share is anonymous). Relaxing changes drop no one and apply
-to new connections. The response of `PUT` and `DELETE /api/shares` reports
+to new connections, unless the change asks for a kick (`share readwrite
+--kick`, `share guest --kick`, or `kick` in the `PUT` body): `staleOnShare`
+then also picks, for `writable`, the connections with a tree opened read-only
+on a share now writable, or, for `guests`, those with an anonymous session
+on a share now open to guests (a refused guest has no tree to find it by).
+The kick is not stored. The response of `PUT` and `DELETE /api/shares` reports
 `disconnected`, and the Shares panel asks first, counting connections from
 `/api/activity`. `reconcileUser` drops a user's connections when they lost
 their SMB password or were deleted.
@@ -993,6 +998,7 @@ access that tightened (the rule of the previous section).
 
   ```
   share NAME      -> ok N | err TEXT
+  share-kick writable|guests NAME -> ok N | err TEXT
   user NAME       -> ok N | err TEXT
   settings        -> ok 0 | err TEXT
   web start [[ADDR:]PORT] -> msg TEXT | err TEXT
@@ -1003,7 +1009,7 @@ access that tightened (the rule of the previous section).
   and nothing else: `Server.reconcileShare` and `reconcileUser` compare the
   new store contents with what live connections hold (`Server.watch`
   rows keep each tree's share, configured path, and read-only flag), so a
-  request can't make the server do more than re-check. `user` drops a
+  request can't make the server do more than re-check, except that `share-kick` also drops the connections still on the stricter rules. `user` drops a
   user's connections only if they lost their SMB password or were deleted.
   `web` starts or stops the console (`Admin.start`/`stop`; a new listener
   thread per start, `generation` ending old keep-alive connections); an

@@ -101,7 +101,7 @@
 
   <section id="shares-view" hidden>
     <h2>Shares</h2>
-    <p class="note">Making a share read-only, or removing guests, disconnects the connections using it so they reconnect under the new rules. Other changes apply to new connections.</p>
+    <p class="note">Making a share read-only, or removing guests, disconnects the connections using it so they reconnect under the new rules. Making it writable, or allowing guests, applies to new connections; you can also disconnect the clients still on the old rules.</p>
     <div id="shares-list"></div>
     <div class="msg" id="shares-msg" aria-live="polite"></div>
   </section>
@@ -201,13 +201,25 @@ function toggle(text, checked, onchange) {
 }
 
 // How many connections use share `name` now (with `guestsOnly`, through an
-// anonymous session), from the activity view; 0 when it can't be read.
-async function connectionsUsing(name, guestsOnly) {
+// anonymous session; with `readOnlyOnly`, through a read-only tree), from the
+// activity view; 0 when it can't be read.
+async function connectionsUsing(name, guestsOnly, readOnlyOnly) {
   try {
     const view = await api("GET", "/api/activity");
     const want = name.toLowerCase();
     return (view.connections || []).filter((c) => (c.sessions || []).some((s) =>
-      (!guestsOnly || s.anonymous) && (s.trees || []).some((t) => t.share.toLowerCase() === want))).length;
+      (!guestsOnly || s.anonymous) && (s.trees || []).some((t) =>
+        t.share.toLowerCase() === want && (!readOnlyOnly || t.read_only)))).length;
+  } catch (e) {
+    return 0;
+  }
+}
+
+// Anonymous connections now: a refused guest has no tree, so any will do.
+async function anonymousConnections() {
+  try {
+    const view = await api("GET", "/api/activity");
+    return (view.connections || []).filter((c) => (c.sessions || []).some((s) => s.anonymous)).length;
   } catch (e) {
     return 0;
   }
@@ -215,21 +227,31 @@ async function connectionsUsing(name, guestsOnly) {
 
 // Saves `share` with one flag changed, then redraws from the server's list.
 // Tightening (read-only on, guests off) disconnects its users, so ask first.
+// Relaxing (read-only off, guests on) disconnects no one, but clients that
+// still see the old rules can be dropped to pick up the change: ask for that.
 async function saveShare(share, field, box) {
   const guests = field === "guest_ok";
+  let kick = "";
   if (guests ? !box.checked : box.checked) {
-    const n = await connectionsUsing(share.name, guests);
+    const n = await connectionsUsing(share.name, guests, false);
     const who = n === 1 ? "1 connection" : n + " connections";
     if (n > 0 && !confirm(who + (guests ? " using guest access to " : " using ") + '"' + share.name +
         '" will be disconnected, so each reconnects under the new rules. Continue?')) {
       box.checked = !box.checked;
       return;
     }
+  } else {
+    const n = guests ? await anonymousConnections() : await connectionsUsing(share.name, false, true);
+    if (n > 0 && confirm((n === 1 ? "1 connection" : n + " connections") +
+        (guests ? " with an anonymous session may have been refused \"" : " still see \"") + share.name +
+        (guests ? '". Disconnect them so they retry?' : '" as read-only. Disconnect them so they pick up the change?'))) {
+      kick = guests ? "guests" : "writable";
+    }
   }
   const boxes = box.closest(".toggles").querySelectorAll("input");
   boxes.forEach((b) => (b.disabled = true));
   try {
-    const r = await api("PUT", "/api/shares", { ...share, [field]: box.checked });
+    const r = await api("PUT", "/api/shares", { ...share, [field]: box.checked, kick });
     const notes = (r.warnings || []).map((w) => share.name + ": " + w);
     if (r.disconnected) notes.push(share.name + ": " + r.disconnected + " connection" + (r.disconnected === 1 ? "" : "s") + " disconnected.");
     await loadShares();

@@ -121,8 +121,8 @@ zsmbd [--db PATH|none] [--config FILE] [--users FILE|-] CMD
   share add SHARE PATH
   share comment SHARE TEXT
   share readonly SHARE
-  share readwrite SHARE
-  share guest SHARE        allow guests (no sign-in)
+  share readwrite [--kick] SHARE
+  share guest [--kick] SHARE   allow guests (no sign-in)
   share noguest SHARE
   share del SHARE
   get [KEY]                show settings
@@ -166,6 +166,10 @@ Any web login may go, even the last: the console then stops and ends that user's
 | `signing_required` | `yes` | require signed SMB messages |
 | `encrypt` | `no` | require encryption for every session |
 
+Anonymous clients can't sign, so a guest share admits them only when
+`signing_required` is `no`; otherwise they reach nothing but `IPC$`, and
+zsmbd warns about each guest share.
+
 ```bash
 zsmbd set encrypt yes
 ```
@@ -178,7 +182,8 @@ shares with the CLI and files instead.
 The console's Shares panel has Read-only and Allow guests switches for each
 share. Making a share read-only, or removing guests, disconnects the
 connections using it (a confirmation says how many) so they reconnect under
-the new rules; relaxing changes apply to new connections.
+the new rules; relaxing changes apply to new connections. After a relaxing
+change the console offers to disconnect the clients still on the old rules.
 
 ### Control socket
 
@@ -192,6 +197,15 @@ the affected connections at once:
 $ zsmbd --db zsmbd.db share readonly docs
 zsmbd: docs: 1 connection dropped; each
 reconnects under the new rules
+```
+
+Relaxing a share drops no one: a client that connected while a share was
+read-only stays read-only, and one refused as a guest stays refused, until it
+reconnects. To make them reconnect now, add `--kick` (once; it isn't stored):
+
+```bash
+zsmbd share readwrite --kick docs   # drops trees opened read-only
+zsmbd share guest --kick docs       # drops connections with an anonymous session
 ```
 
 With no server running the CLI says nothing. `--socket PATH` moves the

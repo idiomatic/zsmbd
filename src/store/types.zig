@@ -5,6 +5,16 @@ const Allocator = std.mem.Allocator;
 
 pub const Error = error{ Sqlite, Store, OutOfMemory };
 
+/// Which clients a relaxing share change also drops, once: those that
+/// connected under the stricter rules and still act on them. Never stored.
+pub const Kick = enum {
+    none,
+    /// Trees opened read-only on a share now writable.
+    writable,
+    /// Connections with an anonymous session, on a share now open to guests.
+    guests,
+};
+
 pub const Share = struct {
     name: []const u8,
     path: []const u8,

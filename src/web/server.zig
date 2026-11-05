@@ -37,8 +37,9 @@ pub const Live = struct {
     /// Settings changed in the database; reload them.
     reload: *const fn (ctx: ?*anyopaque) void = noReload,
     /// A share changed in the store (or was deleted): drop the connections
-    /// whose access that tightens. Returns how many were dropped.
-    shareChanged: *const fn (ctx: ?*anyopaque, share: []const u8) usize = noChange,
+    /// whose access that tightens, and with `kick`, those that a relaxing
+    /// change leaves acting on the old rules. Returns how many were dropped.
+    shareChanged: *const fn (ctx: ?*anyopaque, share: []const u8, kick: db_mod.Kick) usize = noShareChange,
     /// A user changed in the store (or was deleted): drop their connections
     /// if they lost SMB access. Returns how many were dropped.
     userChanged: *const fn (ctx: ?*anyopaque, name: []const u8) usize = noChange,
@@ -53,6 +54,9 @@ pub const Live = struct {
     }
     fn noReload(_: ?*anyopaque) void {}
     fn noChange(_: ?*anyopaque, _: []const u8) usize {
+        return 0;
+    }
+    fn noShareChange(_: ?*anyopaque, _: []const u8, _: db_mod.Kick) usize {
         return 0;
     }
 };
@@ -409,17 +413,22 @@ pub const Admin = struct {
     }
 
     fn putShare(a: *Admin, req: *http.Server.Request, arena: Allocator, body: []const u8) !void {
-        const In = struct { name: []const u8, path: []const u8, comment: []const u8 = "", read_only: bool = false, guest_ok: bool = false };
+        // `kick` ("writable" or "guests") also drops the clients a relaxing
+        // change leaves on the old rules; it is not stored.
+        const In = struct { name: []const u8, path: []const u8, comment: []const u8 = "", read_only: bool = false, guest_ok: bool = false, kick: []const u8 = "" };
         const in = std.json.parseFromSliceLeaky(In, arena, body, .{ .ignore_unknown_fields = true }) catch
             return respondError(req, .bad_request, "expected {\"name\",\"path\",...}");
         auth.validateShareName(in.name) catch |e| return respondError(req, .bad_request, auth.describe(e));
         auth.validateSharePath(arena, in.path) catch |e| return respondError(req, .bad_request, auth.describe(e));
         auth.validateComment(in.comment) catch |e| return respondError(req, .bad_request, auth.describe(e));
+        const relax = std.meta.stringToEnum(db_mod.Kick, in.kick) orelse
+            return respondError(req, .bad_request, "kick must be \"writable\" or \"guests\"");
         const ephemeral = a.db.isEphemeralShare(in.name);
         try a.db.putShare(.{ .name = in.name, .path = in.path, .comment = in.comment, .read_only = in.read_only, .guest_ok = in.guest_ok });
         // Tightening revokes access clients already have, so they reconnect
-        // under the new rules; relaxing changes apply to new connections.
-        const disconnected = a.live.shareChanged(a.live.ctx, in.name);
+        // under the new rules; relaxing changes apply to new connections,
+        // unless `kick` asks for the old ones to be dropped too.
+        const disconnected = a.live.shareChanged(a.live.ctx, in.name, relax);
         return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral), .disconnected = disconnected });
     }
 
@@ -427,7 +436,7 @@ pub const Admin = struct {
         const name = try queryParam(arena, query, "name") orelse return respondError(req, .bad_request, "missing name");
         const ephemeral = a.db.isEphemeralShare(name);
         if (!try a.db.deleteShare(name)) return respondError(req, .not_found, "no such share");
-        const disconnected = a.live.shareChanged(a.live.ctx, name);
+        const disconnected = a.live.shareChanged(a.live.ctx, name, .none);
         return respondJson(req, arena, .{ .ok = true, .warnings = ephemeralWarning(ephemeral), .disconnected = disconnected });
     }
 
