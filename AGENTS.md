@@ -16,7 +16,7 @@
 * `zig build check -Dtarget=x86_64-linux-gnu` (and `aarch64-linux-gnu`) type-checks main and the tests for Linux.
 * Components (`src/` folders) depend one way: main → cli → web, control, smb → policy → store → shared; `web/`, `control/`, and `policy/` never import `smb/`.
 * Untrusted input and secrets are mapped in [SECURITY.md](SECURITY.md); every new parser of untrusted input gets a fuzz target (`src/shared/fuzz.zig`) and a row there.
-* CI: `.github/workflows/ci.yml` (Fedora, Alpine, macOS; type checks; fuzzing).
+* CI: `.github/workflows/ci.yml` (Fedora, Alpine, macOS; type checks; fuzzing; Linux interoperability tests, [test/interop/](test/interop/README.md)).
 * Specifications used are copied to `docs/specifications/` and indexed in its [README.md](docs/specifications/README.md); add new ones there.
 * Only external library: system libsqlite3, through hand-written `extern` declarations.
 
@@ -45,4 +45,4 @@
 * Any web login may be deleted or lose its password, the last included; the console then stops (after replying) and ends the user's sessions, whether the change came from the console or the control socket. `web start` brings it back, making `admin` first if no web login exists (its password is in the reply).
 
 ## Status
-* See [ARCHITECTURE.md](ARCHITECTURE.md) section 13. Next: interoperability tests with real clients, then the browser UI.
+* See [ARCHITECTURE.md](ARCHITECTURE.md) section 13. Next: interoperability tests with Windows and macOS clients, then the browser UI.

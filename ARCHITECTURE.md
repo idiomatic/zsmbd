@@ -1150,10 +1150,12 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
   development machine.
 - CI (`.github/workflows/ci.yml`) builds and tests on Fedora and Alpine
   (x86_64 and aarch64) and macOS, runs the type checks, and fuzzes for 500K
-  runs per push and 20M weekly, keeping crashing inputs as artifacts.
-- Interoperability testing, once the handler exists, uses the real clients:
-  Windows 11 Explorer and `net use`; macOS Finder and `mount_smbfs`; Linux
-  `mount -t cifs` (with `vers=3.1.1`) and `smbclient`.
+  runs per push and 20M weekly, keeping crashing inputs as artifacts. The
+  Linux jobs also run `test/interop/run.sh` in a privileged container.
+- Interoperability testing uses the real clients. Linux (`smbclient` and the
+  kernel's `mount -t cifs` with `vers=3.1.1`) is automated in
+  [test/interop](test/interop/README.md); Windows 11 Explorer and `net use`
+  and macOS Finder and `mount_smbfs` are tried by hand.
 
 ---
 
@@ -1166,16 +1168,18 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 | Admin JSON API | Written; exercised with curl. |
 | `nthash_wasm` | Written; unit-tested natively, and checked in a browser against server-side hashing. |
 | `smb/server.zig` | Written; exercised through the `files.zig` tests. `serve` runs its accept loop, checked with a raw NEGOTIATE over TCP. |
-| `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch), signature verification, and decryption, unit-tested and fuzzed; not yet tried with real clients. |
+| `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch), signature verification, and decryption, unit-tested and fuzzed; tried with Linux clients (test/interop). |
 | `smb/handshake.zig` | NEGOTIATE, the SMB1 upgrade, SESSION_SETUP, and TREE_CONNECT, unit-tested (SESSION_SETUP against an in-test NTLMv2 client) and fuzzed; not yet tried with real clients. |
 | `smb/files.zig` | Written and unit-tested; macOS 15 `mount_smbfs` mounts a read-only share, lists it, and reads files byte-identical. |
 | macOS 15 interop | Keys and signatures verified independently from a capture. `smbutil view` lists shares through `srvsvc` on port 445; on any other port it fails ("Broken pipe", RPC error `0x16c9a042`) because macOS's RPC layer dials 445 for the pipe. Windows and Linux clients are untested. |
 | `web.Live` over `server.Server` | Written: activity, kick, and settings reload, with unit tests and a live run (a raw TCP client listed, kicked, and gone; a settings save reloaded), and a macOS `mount_smbfs` session and tree appeared and vanished on unmount. |
 | `web/index.html` | Sign-in and SMB password form; the rest is still to come. |
-| CI | Green on Fedora and Alpine (x86_64 and aarch64) and macOS: build, unit tests, Linux type checks, and a coverage-guided fuzz run. No real Linux or Windows client is involved. |
+| Linux interop | `test/interop/run.sh` passes on Fedora and Alpine (aarch64, checked locally): `smbclient` and the kernel CIFS client, with signing, encryption, guests, and the control socket. It found, and now guards, two kernel-client bugs. |
+| CI | Build, unit tests, Linux type checks, a coverage-guided fuzz run, and the Linux interop tests, on Fedora and Alpine (x86_64 and aarch64) and macOS. The interop tests have not yet run on the GitHub runners. Windows clients are untested. |
 
 Planned order of work:
 
-1. Run interoperability tests against Windows and Linux clients.
+1. Run interoperability tests against Windows and macOS clients (Linux is
+   automated).
 2. Finish the browser UI (activity table, kick, shares, users,
    settings); share changes for connected clients.
