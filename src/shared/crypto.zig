@@ -303,6 +303,55 @@ test "ccm roundtrip" {
     try std.testing.expectEqualStrings(msg, &p);
 }
 
+// ---------------------------------------------------------------- AES-128-GCM
+
+pub const gcm_nonce_len = 12;
+
+/// AES-128-GCM with a 16-byte tag (SMB3 encryption, cipher 0x0002).
+pub fn gcmEncrypt(c: []u8, tag: *[16]u8, m: []const u8, ad: []const u8, nonce: *const [gcm_nonce_len]u8, key: [16]u8) void {
+    std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(c, tag, m, ad, nonce.*, key);
+}
+
+pub fn gcmDecrypt(m: []u8, c: []const u8, tag: [16]u8, ad: []const u8, nonce: *const [gcm_nonce_len]u8, key: [16]u8) error{AuthenticationFailed}!void {
+    try std.crypto.aead.aes_gcm.Aes128Gcm.decrypt(m, c, tag, ad, nonce.*, key);
+}
+
+// ---------------------------------------------------------------- Preauth hash
+
+/// Extend a preauthentication integrity hash with one message:
+/// SHA-512(hash || msg) (MS-SMB2 3.3.5.4, 3.3.5.5).
+pub fn preauthExtend(hash: *[64]u8, msg: []const u8) void {
+    var h = std.crypto.hash.sha2.Sha512.init(.{});
+    h.update(hash);
+    h.update(msg);
+    h.final(hash);
+}
+
+test "gcm roundtrip, and a flipped tag fails" {
+    const key: [16]u8 = @splat(9);
+    const nonce: [12]u8 = @splat(5);
+    const msg = "the quick brown fox jumps over the lazy dog";
+    var c: [msg.len]u8 = undefined;
+    var tag: [16]u8 = undefined;
+    gcmEncrypt(&c, &tag, msg, "header-data-aad", &nonce, key);
+    var p: [msg.len]u8 = undefined;
+    try gcmDecrypt(&p, &c, tag, "header-data-aad", &nonce, key);
+    try std.testing.expectEqualStrings(msg, &p);
+    tag[0] ^= 1;
+    try std.testing.expectError(error.AuthenticationFailed, gcmDecrypt(&p, &c, tag, "header-data-aad", &nonce, key));
+}
+
+test "preauthExtend chains SHA-512" {
+    var h: [64]u8 = @splat(0);
+    preauthExtend(&h, "abc");
+    var want: [64]u8 = undefined;
+    var s = std.crypto.hash.sha2.Sha512.init(.{});
+    s.update(&@as([64]u8, @splat(0)));
+    s.update("abc");
+    s.final(&want);
+    try std.testing.expectEqualSlices(u8, &want, &h);
+}
+
 pub fn hex(comptime s: []const u8) [s.len / 2]u8 {
     var out: [s.len / 2]u8 = undefined;
     _ = std.fmt.hexToBytes(&out, s) catch unreachable;

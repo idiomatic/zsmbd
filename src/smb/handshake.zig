@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Sha512 = std.crypto.hash.sha2.Sha512;
+const Sha512 = std.crypto.hash.sha2.Sha512; // the test below recomputes the chain independently
 
 const proto = @import("proto.zig");
 const Status = proto.Status;
@@ -209,10 +209,7 @@ pub fn negotiate(c: *Conn, msg: []const u8, out: *Buf) !Outcome {
         .client_caps = wire.get32(b, 8),
         .client_security_mode = wire.get16(b, 4),
     };
-    var h = Sha512.init(.{});
-    h.update(&c.neg.preauth);
-    h.update(msg);
-    h.final(&c.neg.preauth);
+    crypto.preauthExtend(&c.neg.preauth, msg);
     return .{ .status = Status.success };
 }
 
@@ -225,10 +222,7 @@ pub fn hashResponse(c: *Conn, response: []const u8) void {
 /// Extend a preauthentication hash with one message (MS-SMB2 3.3.5.4,
 /// 3.3.5.5).
 pub fn hashInto(hash: *[64]u8, msg: []const u8) void {
-    var h = Sha512.init(.{});
-    h.update(hash);
-    h.update(msg);
-    h.final(hash);
+    crypto.preauthExtend(hash, msg);
 }
 
 pub const SetupOutcome = struct {

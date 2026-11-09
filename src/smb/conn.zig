@@ -5,8 +5,6 @@ const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
 const Allocator = std.mem.Allocator;
-const Sha512 = std.crypto.hash.sha2.Sha512;
-const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 
 const proto = @import("proto.zig");
 const Status = proto.Status;
@@ -289,7 +287,7 @@ pub fn seal(io: Io, cipher: u16, key: [16]u8, session_id: u64, msg: []const u8, 
     wire.put64(th, 44, session_id);
     var tag: [16]u8 = undefined;
     if (gcm)
-        Aes128Gcm.encrypt(sealed, &tag, msg, th[20..52], th[20..32].*, key)
+        crypto.gcmEncrypt(sealed, &tag, msg, th[20..52], th[20..][0..crypto.gcm_nonce_len], key)
     else
         crypto.ccmEncrypt(sealed, &tag, msg, th[20..52], th[20..][0..crypto.ccm_nonce_len], key);
     @memcpy(th[4..20], &tag);
@@ -301,7 +299,7 @@ pub fn unseal(cipher: u16, key: [16]u8, frame: []const u8, plain: []u8) error{Au
     const th = frame[0..transform_size];
     const tag = th[4..20].*;
     if (cipher == proto.Cipher.aes128_gcm)
-        try Aes128Gcm.decrypt(plain, frame[transform_size..], tag, th[20..52], th[20..32].*, key)
+        try crypto.gcmDecrypt(plain, frame[transform_size..], tag, th[20..52], th[20..][0..crypto.gcm_nonce_len], key)
     else
         try crypto.ccmDecrypt(plain, frame[transform_size..], tag, th[20..52], th[20..][0..crypto.ccm_nonce_len], key);
 }

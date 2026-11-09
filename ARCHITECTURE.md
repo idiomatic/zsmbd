@@ -92,8 +92,8 @@ src/
                      shared/ and policy/)
   shared/
     wire.zig         LE codec, output buffer, UTF-16
-    crypto.zig       MD4, NT hash, RC4, AES-CCM, KDF,
-                     signatures
+    crypto.zig       MD4, NT hash, RC4, AES-CCM, AES-GCM,
+                     KDF, signatures, preauth hash
   store/
     store.zig        Db: a backend per part, one mutex
     types.zig        User, UserAuth, Share, Change, errors
@@ -706,7 +706,8 @@ mode, 128-bit output):
 
 Signing uses AES-CMAC (`crypto.cmacSig`). Encryption uses AES-CCM (`crypto.ccmEncrypt`,
 with SMB's 11-byte nonce, implemented in Zig because `std` only offers other
-nonce sizes) or `std`'s AES-128-GCM. Each encrypted message uses a fresh
+nonce sizes) or AES-128-GCM (`crypto.gcmEncrypt`, a wrapper over `std`). The
+preauth hash chain is `crypto.preauthExtend`. Each encrypted message uses a fresh
 random nonce; the AEAD's associated data is the transform header from the
 nonce onward.
 
