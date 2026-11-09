@@ -479,8 +479,51 @@ fn serve(c: *Cli) !void {
     if (addr) |a| try admin.start(a) else std.log.info("zsmbd: no web console (give --web PORT to start it)", .{});
     try srv.start(&listener);
     defer srv.stop();
+    const watcher = try Shutdown.watch(&srv);
     try srv.wait();
+    // A signal stopped the SMB server: its clients are gone and their
+    // opens closed. The web console's connection threads are detached, so
+    // the process ends them rather than unwinding (which would close the
+    // store under them).
+    watcher.join();
+    _ = admin.stop();
+    if (control_socket) |l| l.stop();
+    std.log.info("zsmbd: stopped", .{});
+    std.process.exit(0);
 }
+
+/// SIGTERM and SIGINT stop `serve` cleanly. The handler only writes the
+/// signal's number to a pipe (all a handler may safely do); a thread
+/// reading it stops the server. The handler is reset after one signal, so a
+/// second one ends the process at once.
+const Shutdown = struct {
+    var pipe: [2]std.c.fd_t = .{ -1, -1 };
+
+    fn watch(srv: *smbd.Server) !std.Thread {
+        if (std.c.pipe(&pipe) != 0) return error.SystemResources;
+        const t = try std.Thread.spawn(.{}, wait, .{srv});
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .handler = handler },
+            .mask = std.posix.sigemptyset(),
+            .flags = std.posix.SA.RESETHAND | std.posix.SA.RESTART,
+        };
+        std.posix.sigaction(.TERM, &act, null);
+        std.posix.sigaction(.INT, &act, null);
+        return t;
+    }
+
+    fn handler(sig: std.posix.SIG) callconv(.c) void {
+        const b = [1]u8{@intCast(@intFromEnum(sig))};
+        _ = std.c.write(pipe[1], &b, 1);
+    }
+
+    fn wait(srv: *smbd.Server) void {
+        var b: [1]u8 = undefined;
+        while (std.c.read(pipe[0], &b, 1) != 1) {}
+        std.log.info("zsmbd: {s}: stopping (again to quit at once)", .{if (b[0] == @intFromEnum(std.posix.SIG.INT)) "SIGINT" else "SIGTERM"});
+        srv.stop();
+    }
+};
 
 fn smbConfig(s: auth.ServerSettings) smbd.Config {
     return .{ .server_name = s.server_name, .workgroup = s.workgroup, .signing_required = s.signing_required, .encrypt = s.encrypt };

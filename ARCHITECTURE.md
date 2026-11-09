@@ -72,6 +72,18 @@ only through the host adapter in `cli.zig` (section 6, "Embedding"); the
 in-memory server state (`server.Server`); and the `std.Io` instance from
 `std.process.Init`, which is thread-safe.
 
+SIGTERM and SIGINT stop `serve` cleanly (`cli.Shutdown`). A signal handler
+may do almost nothing safely, so it only writes the signal's number to a
+pipe; a thread blocked reading the pipe logs it and calls `Server.stop`,
+which drops every SMB client and closes their opens (so delete-on-close
+files are removed). The main thread's `wait` then returns, and `serve` stops
+the web console and the control socket (removing its file) and exits with
+status 0. It exits rather than unwinding because the web console's
+connection threads are detached: returning would close the store under a
+request in flight. The handler is installed with `SA_RESETHAND`, so a
+second signal takes the default action and ends the process at once, in
+case a stop hangs.
+
 The CLI commands other than `serve` open the same store, make their change,
 and exit. Because SQLite runs in WAL mode, and text files are replaced
 atomically, they can run while a server is up.

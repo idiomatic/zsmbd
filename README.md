@@ -188,6 +188,13 @@ connections using it (a confirmation says how many) so they reconnect under
 the new rules; relaxing changes apply to new connections. After a relaxing
 change the console offers to disconnect the clients still on the old rules.
 
+### Stopping
+
+SIGTERM or SIGINT (Ctrl-C) stops `serve` cleanly: it drops the SMB clients
+(closing their files, so files marked for deletion are removed), stops the
+web console, removes the control socket, and exits with status 0. A second
+signal ends it at once.
+
 ### Control socket
 
 When `serve` has a persistent store it also listens on a Unix socket beside
