@@ -60,12 +60,46 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // libsmbd for C: `zig build lib` installs lib/libsmbd.a, the shared
+    // library, and include/smbd.h.
+    const c_mod = b.createModule(.{
+        .root_source_file = b.path("src/smbd_c.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .pic = true,
+    });
+    c_mod.addOptions("build_options", options);
+    const lib_static = b.addLibrary(.{ .name = "smbd", .linkage = .static, .root_module = c_mod });
+    lib_static.bundle_compiler_rt = true;
+    lib_static.installHeader(b.path("include/smbd.h"), "smbd.h");
+    const lib_shared = b.addLibrary(.{
+        .name = "smbd",
+        .linkage = .dynamic,
+        .root_module = c_mod,
+        .version = std.SemanticVersion.parse(@import("build.zig.zon").version) catch unreachable,
+    });
+    const lib_step = b.step("lib", "Build libsmbd for C (lib/ and include/)");
+    lib_step.dependOn(&b.addInstallArtifact(lib_static, .{}).step);
+    lib_step.dependOn(&b.addInstallArtifact(lib_shared, .{}).step);
+
+    // The C interface, end to end, from C.
+    const c_test = b.addExecutable(.{ .name = "smbd-c-test", .root_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }) });
+    c_test.root_module.addCSourceFile(.{ .file = b.path("test/c/smoke.c"), .flags = &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-Wall", "-Wextra", "-Werror" } });
+    c_test.root_module.addIncludePath(b.path("include"));
+    c_test.root_module.linkLibrary(lib_static);
+
     const tests = b.addTest(.{ .root_module = mod });
     tests.linker_allow_shlib_undefined = true;
     const smbd_tests = b.addTest(.{ .root_module = smbd });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
     test_step.dependOn(&b.addRunArtifact(smbd_tests).step);
+    test_step.dependOn(&b.addRunArtifact(c_test).step);
 
     // Compile-only check for other targets (no linking, so no sqlite needed):
     //   zig build check -Dtarget=x86_64-linux-gnu
@@ -83,4 +117,5 @@ pub fn build(b: *std.Build) void {
     const check_tests = b.addTest(.{ .root_module = check_mod });
     check_step.dependOn(&check_tests.step);
     check_step.dependOn(&b.addTest(.{ .root_module = smbd }).step);
+    check_step.dependOn(&lib_static.step);
 }

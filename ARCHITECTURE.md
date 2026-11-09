@@ -62,12 +62,15 @@ only when `--web` is given (it has no default port). Each flag takes
 `ADDR:PORT` or just `PORT` (or `:PORT`), and a missing address keeps that
 listener's default, so `--smb 4450` still listens on every interface and
 `--web 8099` only on localhost. `serve` binds the SMB port first and fails
-if it cannot, then runs `Server.acceptLoop` on its own thread (without
-`--web` there is no web listener and no first-run `admin`, and
-`acceptLoop` runs on the main thread). Each accepted
-connection, SMB or HTTP, gets its own detached OS thread. The threads share three things: the store
-(`store.Db`: SQLite or plain-text files), the in-memory server state (`server.Server`), and the
-`std.Io` instance from `std.process.Init`, which is thread-safe.
+if it cannot, then hands the listener to the SMB server
+(`Server.start`), which accepts clients in an `std.Io` task and serves each
+in a task of its own, while the main thread waits (`Server.wait`). Without
+`--web` there is no web listener and no first-run `admin`. Each HTTP
+connection gets its own detached OS thread. The threads share three things:
+the store (`store.Db`: SQLite or plain-text files), reached by the SMB side
+only through the host adapter in `cli.zig` (section 6, "Embedding"); the
+in-memory server state (`server.Server`); and the `std.Io` instance from
+`std.process.Init`, which is thread-safe.
 
 The CLI commands other than `serve` open the same store, make their change,
 and exit. Because SQLite runs in WAL mode, and text files are replaced
@@ -82,11 +85,19 @@ which triggers a reload.
 ## 3. Source layout
 
 ```
-build.zig            build, test, type-check steps
+build.zig            build, test, type-check, lib steps
+include/smbd.h       libsmbd's C header
+test/c/smoke.c       the C interface, end to end
 examples/            example --config and --users files
 src/
   main.zig           global flags, store, run a command
-  cli.zig            serve, user, share, get, set, hash
+  cli.zig            serve, user, share, get, set, hash;
+                     libsmbd's host over the store
+  smbd.zig           libsmbd's root: the public API of
+                     smb/ (top level, so its module can
+                     reach shared/)
+  smbd_c.zig         libsmbd's C interface (root of
+                     libsmbd.a and the shared library)
   nthash_wasm.zig    NT hash and strength for WebAssembly
                      (top level, so its module can reach
                      shared/ and policy/)
@@ -108,7 +119,10 @@ src/
     ephemeral.zig    parses serve's ephemeral flags
     strength.zig     password strength (informs only)
   smb/
-    server.zig       process-wide state: connections,
+    README.md        libsmbd guide: embedding the server
+    host.zig         Host: what the embedder supplies
+                     (shares, NT hashes, log)
+    server.zig       Server: lifecycle, connections,
                      nodes, events
     conn.zig         one connection: framing, chains,
                      credits, dispatch
@@ -135,13 +149,10 @@ src/
 Each folder is a component, and dependencies point one way:
 
 ```
-main ──► cli ──┬──► web ────┐
-               │            ▼
+main ──► cli ──┬──► web ──► policy ──► store ──► shared
                ├──► control (std only)
-               │
-               └──► smb ──► policy ──► store ──► shared
-                     │                   ▲
-                     └───────────────────┴──────► shared
+               ├──► policy
+               └──► smbd (smb/) ──► shared
 ```
 
 - `shared/` depends on nothing else in the project, and `store/` only on
@@ -154,10 +165,14 @@ main ──► cli ──┬──► web ────┐
 - `control/` imports only `std` and `shared/fuzz.zig` (for its fuzz
   target) and reaches the SMB side only through its `Hooks` (section 8,
   "Control socket").
-- `smb/` is the only component that knows about connections and threads.
-  `smb/server.zig` and `smb/conn.zig` refer to each other, but the cycle
-  stays inside the component. `files.zig` gets the share list from the store
-  through `smb/server.zig`'s `*Db`.
+- `smb/` is libsmbd (root `src/smbd.zig`, the `smbd` module of
+  `build.zig`): it imports only `shared/` and knows nothing of the store,
+  policy, the web console, or the control socket. It is the only component
+  that knows about SMB connections. `smb/server.zig` and `smb/conn.zig`
+  refer to each other, but the cycle stays inside the component. Shares and
+  NT hashes come from the host (`Host`, section 6), which in zsmbd is the
+  store adapter in `cli.zig`; `zig build test` builds libsmbd's tests as a
+  binary of their own, without SQLite, so a stray import would fail to link.
 - Within `store/`, the backends import `types.zig`, never the `store.zig`
   facade that imports them.
 
@@ -394,7 +409,10 @@ checked, so the CLI and the web API apply identical rules.
   `signing_required` (default true), and `encrypt` (default false).
   `normalizeSetting` rejects unknown keys and canonicalizes booleans to
   `true`/`false`. Absent rows mean "use the default", so the database holds
-  only what an administrator changed.
+  only what an administrator changed. `serverSettings` reads all four with
+  their defaults applied, for `serve` to hand to the SMB server
+  (`Server.setConfig`); a boolean a hand-edited file got wrong is logged and
+  refused, so `serve` won't start, and a reload keeps the old settings.
 - **Names.** User names are 1–64 UTF-8 characters without `\ / : @ "` or
   control characters. Share names are 1–80 characters without Windows-illegal
   characters; `IPC$` is reserved.
@@ -425,18 +443,118 @@ checked, so the CLI and the web API apply identical rules.
 
 ## 6. Shared server state: `smb/server.zig`
 
-`server.Server` is the one object every SMB thread and the web server can
-reach. It compiles against the `Conn` core and is exercised by the
-`files.zig` tests.
+`server.Server` is the one object every SMB task and the host (in zsmbd,
+the web console and the control socket, through `cli.zig`) can reach. It
+compiles against the `Conn` core and is exercised by the `files.zig` tests.
 
 | Field | Purpose |
 |---|---|
-| `cfg: Config` | Snapshot of the four settings, refreshed by `loadConfig`. NEGOTIATE reads it under the lock; SESSION_SETUP and TREE_CONNECT use the signing rule the NEGOTIATE response promised (`Negotiated.signing_required`) so a reload never changes rules mid-handshake (`encrypt` is read live). |
+| `host: Host` | The embedder's answers: shares, NT hashes, and the log (below). |
+| `group`, `stopping`, `stopped` | The accept loop and connection tasks, and the state of `stop` (below). |
+| `cfg: Config` | Snapshot of the four settings, replaced by `setConfig`. NEGOTIATE reads it under the lock; SESSION_SETUP and TREE_CONNECT use the signing rule the NEGOTIATE response promised (`Negotiated.signing_required`) so a reload never changes rules mid-handshake (`encrypt` is read live). |
 | `guid`, `start_ms` | Server GUID and start time, reported in NEGOTIATE responses. |
 | `conns` | Registry of live connections, for the monitor, kicking, and change notification. |
 | `nodes` | Open-file table keyed by `(st_dev, st_ino)`; see below. |
 | `events` | Ring buffer of the last 512 activity events (connect, logon, tree connect, errors), each a fixed-size record so logging never allocates under the lock. |
 | `stats` | Atomic counters: connections, bytes in and out, data read and written, requests, logon failures. Updated without the lock. |
+
+### Embedding: the host and the lifecycle
+
+libsmbd is the SMB server alone, so that other programs can embed it the way
+zsmbd does; its guide, with an example, is
+[src/smb/README.md](src/smb/README.md). Everything it needs from outside
+comes through `Host` (`smb/host.zig`), a context pointer and three
+functions, called from any connection task:
+
+- `listShares` returns every share (name, absolute path, comment,
+  read-only, guests allowed). TREE_CONNECT looks the share up in it on every
+  connect, srvsvc lists it, and `reconcileShare` compares it with what live
+  connections hold. Asking each time keeps libsmbd stateless about
+  configuration: the host may keep shares anywhere and change them at will.
+- `ntHash` returns a user's NT hash, or null for a user without an SMB
+  password or no such user, which then fail alike.
+- `log` receives each event the server also keeps in its ring buffer, with
+  a level; zsmbd passes them to `std.log`. A library must not write to the
+  host's stderr on its own, which is why nothing in `smb/` calls `std.log`.
+
+zsmbd's host is a thin adapter in `cli.zig` over `store.Db` (`storeHost`):
+it moves the store's share strings into libsmbd's `Share` and maps store
+errors to `error.HostFailed`. Settings are not asked for but pushed:
+`Server.init` and `setConfig` take a `Config`, and zsmbd builds one from
+`auth.serverSettings` at start and on every reload. Policy that concerns
+zsmbd's administrators, such as the warning about guest shares under
+required signing, stays in `cli.zig`.
+
+The lifecycle is explicit, because a library can't assume it owns the
+process:
+
+- `Server.init` makes a server that serves nothing; it must not move after
+  `start` or `adopt`.
+- `start(listener)` runs the accept loop as a task in `group`; `adopt(stream)`
+  serves a client the host accepted itself (socket activation, a privileged
+  helper, or a test). Each connection runs `conn.serve` as a task in the same
+  group.
+- `stop` sets `stopping` (so `addConn` refuses new clients with
+  `error.Stopped`), shuts down every registered connection's socket, then
+  cancels the group: the accept loop's `accept` returns `error.Canceled`,
+  and each connection's blocked read fails and runs its normal teardown
+  (closing its opens, so delete-pending files are removed). `Group.cancel`
+  returns once every task has finished, so after `stop` nothing of the
+  server runs and `deinit` may free it. Shutting the sockets down as well as
+  canceling covers a client accepted just before `stopping` was set, whose
+  task may join the group after the cancel began.
+- `wait` blocks until `stop` has finished; zsmbd's main thread waits there.
+
+The task model needs an `Io` that supports concurrency (`std.Io.Threaded`
+does; its cancellation interrupts blocking calls with a signal), and the
+group's tasks get the `Io`'s stack size.
+
+### The C interface: `smbd_c.zig` and `include/smbd.h`
+
+Programs in C, or in any language with a C foreign-function interface, use
+libsmbd as `libsmbd.a` or the shared `libsmbd` (`zig build lib`, which also
+installs the header). `src/smbd_c.zig` is the static library's root: a thin
+layer of `export` functions over `smbd.Server`, with a hand-written header,
+`include/smbd.h`, that documents each function. The C test,
+`test/c/smoke.c`, is the header's executable specification.
+
+- **Objects.** `smbd_new` returns an opaque `smbd_server`, a heap `Handle`
+  that holds the `Server` (which must not move), a copy of the C host, and
+  up to four listeners made by `smbd_listen`. `smbd_free` stops the server
+  if needed, closes the listeners, and frees everything.
+- **The host.** `smbd_host` holds a context pointer and three callbacks,
+  wrapped in a `Host` vtable. Ownership never crosses the boundary: the
+  `list_shares` callback adds each share with `smbd_shares_add`, which
+  copies it into a collector, so the C side never frees anything libsmbd
+  made, and libsmbd never frees anything the C side made. `nt_hash` writes
+  into a 16-byte buffer and says whether the user exists; the copy is wiped
+  after use. A user name longer than 256 bytes, or holding a NUL, is no
+  user, so names always fit the C string libsmbd builds on the stack. Log
+  lines are copied into NUL-terminated stack buffers for the call.
+- **Settings.** `smbd_config` mirrors `Config`; `smbd_config_init` fills the
+  defaults, since C can't declare them.
+- **Errors** are negative integers (`SMBD_ENOMEM`, `SMBD_EINVAL`,
+  `SMBD_EADDRINUSE`, `SMBD_EACCES`, `SMBD_ESTOPPED`, `SMBD_EFAIL`), and
+  constructors return NULL. Arguments are checked for NULL; anything else a
+  C caller passes is trusted, as C requires.
+- **One `Io` per process.** Every server shares one `std.Io.Threaded`, made
+  by the first `smbd_new` and freed by the last `smbd_free` (a reference
+  count under a spin lock). `Threaded.init` installs do-nothing handlers
+  for SIGIO, which cancellation uses to interrupt blocked threads, and for
+  SIGPIPE, and `deinit` restores the old ones; with one shared instance the
+  restore order can't go wrong, and the header documents the handlers.
+  Sends use `MSG_NOSIGNAL`, so a client that hangs up can't kill the host.
+- **Memory** comes from `malloc` (`std.heap.c_allocator`), so the host's
+  allocator tools see it; `smbd_activity_json` returns a string to free
+  with `smbd_free_string`.
+- **Sockets the host accepted** go to `smbd_adopt_fd`, which fills in the
+  peer address with `getpeername` (a Unix socket shows as loopback).
+- **Stopping** is idempotent in C (`smbd_stop` swaps a flag before calling
+  `Server.stop`), and `smbd_listen` after it is `SMBD_ESTOPPED`.
+
+The interface is unstable before 1.0; `smbd_version` reports the release.
+The shared library carries the package version (`libsmbd.0.1.1.dylib` and
+its links).
 
 ### Open-file nodes
 
@@ -937,9 +1055,9 @@ a context pointer and five function pointers.
 The defaults report `"smb_running": false`, which lets the admin server run,
 and be tested, without the SMB side. `serve` (`cli.zig`, the one place that
 sees both sides) points `Live` at `Server.writeActivity`, `Server.kick`
-(which shuts the socket down so the connection's own thread tears it
-down), and `Server.loadConfig` (a bad value is logged and the old settings
-stay).
+(which shuts the socket down so the connection's own task tears it
+down), and a reload that reads `auth.serverSettings` into
+`Server.setConfig` (a bad value is logged and the old settings stay).
 
 The activity view is
 `{"smb_running","server":{name,port,start_ms,now_ms},"connections":[`
@@ -1016,6 +1134,10 @@ access that tightened (the rule of the previous section).
   thread per start, `generation` ending old keep-alive connections); an
   omitted address reuses `Admin.last_addr`. New verbs (a log level,
   shutdown) would be added to `parse` and `Hooks`.
+- **Lifetime.** The listener serves requests one at a time in an `std.Io`
+  task. `Listener.stop` cancels it (after the request in progress), removes
+  the socket file, closes the socket, and frees the listener, so nothing
+  can touch a freed listener.
 - **CLI.** After `share`, `user`, and `set` commands, the CLI sends the
   matching line and prints only when something was dropped (or a warning if
   the socket exists but refuses it). With no server it prints nothing.
@@ -1072,8 +1194,10 @@ Rules that keep this deadlock-free:
 3. Only a connection's own thread mutates its sessions, trees, and opens, so
    that thread can read them without locking.
 
-Connection lifetime is reference-counted. The connection thread owns the
-initial reference. On exit it marks the connection closed (which turns
+Each SMB connection runs as a task in the server's `Io.Group` (section 6,
+"Embedding"), which on `std.Io.Threaded` is a pooled OS thread; "thread"
+below means that task. Connection lifetime is reference-counted. The
+connection thread owns the initial reference. On exit it marks the connection closed (which turns
 `completeNotifies` into a no-op), closes its opens (releasing nodes and
 locks, and performing delete-pending unlinks), unregisters with `removeConn`,
 and drops its reference. The last `unref`, possibly on another thread that
@@ -1081,7 +1205,9 @@ was completing a notify, closes the socket and frees the memory.
 
 Kicking a client from the web UI calls `shutdown` on its socket. The
 connection thread's blocked read then fails and it runs the normal teardown,
-so cleanup is always done by the thread that owns the state.
+so cleanup is always done by the thread that owns the state. `Server.stop`
+does the same for every connection and then waits for their tasks, which
+is why it may not be called from one of them (or from a host callback).
 
 ---
 
@@ -1140,14 +1266,23 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
   TREE_DISCONNECT, and the fail-closed signature check), and the handshake
   (NEGOTIATE contexts, refusals, and the preauth hash; the SMB1 upgrade;
   TREE_CONNECT for shares, `IPC$`, read-only shares, and anonymous
-  sessions).
+  sessions), and the server's lifecycle (a TCP client accepted by `start`,
+  dropped by `stop`, and refused afterward). libsmbd's tests (everything
+  under `smb/` and `shared/`) run in a test binary of their own, built from
+  `src/smbd.zig` without SQLite and against an in-memory `TestHost`;
+  zsmbd's run in another. `test/c/smoke.c`, linked against `libsmbd.a`,
+  drives the C interface: a C host, an SMB 3.1.1 NEGOTIATE over TCP and over
+  an adopted socket pair, stats and activity, stop, and a second server
+  after the shared `Io` was freed.
+- `zig build lib` installs `libsmbd.a`, the shared library, and `smbd.h`
+  under `zig-out/`.
 - Fuzz targets (`src/shared/fuzz.zig`) cover every parser of untrusted
   input listed in [SECURITY.md](SECURITY.md). `zig build test` runs each on
   its seeds plus 400 deterministic mutations per seed; `zig build test
   --fuzz=N` adds Zig's coverage-guided fuzzer.
 - `zig build check -Dtarget=x86_64-linux-gnu` (or `aarch64-linux-gnu`)
-  type-checks everything reachable from `main` and from the tests for Linux
-  without linking, so Linux-only code paths are verified from a macOS
+  type-checks everything reachable from `main`, from the tests, and from
+  libsmbd's tests for Linux without linking, and builds `libsmbd.a` for it, so Linux-only code paths are verified from a macOS
   development machine.
 - CI (`.github/workflows/ci.yml`) builds and tests on Fedora and Alpine
   (x86_64 and aarch64) and macOS, runs the type checks, and fuzzes for 500K
@@ -1168,7 +1303,9 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 | `db`, `auth`, CLI | Written and unit-tested. |
 | Admin JSON API | Written; exercised with curl. |
 | `nthash_wasm` | Written; unit-tested natively, and checked in a browser against server-side hashing. |
-| `smb/server.zig` | Written; exercised through the `files.zig` tests. `serve` runs its accept loop, checked with a raw NEGOTIATE over TCP. |
+| `smb/server.zig` | Written; exercised through the `files.zig` tests and a start-and-stop test over TCP. `serve` runs it through libsmbd's `start` and `wait`. |
+| libsmbd (`src/smbd.zig`, `smb/host.zig`) | Written: the `smbd` module, a `Host` interface, and `start`/`adopt`/`stop`/`wait`; zsmbd is its one user, checked with macOS `mount_smbfs`, the web console's activity view, and a control-socket kick. |
+| libsmbd C interface (`smbd_c.zig`, `include/smbd.h`) | Written; `test/c/smoke.c` runs it from C against the static library, and it was checked once by hand against the shared one. The header also compiles as C99 and C++17. A pluggable file system is not planned yet. |
 | `smb/conn.zig` | `Conn` core and the request loop (framing, chains, credits, ECHO, LOGOFF, TREE_DISCONNECT, CANCEL, dispatch), signature verification, and decryption, unit-tested and fuzzed; tried with Linux clients (test/interop). |
 | `smb/handshake.zig` | NEGOTIATE, the SMB1 upgrade, SESSION_SETUP, and TREE_CONNECT, unit-tested (SESSION_SETUP against an in-test NTLMv2 client) and fuzzed; not yet tried with real clients. |
 | `smb/files.zig` | Written and unit-tested; macOS 15 `mount_smbfs` mounts a read-only share, lists it, and reads files byte-identical. |

@@ -35,6 +35,7 @@ jobs:
             export PATH="/opt/zig-$(uname -m)-linux-$ZIG_VERSION:$PATH"
             zig build test --summary all
             zig build
+            zig build lib
             INTEROP_REQUIRE_KERNEL=1 sh test/interop/run.sh'
 
   alpine:
@@ -56,6 +57,7 @@ jobs:
             export PATH="/opt/zig-$(uname -m)-linux-$ZIG_VERSION:$PATH"
             zig build test --summary all
             zig build
+            zig build lib
             INTEROP_REQUIRE_KERNEL=1 sh test/interop/run.sh'
 
   macos:
@@ -67,6 +69,7 @@ jobs:
           version: ${{ env.ZIG_VERSION }}
       - run: zig build test --summary all
       - run: zig build
+      - run: zig build lib
       - name: Linux type checks
         run: |
           zig build check -Dtarget=x86_64-linux-gnu

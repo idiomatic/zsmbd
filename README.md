@@ -29,6 +29,8 @@ It has four settings, all with working defaults.
 - State in one SQLite database, or in plain-text files you can edit, diff,
   and keep in version control.
 - Admin web console and JSON API on localhost.
+- The SMB server is also a library, libsmbd, for embedding in other
+  programs, from Zig or C: see [src/smb/README.md](src/smb/README.md).
 
 Not supported: SMB 1, 2, and 3.0; oplocks and leases; multichannel; DFS;
 named streams; durable handles; and Windows ACLs.
@@ -43,7 +45,8 @@ macOS).
 zig build
 ```
 
-The binary is `zig-out/bin/zsmbd`. Run the unit tests with:
+The binary is `zig-out/bin/zsmbd`. `zig build lib` builds libsmbd for C
+programs (`zig-out/lib`, `zig-out/include/smbd.h`). Run the unit tests with:
 
 ```bash
 zig build test
@@ -322,6 +325,7 @@ paste into an existing line.
 - [ARCHITECTURE.md](ARCHITECTURE.md): design, modules, and status.
 - [AGENTS.md](AGENTS.md): requirements and decisions.
 - [SECURITY.md](SECURITY.md): attack surface and secrets.
+- [src/smb/README.md](src/smb/README.md): libsmbd, the embeddable server.
 - [docs/specifications](docs/specifications/README.md): protocol specifications.
 - [CHANGELOG.md](CHANGELOG.md): changes by version.
 

@@ -4,23 +4,26 @@
 * A network file server daemon implementing SMB 3.1.1 or later, with few configuration options and sensible defaults.
 * Hosts: recent Linux and macOS. Clients: recent Linux, Windows, and macOS.
 * Embedded admin web server: settings, shares (names and directory paths), user credentials, and live activity.
+* libsmbd: the SMB server is also an embeddable Zig module (`smbd`, root `src/smbd.zig`; guide [src/smb/README.md](src/smb/README.md)), and zsmbd is its host.
 * All code in Zig 0.17.0 or later; this is non-negotiable.
 * SQLite may store data (hashed passwords, configuration).
 * Markdown code blocks are at most 60 columns wide (due to a Claude desktop app bug).
 * Keep this file, [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), and [CHANGELOG.md](CHANGELOG.md) current with each change.
 
 ## Build
-* `zig build` makes `zsmbd`; `zig build test` runs the unit tests.
+* `zig build` makes `zsmbd`; `zig build lib` makes libsmbd for C (`libsmbd.a`, the shared library, `smbd.h`); `zig build test` runs the unit tests (zsmbd's, and libsmbd's in a binary without SQLite) and the C test, `test/c/smoke.c`.
 * Local databases, logs, and test shares go in `var/` (git-ignored), e.g. `--db var/zsmbd.db`.
 * Version: semantic, in `build.zig.zon` only (code reads `build_options.version`); releases get a CHANGELOG.md section and a `vX.Y.Z` tag.
-* `zig build check -Dtarget=x86_64-linux-gnu` (and `aarch64-linux-gnu`) type-checks main and the tests for Linux.
-* Components (`src/` folders) depend one way: main → cli → web, control, smb → policy → store → shared; `web/`, `control/`, and `policy/` never import `smb/`.
+* `zig build check -Dtarget=x86_64-linux-gnu` (and `aarch64-linux-gnu`) type-checks main and both test binaries for Linux.
+* Components (`src/` folders) depend one way: main → cli → web, control, policy, smbd; web → policy → store → shared; smbd (`smb/`) → shared only; `web/`, `control/`, and `policy/` never import `smb/`.
 * Untrusted input and secrets are mapped in [SECURITY.md](SECURITY.md); every new parser of untrusted input gets a fuzz target (`src/shared/fuzz.zig`) and a row there.
 * CI: `.github/workflows/ci.yml` (Fedora, Alpine, macOS; type checks; fuzzing; Linux interoperability tests, [test/interop/](test/interop/README.md)).
 * Specifications used are copied to `docs/specifications/` and indexed in its [README.md](docs/specifications/README.md); add new ones there.
 * Only external library: system libsqlite3, through hand-written `extern` declarations.
 
 ## Decisions
+* libsmbd stores nothing: its host supplies shares, NT hashes, and the log (`Host`) and pushes settings (`setConfig`); nothing in `smb/` calls `std.log`. `start`, `adopt`, `stop`, and `wait` bound its life; connections are `Io.Group` tasks, and `stop` returns once they have ended.
+* libsmbd's C interface: `src/smbd_c.zig` and the hand-written `include/smbd.h`; opaque `smbd_server`, callbacks that copy in (`smbd_shares_add`) so no memory crosses the boundary, negative `SMBD_E*` codes, `malloc`ed memory, and one `std.Io.Threaded` per process (refcounted). Unstable before 1.0.
 * SMB 3.1.1 or later (no older dialect); signing required by default.
 * Authentication: SPNEGO with NTLMv2 only; no Kerberos.
 * Anonymous sessions can't sign, so a guest share works only with `signing_required = no`; with signing required, `serve` and share changes warn about each guest share.
