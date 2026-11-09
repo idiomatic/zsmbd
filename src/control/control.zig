@@ -199,7 +199,7 @@ pub const Listener = struct {
     path: [:0]u8,
     server: net.Server,
     hooks: Hooks,
-    thread: ?std.Thread = null,
+    accepting: Io.Future(void) = undefined,
 
     /// Binds `path` (mode 0600) and serves requests on a thread. A socket
     /// left by a dead server is replaced; one that answers is
@@ -225,21 +225,25 @@ pub const Listener = struct {
         const l = try gpa.create(Listener);
         errdefer gpa.destroy(l);
         l.* = .{ .gpa = gpa, .io = io, .path = z, .server = server, .hooks = hooks };
-        l.thread = try std.Thread.spawn(.{}, acceptLoop, .{l});
-        l.thread.?.detach();
+        l.accepting = try io.concurrent(acceptLoop, .{l});
         return l;
     }
 
-    /// Removes the socket file. The accept thread ends with the process.
+    /// Stops serving (after the request in progress), removes the socket
+    /// file, and frees `l`.
     pub fn stop(l: *Listener) void {
+        l.accepting.cancel(l.io);
         _ = std.c.unlink(l.path);
+        l.server.deinit(l.io);
+        l.gpa.free(l.path);
+        l.gpa.destroy(l);
     }
 };
 
 fn acceptLoop(l: *Listener) void {
     while (true) {
         const stream = l.server.accept(l.io) catch |e| {
-            std.log.warn("control accept: {s}", .{@errorName(e)});
+            if (e != error.Canceled) std.log.warn("control accept: {s}", .{@errorName(e)});
             return;
         };
         serveOne(l, stream);
@@ -453,11 +457,7 @@ test "a client reaches a listening server; stale sockets are replaced" {
 
     var c: Count = .{};
     const l = try Listener.start(testing.allocator, testing.io, path, c.hooks());
-    defer {
-        l.stop();
-        testing.allocator.free(l.path);
-        testing.allocator.destroy(l);
-    }
+    defer l.stop();
     const st = try tmp.dir.statFile(testing.io, "c.sock", .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), st.permissions.toMode() & 0o777);
 
