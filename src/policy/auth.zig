@@ -149,6 +149,52 @@ pub fn normalizeSetting(key: []const u8, value: []const u8) ValidationError![]co
     }
 }
 
+/// The four settings with their defaults applied, as the SMB server takes
+/// them.
+pub const ServerSettings = struct {
+    server_name: []u8,
+    workgroup: []u8,
+    signing_required: bool,
+    encrypt: bool,
+
+    pub fn free(s: ServerSettings, gpa: Allocator) void {
+        gpa.free(s.server_name);
+        gpa.free(s.workgroup);
+    }
+};
+
+/// Reads the settings from the store; a boolean that hand-edited text
+/// files got wrong is logged and fails with `InvalidSetting`.
+pub fn serverSettings(gpa: Allocator, db: *Db) !ServerSettings {
+    const name = (try db.getSetting(gpa, "server_name")) orelse try defaultServerName(gpa);
+    errdefer gpa.free(name);
+    const wg = (try db.getSetting(gpa, "workgroup")) orelse try gpa.dupe(u8, "WORKGROUP");
+    errdefer gpa.free(wg);
+    return .{
+        .server_name = name,
+        .workgroup = wg,
+        .signing_required = try boolSetting(gpa, db, "signing_required", true),
+        .encrypt = try boolSetting(gpa, db, "encrypt", false),
+    };
+}
+
+fn boolSetting(gpa: Allocator, db: *Db, key: []const u8, default: bool) !bool {
+    const v = (try db.getSetting(gpa, key)) orelse return default;
+    defer gpa.free(v);
+    return parseBool(v) orelse {
+        std.log.err("setting {s} = {s}: expected yes or no", .{ key, v });
+        return error.InvalidSetting;
+    };
+}
+
+/// The host name up to its first dot, at most 15 characters.
+fn defaultServerName(gpa: Allocator) ![]u8 {
+    var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+    const h = std.posix.gethostname(&buf) catch return gpa.dupe(u8, "ZSMBD");
+    const short = h[0 .. std.mem.indexOfScalar(u8, h, '.') orelse h.len];
+    return gpa.dupe(u8, short[0..@min(short.len, 15)]);
+}
+
 // ---------------------------------------------------------------- users
 
 pub fn nowSeconds(io: Io) i64 {
@@ -350,6 +396,21 @@ test "validation" {
 
 fn testDb() !Db {
     return Db.open(std.testing.io, ":memory:");
+}
+
+test "settings read yes and no as hand-edited text files write them" {
+    var db = try testDb();
+    defer db.close();
+    const gpa = std.testing.allocator;
+    const defaults = try serverSettings(gpa, &db);
+    defer defaults.free(gpa);
+    try std.testing.expect(defaults.signing_required and !defaults.encrypt);
+    try std.testing.expectEqualStrings("WORKGROUP", defaults.workgroup);
+    try db.setSetting("encrypt", "yes");
+    try db.setSetting("signing_required", "No");
+    const s = try serverSettings(gpa, &db);
+    defer s.free(gpa);
+    try std.testing.expect(s.encrypt and !s.signing_required);
 }
 
 fn canWebLogin(db: *Db, name: []const u8, pw: []const u8) !bool {

@@ -20,7 +20,7 @@ const rpc = @import("rpc.zig");
 const vfs = @import("vfs.zig");
 const state = @import("server.zig");
 const Server = state.Server;
-const db_mod = @import("../store/store.zig");
+const TestHost = @import("host.zig").TestHost;
 
 pub const max_io_size: u32 = 4 * 1024 * 1024;
 const max_frame: usize = max_io_size + 64 * 1024;
@@ -863,22 +863,15 @@ test "smb1OffersSmb2" {
 }
 
 pub const TestConn = struct {
-    db: db_mod.Db,
+    host: TestHost,
     srv: Server,
     conn: *Conn,
 
     pub fn init(t: *TestConn) !void {
         const gpa = testing.allocator;
-        t.db = try db_mod.Db.open(testing.io, ":memory:");
-        t.srv = .{
-            .gpa = gpa,
-            .io = testing.io,
-            .db = &t.db,
-            .guid = @splat(0),
-            .start_ms = 0,
-            .smb_port = 445,
-            .cfg = .{ .server_name = &.{}, .workgroup = &.{}, .signing_required = false, .encrypt = false },
-        };
+        t.host = .{ .gpa = gpa };
+        t.srv = try .init(gpa, testing.io, t.host.host(), .{ .server_name = "", .workgroup = "", .signing_required = false });
+        t.srv.smb_port = 445;
         t.conn = try gpa.create(Conn);
         t.conn.* = .{ .gpa = gpa, .srv = &t.srv, .id = 1, .stream = undefined };
         t.conn.neg.dialect = proto.Dialect.smb311;
@@ -895,9 +888,8 @@ pub const TestConn = struct {
         for (c.notifies.items) |n| gpa.free(n.dir_path);
         c.notifies.deinit(gpa);
         gpa.destroy(c);
-        t.srv.nodes.deinit(gpa);
-        t.srv.deinitMonitor();
-        t.db.close();
+        t.srv.deinit();
+        t.host.deinit();
     }
 
     /// Ends every session and drops the tables' capacity, so a fuzz input

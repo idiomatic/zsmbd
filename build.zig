@@ -51,10 +51,21 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zsmbd");
     run_step.dependOn(&run_cmd.step);
 
+    // libsmbd, the SMB server for embedding: smb/ and shared/ only, so it
+    // links neither SQLite nor anything else of zsmbd's.
+    const smbd = b.addModule("smbd", .{
+        .root_source_file = b.path("src/smbd.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     const tests = b.addTest(.{ .root_module = mod });
     tests.linker_allow_shlib_undefined = true;
+    const smbd_tests = b.addTest(.{ .root_module = smbd });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+    test_step.dependOn(&b.addRunArtifact(smbd_tests).step);
 
     // Compile-only check for other targets (no linking, so no sqlite needed):
     //   zig build check -Dtarget=x86_64-linux-gnu
@@ -69,7 +80,7 @@ pub fn build(b: *std.Build) void {
     const check_obj = b.addExecutable(.{ .name = "zsmbd-check", .root_module = check_mod });
     const check_step = b.step("check", "Type-check without linking");
     check_step.dependOn(&check_obj.step);
-    // The tests reach modules that main does not use yet (files.zig).
     const check_tests = b.addTest(.{ .root_module = check_mod });
     check_step.dependOn(&check_tests.step);
+    check_step.dependOn(&b.addTest(.{ .root_module = smbd }).step);
 }

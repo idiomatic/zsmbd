@@ -151,15 +151,7 @@ test {
     _ = @import("store/textusers.zig");
     _ = @import("web/server.zig");
     _ = @import("control/control.zig");
-    _ = @import("smb/rpc.zig");
-    _ = @import("smb/auth/ntlm.zig");
-    _ = @import("smb/auth/spnego.zig");
-    _ = @import("smb/vfs.zig");
-    _ = @import("smb/files.zig");
-    _ = @import("smb/conn.zig");
-    _ = @import("smb/handshake.zig");
-    _ = @import("shared/crypto.zig");
-    _ = @import("shared/wire.zig");
+    // libsmbd's own tests run in its test binary (smbd.zig).
     _ = @import("nthash_wasm.zig");
     _ = @import("policy/strength.zig");
 }

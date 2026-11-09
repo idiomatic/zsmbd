@@ -32,7 +32,7 @@ const Open = conn_mod.Open;
 const state = @import("server.zig");
 const Server = state.Server;
 const Node = state.Node;
-const db_mod = @import("../store/store.zig");
+const host_mod = @import("host.zig");
 
 const max_io_size = conn_mod.max_io_size;
 const hdr = proto.header_size;
@@ -715,7 +715,7 @@ fn pipeWrite(ctx: *Ctx, pipe: *rpc.Pipe, data: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(ctx.gpa());
     defer arena.deinit();
     const a = arena.allocator();
-    const shares = try ctx.srv().db.listShares(a);
+    const shares = try ctx.srv().host.listShares(a);
     const entries = try a.alloc(rpc.ShareEntry, shares.len + 1);
     for (shares, entries[0..shares.len]) |s, *e| e.* = .{ .name = s.name, .comment = s.comment, .kind = rpc.stype_disktree };
     entries[shares.len] = .{ .name = "IPC$", .comment = "IPC Service", .kind = rpc.stype_ipc_special };
@@ -1456,11 +1456,10 @@ fn copyChunk(ctx: *Ctx, dst: *Open, input: []const u8, need_read: bool, out: *Bu
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
-const Db = db_mod.Db;
 
 const Fixture = struct {
     tmp: testing.TmpDir,
-    db: Db,
+    host: host_mod.TestHost,
     srv: Server,
     conn: *Conn,
     session: Session,
@@ -1474,16 +1473,8 @@ const Fixture = struct {
         errdefer f.tmp.cleanup();
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const n = try f.tmp.dir.realPath(testing.io, &buf);
-        f.db = try Db.open(testing.io, ":memory:");
-        f.srv = .{
-            .gpa = gpa,
-            .io = testing.io,
-            .db = &f.db,
-            .guid = @splat(0),
-            .start_ms = 0,
-            .smb_port = 445,
-            .cfg = .{ .server_name = &.{}, .workgroup = &.{}, .signing_required = true, .encrypt = false },
-        };
+        f.host = .{ .gpa = gpa };
+        f.srv = try .init(gpa, testing.io, f.host.host(), .{ .server_name = "" });
         f.conn = try gpa.create(Conn);
         f.conn.* = .{ .gpa = gpa, .srv = &f.srv, .id = 1, .stream = undefined };
         f.session = .{ .id = 7, .state = .valid, .created_ms = 0 };
@@ -1506,8 +1497,8 @@ const Fixture = struct {
         f.conn.opens.map.deinit(gpa);
         f.conn.notifies.deinit(gpa);
         gpa.destroy(f.conn);
-        f.srv.nodes.deinit(gpa);
-        f.db.close();
+        f.srv.deinit();
+        f.host.deinit();
         gpa.free(f.tree.root);
         f.out.deinit();
         f.tmp.cleanup();

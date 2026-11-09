@@ -7,7 +7,7 @@ const Db = @import("store/store.zig").Db;
 const db_mod = @import("store/store.zig");
 const auth = @import("policy/auth.zig");
 const web = @import("web/server.zig");
-const smb_server = @import("smb/server.zig");
+const smbd = @import("smbd.zig");
 const strength = @import("policy/strength.zig");
 const ephemeral = @import("policy/ephemeral.zig");
 const control = @import("control/control.zig");
@@ -445,19 +445,10 @@ fn serve(c: *Cli) !void {
         , .{ b.password, addr.? });
     }
 
-    var guid: [16]u8 = undefined;
-    c.io.random(&guid);
-    var srv: smb_server.Server = .{
-        .gpa = c.gpa,
-        .io = c.io,
-        .db = c.db,
-        .guid = guid,
-        .start_ms = Io.Clock.real.now(c.io).toMilliseconds(),
-        .smb_port = saddr.getPort(),
-        .cfg = .{ .server_name = &.{}, .workgroup = &.{}, .signing_required = true, .encrypt = false },
-    };
-    try srv.loadConfig();
-    srv.warnGuestSigning(null);
+    const settings = try auth.serverSettings(c.gpa, c.db);
+    defer settings.free(c.gpa);
+    var srv: smbd.Server = try .init(c.gpa, c.io, storeHost(c.db), smbConfig(settings));
+    defer srv.deinit();
     var listener = saddr.listen(c.io, .{ .reuse_address = true }) catch |e| {
         std.log.err("cannot listen for SMB on {f}: {s} (ports below 1024 need root; try --smb 4450)", .{ saddr, @errorName(e) });
         return e;
@@ -465,15 +456,17 @@ fn serve(c: *Cli) !void {
     defer listener.deinit(c.io);
     std.log.info("zsmbd: SMB on {f} as {s}", .{ saddr, srv.cfg.server_name });
 
-    var admin: web.Admin = .{ .gpa = c.gpa, .io = c.io, .db = c.db, .live = .{
-        .ctx = &srv,
+    var admin: web.Admin = undefined;
+    var sv: Serving = .{ .c = c, .srv = &srv, .admin = &admin };
+    sv.warnGuestSigning(null);
+    admin = .{ .gpa = c.gpa, .io = c.io, .db = c.db, .live = .{
+        .ctx = &sv,
         .writeActivity = liveActivity,
         .kick = liveKick,
         .reload = liveReload,
         .shareChanged = liveShareChanged,
         .userChanged = liveUserChanged,
     } };
-    var sv: Serving = .{ .c = c, .srv = &srv, .admin = &admin };
 
     var control_socket: ?*control.Listener = null;
     if (c.control) |path| {
@@ -484,19 +477,61 @@ fn serve(c: *Cli) !void {
     }
     defer if (control_socket) |l| l.stop();
     if (addr) |a| try admin.start(a) else std.log.info("zsmbd: no web console (give --web PORT to start it)", .{});
-    return srv.acceptLoop(&listener);
+    try srv.start(&listener);
+    defer srv.stop();
+    try srv.wait();
 }
 
-/// What the control socket's hooks need: the SMB server, the web console,
-/// and the command line's store.
-const Serving = struct { c: *Cli, srv: *smb_server.Server, admin: *web.Admin };
+fn smbConfig(s: auth.ServerSettings) smbd.Config {
+    return .{ .server_name = s.server_name, .workgroup = s.workgroup, .signing_required = s.signing_required, .encrypt = s.encrypt };
+}
+
+/// What the control socket's and web console's hooks need: the SMB server,
+/// the web console, and the command line's store.
+const Serving = struct {
+    c: *Cli,
+    srv: *smbd.Server,
+    admin: *web.Admin,
+
+    /// Re-reads the settings; a bad value keeps the old ones.
+    fn reload(s: *Serving) void {
+        const settings = auth.serverSettings(s.c.gpa, s.c.db) catch |e| return std.log.warn("settings not reloaded: {s}", .{@errorName(e)});
+        defer settings.free(s.c.gpa);
+        s.srv.setConfig(smbConfig(settings)) catch |e| return std.log.warn("settings not reloaded: {s}", .{@errorName(e)});
+        s.warnGuestSigning(null);
+    }
+
+    /// Share `name` changed in the store: warn, and drop the clients it
+    /// shuts out (or, with `kick`, those still on the old rules).
+    fn shareChanged(s: *Serving, name: []const u8, kick: db_mod.Kick) usize {
+        s.warnGuestSigning(name);
+        return s.srv.reconcileShare(name, switch (kick) {
+            .none => .none,
+            .writable => .writable,
+            .guests => .guests,
+        });
+    }
+
+    /// Warns about each guest share (only `name`, if given) while signing
+    /// is required: anonymous sessions can't sign, so they reach only IPC$.
+    fn warnGuestSigning(s: *Serving, name: ?[]const u8) void {
+        if (!s.srv.signingRequired()) return;
+        const shares = s.c.db.listShares(s.c.gpa) catch return;
+        defer db_mod.freeShares(s.c.gpa, shares);
+        for (shares) |sh| {
+            if (!sh.guest_ok) continue;
+            if (name) |n| if (!std.ascii.eqlIgnoreCase(sh.name, n)) continue;
+            std.log.warn("share {s} allows guests, but signing is required and anonymous sessions can't sign, so guests are refused; set signing_required = no to admit them", .{sh.name});
+        }
+    }
+};
 
 fn serving(ctx: ?*anyopaque) *Serving {
     return @ptrCast(@alignCast(ctx.?));
 }
 
 fn ctlShare(ctx: ?*anyopaque, name: []const u8, kick: db_mod.Kick) usize {
-    return serving(ctx).srv.reconcileShare(name, kick);
+    return serving(ctx).shareChanged(name, kick);
 }
 
 fn ctlUser(ctx: ?*anyopaque, name: []const u8) usize {
@@ -506,7 +541,7 @@ fn ctlUser(ctx: ?*anyopaque, name: []const u8) usize {
 }
 
 fn ctlSettings(ctx: ?*anyopaque) void {
-    liveReload(serving(ctx).srv);
+    serving(ctx).reload();
 }
 
 /// `web start [[ADDR:]PORT]` and `web stop`. Starting with no web login
@@ -532,31 +567,66 @@ fn ctlWeb(ctx: ?*anyopaque, start: bool, arg: ?[]const u8, buf: []u8) control.Re
 // The admin web server reaches the SMB server only through these hooks
 // (web.Live), because `web/` may not import `smb/`.
 
-fn liveServer(ctx: ?*anyopaque) *smb_server.Server {
-    return @ptrCast(@alignCast(ctx.?));
-}
-
 fn liveActivity(ctx: ?*anyopaque, gpa: Allocator, w: *Io.Writer) anyerror!void {
-    return liveServer(ctx).writeActivity(gpa, w);
+    return serving(ctx).srv.writeActivity(gpa, w);
 }
 
 fn liveKick(ctx: ?*anyopaque, conn_id: u64) bool {
-    return liveServer(ctx).kick(conn_id);
+    return serving(ctx).srv.kick(conn_id);
 }
 
 fn liveShareChanged(ctx: ?*anyopaque, share: []const u8, kick: db_mod.Kick) usize {
-    return liveServer(ctx).reconcileShare(share, kick);
+    return serving(ctx).shareChanged(share, kick);
 }
 
 fn liveUserChanged(ctx: ?*anyopaque, name: []const u8) usize {
-    return liveServer(ctx).reconcileUser(name);
+    return serving(ctx).srv.reconcileUser(name);
 }
 
-/// Settings changed in the store; a bad value keeps the old ones.
+/// Settings changed in the store.
 fn liveReload(ctx: ?*anyopaque) void {
-    const srv = liveServer(ctx);
-    srv.loadConfig() catch |e| return std.log.warn("settings not reloaded: {s}", .{@errorName(e)});
-    srv.warnGuestSigning(null);
+    serving(ctx).reload();
+}
+
+// libsmbd's host: shares and SMB users come from the store, and its log goes
+// to std.log.
+
+fn storeHost(db: *Db) smbd.Host {
+    return .{ .ctx = db, .vtable = &.{ .listShares = hostShares, .ntHash = hostNtHash, .log = hostLog } };
+}
+
+fn hostDb(ctx: ?*anyopaque) *Db {
+    return @ptrCast(@alignCast(ctx.?));
+}
+
+fn hostError(e: db_mod.Error) smbd.Error {
+    return if (e == error.OutOfMemory) error.OutOfMemory else error.HostFailed;
+}
+
+fn hostShares(ctx: ?*anyopaque, gpa: Allocator) smbd.Error![]smbd.Share {
+    const stored = hostDb(ctx).listShares(gpa) catch |e| return hostError(e);
+    defer gpa.free(stored);
+    // The strings move to the new list.
+    const shares = gpa.alloc(smbd.Share, stored.len) catch {
+        for (stored) |sh| sh.free(gpa);
+        return error.OutOfMemory;
+    };
+    for (stored, shares) |sh, *out| out.* = .{ .name = sh.name, .path = sh.path, .comment = sh.comment, .read_only = sh.read_only, .guest_ok = sh.guest_ok };
+    return shares;
+}
+
+fn hostNtHash(ctx: ?*anyopaque, name: []const u8) smbd.Error!?[16]u8 {
+    return hostDb(ctx).ntHash(name) catch |e| hostError(e);
+}
+
+fn hostLog(_: ?*anyopaque, level: smbd.Level, conn_id: u64, kind: []const u8, msg: []const u8) void {
+    const f = "[{d}] {s}: {s}";
+    const args = .{ conn_id, kind, msg };
+    switch (level) {
+        .err => std.log.err(f, args),
+        .warn => std.log.warn(f, args),
+        .info => std.log.info(f, args),
+    }
 }
 
 /// Adds the login of `--user`, `--smb-user`, or `--web-user` to `spec`,

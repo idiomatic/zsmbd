@@ -14,6 +14,7 @@ const ntlm = @import("auth/ntlm.zig");
 const spnego = @import("auth/spnego.zig");
 const vfs = @import("vfs.zig");
 const conn_mod = @import("conn.zig");
+const host_mod = @import("host.zig");
 const Conn = conn_mod.Conn;
 const Session = conn_mod.Session;
 const Tree = conn_mod.Tree;
@@ -392,7 +393,7 @@ fn logonFailure(c: *Conn, authenticate: ?[]const u8) SetupOutcome {
 
 /// NT hash for SMB logins; admins and unknown users look alike.
 fn lookupNtHash(c: *Conn, name: []const u8) ntlm.LookupError![16]u8 {
-    const h = c.srv.db.ntHash(name) catch |e| {
+    const h = c.srv.host.ntHash(name) catch |e| {
         c.srv.log(c.id, "auth", "user lookup failed: {s}", .{@errorName(e)});
         return error.NoSuchUser;
     };
@@ -433,11 +434,8 @@ pub fn treeConnect(c: *Conn, s: *Session, msg: []const u8, out: *Buf) !TreeOutco
         // An anonymous session cannot sign, so with signing required it
         // reaches only IPC$.
         if (s.anonymous and c.neg.signing_required) return .{ .status = Status.access_denied };
-        const shares = try c.srv.db.listShares(gpa);
-        defer {
-            for (shares) |sh| sh.free(gpa);
-            gpa.free(shares);
-        }
+        const shares = try c.srv.host.listShares(gpa);
+        defer host_mod.freeShares(gpa, shares);
         const sh = for (shares) |sh| {
             if (vfs.eqlFold(sh.name, name)) break sh;
         } else return .{ .status = Status.bad_network_name };
@@ -866,7 +864,7 @@ test "SESSION_SETUP: NTLMv2 through SPNEGO, keys, MICs, and the signed response"
     try t.init();
     defer t.deinit();
     t.conn.neg.signing_required = true;
-    try t.db.putUser("hal", .{ .set = try crypto.ntHash(gpa, "daisy") }, .keep, 0);
+    try t.host.putUser("hal", "daisy");
     var out = Buf.init(gpa);
     defer out.deinit();
     const mech_types = try spnego.mechTypesNtlm(gpa);
@@ -939,7 +937,7 @@ test "a signed request gets a signed reply on a session that does not sign" {
     var t: TestConn = undefined;
     try t.init();
     defer t.deinit();
-    try t.db.putUser("hal", .{ .set = try crypto.ntHash(gpa, "daisy") }, .keep, 0);
+    try t.host.putUser("hal", "daisy");
     var out = Buf.init(gpa);
     defer out.deinit();
     try testing.expectEqual(Status.success, try logon(&t, 0, "hal", "daisy", &out));
@@ -984,12 +982,12 @@ test "SESSION_SETUP: failures, anonymous logons, and policy" {
     var t: TestConn = undefined;
     try t.init();
     defer t.deinit();
-    try t.db.putUser("hal", .{ .set = try crypto.ntHash(gpa, "daisy") }, .keep, 0);
-    try t.db.putUser("art", .keep, .{ .set = "x" }, 0);
+    try t.host.putUser("hal", "daisy");
     var out = Buf.init(gpa);
     defer out.deinit();
 
-    // A wrong password and an admin fail alike, and leave no session.
+    // A wrong password and a user without an SMB password (the host has
+    // no hash for art) fail alike, and leave no session.
     try testing.expectEqual(Status.logon_failure, try logon(&t, 0, "hal", "dave", &out));
     try testing.expectEqual(Status.logon_failure, try logon(&t, 2, "art", "x", &out));
     try testing.expectEqual(Status.logon_failure, try logon(&t, 4, "skynet", "x", &out));
@@ -1064,9 +1062,9 @@ test "TREE_CONNECT: shares, IPC$, read-only, and anonymous sessions" {
     defer tmp.cleanup();
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = buf[0..try tmp.dir.realPath(testing.io, &buf)];
-    try t.db.putShare(.{ .name = "Data", .path = dir });
-    try t.db.putShare(.{ .name = "pub", .path = dir, .read_only = true, .guest_ok = true });
-    try t.db.putShare(.{ .name = "gone", .path = "/nonexistent/skynet" });
+    try t.host.putShare(.{ .name = "Data", .path = dir });
+    try t.host.putShare(.{ .name = "pub", .path = dir, .read_only = true, .guest_ok = true });
+    try t.host.putShare(.{ .name = "gone", .path = "/nonexistent/skynet" });
     const s = try t.addSession(false);
     t.conn.credits.high = 64;
     var out = Buf.init(gpa);
@@ -1131,7 +1129,7 @@ test "fuzz: NEGOTIATE, SESSION_SETUP, and TREE_CONNECT" {
     var t: TestConn = undefined;
     try t.init();
     defer t.deinit();
-    try t.db.putShare(.{ .name = "data", .path = "/" });
+    try t.host.putShare(.{ .name = "data", .path = "/" });
 
     const neg = try negotiateRequest(gpa, 0, &.{ 0x0300, 0x0311 }, sha512_id, &.{ proto.Cipher.aes128_ccm, proto.Cipher.aes128_gcm }, &.{proto.SigningAlg.aes_cmac});
     defer gpa.free(neg);

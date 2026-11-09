@@ -1,26 +1,29 @@
-//! Process-wide server state shared by SMB connection threads and the admin
-//! web server: configuration snapshot, live connection registry, the table of
-//! open file nodes (share modes, delete-pending, byte-range locks), an
-//! activity log ring, and the view of who is signed in to what that the admin
-//! web server shows (`writeActivity`).
+//! The server, shared by SMB connection tasks and the host: its lifecycle
+//! (`start`, `adopt`, `stop`), configuration snapshot, live connection
+//! registry, the table of open file nodes (share modes, delete-pending,
+//! byte-range locks), an activity log ring, and the view of who is signed in
+//! to what (`writeActivity`).
 
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
-const db_mod = @import("../store/store.zig");
-const Db = db_mod.Db;
-const Share = db_mod.Share;
-const Kick = db_mod.Kick;
-const auth = @import("../policy/auth.zig");
+const host_mod = @import("host.zig");
+const Host = host_mod.Host;
+const Share = host_mod.Share;
+const Kick = host_mod.Kick;
+const Level = host_mod.Level;
 const conn_mod = @import("conn.zig");
 const Conn = conn_mod.Conn;
 const Open = conn_mod.Open;
 
+/// The settings a host chooses. `setConfig` copies them.
 pub const Config = struct {
-    server_name: []u8,
-    workgroup: []u8,
-    signing_required: bool,
-    encrypt: bool,
+    /// NetBIOS name shown to clients (upper-cased; at most 15 characters).
+    server_name: []const u8,
+    workgroup: []const u8 = "WORKGROUP",
+    signing_required: bool = true,
+    /// Every session must encrypt.
+    encrypt: bool = false,
 
     pub fn free(cfg: Config, gpa: Allocator) void {
         gpa.free(cfg.server_name);
@@ -97,14 +100,21 @@ pub const Stats = struct {
 pub const Server = struct {
     gpa: Allocator,
     io: Io,
-    db: *Db,
+    host: Host,
     guid: [16]u8,
     start_ms: i64,
-    smb_port: u16,
+    /// The port `start` listens on, for the activity view; 0 before.
+    smb_port: u16 = 0,
+    /// The accept loop and one task per connection.
+    group: Io.Group = .init,
+    /// Set when `stop` has finished.
+    stopped: Io.Event = .unset,
 
     /// Protects everything below.
     mutex: Io.Mutex = .init,
     cfg: Config,
+    /// No connection starts once set.
+    stopping: bool = false,
     conns: std.ArrayList(*Conn) = .empty,
     nodes: std.AutoHashMapUnmanaged(NodeKey, *Node) = .empty,
     events: [512]Event = undefined,
@@ -114,6 +124,30 @@ pub const Server = struct {
 
     stats: Stats = .{},
     next_id: std.atomic.Value(u64) = .init(1),
+
+    /// A server that serves nothing until `start` or `adopt`. It must not
+    /// move after that.
+    pub fn init(gpa: Allocator, io: Io, host: Host, cfg: Config) Allocator.Error!Server {
+        var srv: Server = .{
+            .gpa = gpa,
+            .io = io,
+            .host = host,
+            .guid = undefined,
+            .start_ms = Io.Clock.real.now(io).toMilliseconds(),
+            .cfg = .{ .server_name = &.{}, .workgroup = &.{} },
+        };
+        io.random(&srv.guid);
+        try srv.setConfig(cfg);
+        return srv;
+    }
+
+    /// Frees the server; after `stop`, if it was started.
+    pub fn deinit(srv: *Server) void {
+        srv.cfg.free(srv.gpa);
+        srv.conns.deinit(srv.gpa);
+        srv.nodes.deinit(srv.gpa);
+        srv.deinitMonitor();
+    }
 
     pub fn nowMs(srv: *Server) i64 {
         return Io.Clock.real.now(srv.io).toMilliseconds();
@@ -130,31 +164,18 @@ pub const Server = struct {
         srv.mutex.unlock(srv.io);
     }
 
-    /// Re-read configuration from the database.
-    pub fn loadConfig(srv: *Server) !void {
-        const gpa = srv.gpa;
-        const name = (try srv.db.getSetting(gpa, "server_name")) orelse try defaultServerName(gpa);
-        errdefer gpa.free(name);
+    /// Replaces the settings. NEGOTIATE uses them from then on; a session
+    /// keeps the signing rule its NEGOTIATE promised.
+    pub fn setConfig(srv: *Server, cfg: Config) Allocator.Error!void {
+        const name = try srv.gpa.dupe(u8, cfg.server_name);
+        errdefer srv.gpa.free(name);
         for (name) |*ch| ch.* = std.ascii.toUpper(ch.*);
-        const wg = (try srv.db.getSetting(gpa, "workgroup")) orelse try gpa.dupe(u8, "WORKGROUP");
-        errdefer gpa.free(wg);
-        const sr = try srv.boolSetting("signing_required", true);
-        const enc = try srv.boolSetting("encrypt", false);
+        const wg = try srv.gpa.dupe(u8, cfg.workgroup);
         srv.lock();
-        defer srv.unlock();
-        if (srv.cfg.server_name.len != 0) srv.cfg.free(gpa);
-        srv.cfg = .{ .server_name = name, .workgroup = wg, .signing_required = sr, .encrypt = enc };
-    }
-
-    fn boolSetting(srv: *Server, key: []const u8, default: bool) !bool {
-        const v = (try srv.db.getSetting(srv.gpa, key)) orelse return default;
-        defer srv.gpa.free(v);
-        // Hand-edited text files skip the CLI and web checks.
-        const n = auth.normalizeSetting(key, v) catch {
-            std.log.err("setting {s} = {s}: expected yes or no", .{ key, v });
-            return error.InvalidSetting;
-        };
-        return n[0] == 't';
+        const old = srv.cfg;
+        srv.cfg = .{ .server_name = name, .workgroup = wg, .signing_required = cfg.signing_required, .encrypt = cfg.encrypt };
+        srv.unlock();
+        old.free(srv.gpa);
     }
 
     /// Copy of the current configuration; caller frees with Config.free.
@@ -166,7 +187,18 @@ pub const Server = struct {
         return .{ .server_name = n, .workgroup = try gpa.dupe(u8, srv.cfg.workgroup), .signing_required = srv.cfg.signing_required, .encrypt = srv.cfg.encrypt };
     }
 
+    pub fn signingRequired(srv: *Server) bool {
+        srv.lock();
+        defer srv.unlock();
+        return srv.cfg.signing_required;
+    }
+
+    /// Records an event for the activity view and passes it to the host.
     pub fn log(srv: *Server, conn_id: u64, kind: []const u8, comptime fmt: []const u8, args: anytype) void {
+        srv.logAt(.info, conn_id, kind, fmt, args);
+    }
+
+    pub fn logAt(srv: *Server, level: Level, conn_id: u64, kind: []const u8, comptime fmt: []const u8, args: anytype) void {
         var e: Event = undefined;
         e.time_ms = srv.nowMs();
         e.conn_id = conn_id;
@@ -174,7 +206,7 @@ pub const Server = struct {
         @memcpy(e.kind[0..e.kind_len], kind[0..e.kind_len]);
         const m = std.fmt.bufPrint(&e.msg, fmt, args) catch e.msg[0..];
         e.msg_len = @intCast(m.len);
-        std.log.info("[{d}] {s}: {s}", .{ conn_id, kind, m });
+        srv.host.log(level, conn_id, kind, m);
         srv.lock();
         defer srv.unlock();
         srv.events[srv.event_head] = e;
@@ -182,42 +214,70 @@ pub const Server = struct {
         if (srv.event_count < srv.events.len) srv.event_count += 1;
     }
 
-    /// Accept SMB clients on `listener` until it fails, one thread per
-    /// connection. Each `Conn` releases itself when its client leaves.
-    pub fn acceptLoop(srv: *Server, listener: *Io.net.Server) void {
+    // ------------------------------------------------------------ lifecycle
+
+    /// Serves the clients that connect to `listener` until `stop`, which the
+    /// host calls before closing `listener`.
+    pub fn start(srv: *Server, listener: *Io.net.Server) Io.ConcurrentError!void {
+        srv.smb_port = listener.socket.address.getPort();
+        try srv.group.concurrent(srv.io, acceptLoop, .{ srv, listener });
+    }
+
+    fn acceptLoop(srv: *Server, listener: *Io.net.Server) void {
         while (true) {
-            const stream = listener.accept(srv.io) catch |e| {
-                std.log.warn("smb accept: {s}", .{@errorName(e)});
-                continue;
+            const stream = listener.accept(srv.io) catch |e| switch (e) {
+                error.Canceled, error.SocketNotListening => return,
+                else => {
+                    srv.logAt(.warn, 0, "smb", "accept: {s}", .{@errorName(e)});
+                    continue;
+                },
             };
-            srv.startConn(stream) catch |e| {
-                std.log.warn("smb connection not started: {s}", .{@errorName(e)});
+            srv.adopt(stream) catch |e| {
+                srv.logAt(.warn, 0, "smb", "connection not started: {s}", .{@errorName(e)});
                 stream.close(srv.io);
             };
         }
     }
 
-    fn startConn(srv: *Server, stream: Io.net.Stream) !void {
+    /// Serves one client the host accepted; the server closes `stream`
+    /// when the client leaves. On error the host still owns `stream`.
+    pub fn adopt(srv: *Server, stream: Io.net.Stream) (Allocator.Error || Io.ConcurrentError || error{Stopped})!void {
         const c = try srv.gpa.create(Conn);
         c.* = .{ .gpa = srv.gpa, .srv = srv, .id = srv.newId(), .stream = stream };
+        c.connected_ms = srv.nowMs();
+        const peer = std.fmt.bufPrint(&c.peer, "{f}", .{stream.socket.address}) catch c.peer[0..0];
+        c.peer_len = @intCast(peer.len);
         srv.addConn(c) catch |e| {
             srv.gpa.destroy(c);
             return e;
         };
-        c.connected_ms = srv.nowMs();
-        const peer = std.fmt.bufPrint(&c.peer, "{f}", .{stream.socket.address}) catch c.peer[0..0];
-        c.peer_len = @intCast(peer.len);
-        const t = std.Thread.spawn(.{}, conn_mod.serve, .{c}) catch |e| {
+        srv.group.concurrent(srv.io, conn_mod.serve, .{c}) catch |e| {
             srv.removeConn(c);
             srv.gpa.destroy(c);
             return e;
         };
-        t.detach();
     }
 
-    pub fn addConn(srv: *Server, c: *Conn) !void {
+    /// Stops accepting, drops every client, and returns once their tasks
+    /// have finished (their opens closed). Call once, not from a callback.
+    pub fn stop(srv: *Server) void {
+        srv.lock();
+        srv.stopping = true;
+        for (srv.conns.items) |c| c.stream.shutdown(srv.io, .both) catch {};
+        srv.unlock();
+        srv.group.cancel(srv.io);
+        srv.stopped.set(srv.io);
+    }
+
+    /// Blocks until `stop` has finished.
+    pub fn wait(srv: *Server) Io.Cancelable!void {
+        return srv.stopped.wait(srv.io);
+    }
+
+    pub fn addConn(srv: *Server, c: *Conn) (Allocator.Error || error{Stopped})!void {
         srv.lock();
         defer srv.unlock();
+        if (srv.stopping) return error.Stopped;
         try srv.conns.append(srv.gpa, c);
         _ = srv.stats.connections_total.fetchAdd(1, .monotonic);
     }
@@ -421,33 +481,16 @@ pub const Server = struct {
         return false;
     }
 
-    /// Warns about each guest share (only `name`, if given) while signing
-    /// is required: anonymous sessions can't sign, so they reach only IPC$.
-    pub fn warnGuestSigning(srv: *Server, name: ?[]const u8) void {
-        srv.lock();
-        const signing = srv.cfg.signing_required;
-        srv.unlock();
-        if (!signing) return;
-        const shares = srv.db.listShares(srv.gpa) catch return;
-        defer db_mod.freeShares(srv.gpa, shares);
-        for (shares) |sh| {
-            if (!sh.guest_ok) continue;
-            if (name) |n| if (!std.ascii.eqlIgnoreCase(sh.name, n)) continue;
-            std.log.warn("share {s} allows guests, but signing is required and anonymous sessions can't sign, so guests are refused; set signing_required = no to admit them", .{sh.name});
-        }
-    }
-
-    /// Call after share `name` changed in the store (or was deleted): drops
-    /// the connections whose access it now tightens, so each client
-    /// reconnects under the new rules (`relax`: see staleOnShare). Returns how
-    /// many were dropped.
+    /// Call after the host changed (or deleted) share `name`: drops the
+    /// connections whose access it now tightens, so each client reconnects
+    /// under the new rules (`relax`: see staleOnShare). Returns how many
+    /// were dropped.
     pub fn reconcileShare(srv: *Server, name: []const u8, relax: Kick) usize {
-        const shares = srv.db.listShares(srv.gpa) catch return 0;
-        defer db_mod.freeShares(srv.gpa, shares);
+        const shares = srv.host.listShares(srv.gpa) catch return 0;
+        defer host_mod.freeShares(srv.gpa, shares);
         const cur: ?Share = for (shares) |sh| {
             if (std.ascii.eqlIgnoreCase(sh.name, name)) break sh;
         } else null;
-        if (cur) |c| if (c.guest_ok) srv.warnGuestSigning(name);
         const ids = srv.staleOnShare(srv.gpa, name, cur, relax) catch return 0;
         defer srv.gpa.free(ids);
         const n = srv.kickAll(ids);
@@ -469,11 +512,11 @@ pub const Server = struct {
         return ids.toOwnedSlice(gpa);
     }
 
-    /// Call after user `name` changed in the store: drops their connections
-    /// if they no longer have an SMB password (or no longer exist). A new
+    /// Call after the host changed user `name`: drops their connections if
+    /// they no longer have an SMB password (or no longer exist). A new
     /// password alone keeps sessions, as on any SMB server.
     pub fn reconcileUser(srv: *Server, name: []const u8) usize {
-        const nt = srv.db.ntHash(name) catch return 0;
+        const nt = srv.host.ntHash(name) catch return 0;
         if (nt != null) return 0;
         const ids = srv.connectionsOfUser(srv.gpa, name) catch return 0;
         defer srv.gpa.free(ids);
@@ -562,26 +605,42 @@ pub const Server = struct {
     }
 };
 
-fn defaultServerName(gpa: Allocator) ![]u8 {
-    var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
-    const h = std.posix.gethostname(&buf) catch return gpa.dupe(u8, "ZSMBD");
-    const short = h[0 .. std.mem.indexOfScalar(u8, h, '.') orelse h.len];
-    return gpa.dupe(u8, short[0..@min(short.len, 15)]);
-}
-
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
 
-test "loadConfig reads yes and no as hand-edited text files write them" {
-    var t: conn_mod.TestConn = undefined;
-    try t.init();
-    defer t.deinit();
-    try t.db.setSetting("encrypt", "yes");
-    try t.db.setSetting("signing_required", "No");
-    try t.srv.loadConfig();
-    defer t.srv.cfg.free(testing.allocator);
-    try testing.expect(t.srv.cfg.encrypt and !t.srv.cfg.signing_required);
+test "stop drops the clients and ends their tasks" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var th: host_mod.TestHost = .{ .gpa = gpa };
+    defer th.deinit();
+    var srv: Server = try .init(gpa, io, th.host(), .{ .server_name = "hal9000" });
+    defer srv.deinit();
+    try testing.expectEqualStrings("HAL9000", srv.cfg.server_name);
+    const addr: Io.net.IpAddress = try .parse("127.0.0.1", 0);
+    var listener = try addr.listen(io, .{});
+    defer listener.deinit(io);
+    try srv.start(&listener);
+    try testing.expect(srv.smb_port != 0);
+
+    const client = try listener.socket.address.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+    // Until the server has registered the client.
+    for (0..1000) |_| {
+        srv.lock();
+        const n = srv.conns.items.len;
+        srv.unlock();
+        if (n == 1) break;
+        try io.sleep(.fromMilliseconds(2), .awake);
+    } else return error.TestUnexpectedResult;
+
+    srv.stop();
+    try srv.wait();
+    try testing.expectEqual(@as(usize, 0), srv.conns.items.len);
+    var buf: [1]u8 = undefined;
+    var r = client.reader(io, &buf);
+    try testing.expectError(error.EndOfStream, r.interface.takeByte());
+    try testing.expectError(error.Stopped, srv.adopt(client));
 }
 
 test "the activity view lists connections, sessions, trees, and events" {
@@ -594,7 +653,6 @@ test "the activity view lists connections, sessions, trees, and events" {
     @memcpy(c.peer[0..peer.len], peer);
     c.peer_len = peer.len;
     try t.srv.conns.append(testing.allocator, c);
-    defer t.srv.conns.deinit(testing.allocator);
     t.srv.watchSession(c.id, 7, "hal");
     t.srv.watchTree(c.id, 7, 3, "data", "/srv/data", true);
     t.srv.watchSession(c.id, 8, "");
