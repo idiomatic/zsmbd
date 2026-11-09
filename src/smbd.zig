@@ -31,4 +31,5 @@ test {
     _ = @import("smb/server.zig");
     _ = @import("shared/crypto.zig");
     _ = @import("shared/wire.zig");
+    _ = @import("shared/wire_fuzz.zig");
 }
