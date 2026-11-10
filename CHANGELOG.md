@@ -11,7 +11,7 @@ the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
 - A warning for each guest share while signing is required, since anonymous sessions can't sign.
 - libsmbd: the SMB server as an embeddable Zig module (`smbd`), with a `Host` interface for shares, NT hashes, and logging, and `start`, `adopt`, `stop`, and `wait`. It links no SQLite. zsmbd now uses it, and its tests run in a binary of their own. Guide: [src/smb/README.md](src/smb/README.md).
 - SIGTERM and SIGINT stop `serve` cleanly: SMB clients are dropped with their files closed, the web console stops, the control socket file is removed, and the exit status is 0. A second signal ends it at once.
-- Release downloads: a `vX.Y.Z` tag builds archives of `zsmbd` and libsmbd on each platform's own runner (Linux glibc 2.34+ and musl, x86_64 and aarch64; macOS 13+, Apple silicon and Intel) and publishes them, with checksums, as a GitHub Release.
+- Release downloads: a `vX.Y.Z` tag builds, on each platform's own runner (Linux glibc 2.34+ and musl, x86_64 and aarch64; macOS 13+, Apple silicon and Intel), a `zsmbd` archive with the server and a `zsmbd-dev` archive with libsmbd and its header, and publishes them, with checksums, as a GitHub Release.
 - libsmbd for C: `zig build lib` builds `libsmbd.a` and a shared library with the header `include/smbd.h` (servers, a callback host, listening and adopted sockets, stop, settings, kicks, stats, and the activity JSON), tested from C by `test/c/smoke.c` in `zig build test`. CI builds it on every platform.
 
 ### Fixed

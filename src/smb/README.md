@@ -78,7 +78,8 @@ served in a task of the server's `Io.Group`.
 
 ## From C
 
-`zig build lib` installs `zig-out/lib/libsmbd.a`, the shared library
+Each release's `zsmbd-dev` archive holds the same files, built for its
+platform. `zig build lib` installs `zig-out/lib/libsmbd.a`, the shared library
 (`libsmbd.so` or `libsmbd.dylib`), and `zig-out/include/smbd.h`, which
 documents every function. Link with `-lsmbd`; it needs only libc.
 

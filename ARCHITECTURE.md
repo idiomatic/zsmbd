@@ -1300,12 +1300,18 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
   (x86_64 and aarch64) and macOS, runs the type checks, and fuzzes for 100K
   runs per push and 20M weekly, keeping crashing inputs as artifacts. The
   Linux jobs also run `test/interop/run.sh` in a privileged container.
-- Releases: a `vX.Y.Z` tag that passes those jobs is built into archives
-  (`zsmbd`, libsmbd static and shared, `smbd.h`, README, license, and
-  changelog; ReleaseSafe) on a runner of each platform's own: Fedora for
-  x86_64 and aarch64 glibc, Alpine for musl, and Apple silicon and Intel
-  macOS. Each archive is made by `.github/dist.sh` and smoke-tested with
-  `--version` where it was built. The release job checks that the tag
+- Releases: a `vX.Y.Z` tag that passes those jobs is built (ReleaseSafe)
+  on a runner of each platform's own: Fedora for x86_64 and aarch64 glibc,
+  Alpine for musl, and Apple silicon and Intel macOS. `.github/dist.sh`
+  makes two archives per platform, so servers and embedders each take only
+  what they use: `zsmbd-VERSION-PLATFORM` holds `bin/zsmbd` with the README,
+  license, and changelog; `zsmbd-dev-VERSION-PLATFORM` holds libsmbd
+  (`lib/`, static and shared, and `include/smbd.h`) with the libsmbd guide
+  as its README, the license, and the changelog. Both are smoke-tested
+  where they were built: `zsmbd --version`, and `test/c/smoke.c` compiled
+  with the system C compiler against the packaged `libsmbd.a`, as an
+  embedder would (`zig cc` can't link the glibc-2.34 archive, though `gcc`
+  links it, static and shared, on RHEL 9, Ubuntu 22.04, and Debian 12). The release job checks that the tag
   matches `build.zig.zon`, publishes the archives with a `SHA256SUMS` file,
   and uses the version's CHANGELOG.md section as the notes. Building on
   native runners keeps the system libsqlite3: the glibc builds target glibc

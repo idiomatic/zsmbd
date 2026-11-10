@@ -40,10 +40,13 @@ named streams; durable handles; and Windows ACLs.
 
 Each [release](https://github.com/idiomatic/zsmbd/releases) has archives
 for Linux (x86_64 and aarch64; glibc 2.34 or later, or musl for Alpine) and
-macOS 13 or later (Apple silicon and Intel), with `SHA256SUMS`. Each holds
-`bin/zsmbd`, libsmbd (`lib/`, `include/smbd.h`), and these docs. zsmbd
-needs the system SQLite library: `libsqlite3-0` on Debian and Ubuntu,
-`sqlite-libs` on Fedora, RHEL, and Alpine, and built in on macOS.
+macOS 13 or later (Apple silicon and Intel), with `SHA256SUMS`:
+
+- `zsmbd-VERSION-PLATFORM.tar.gz`: the server, `bin/zsmbd`. It needs the
+  system SQLite library: `libsqlite3-0` on Debian and Ubuntu, `sqlite-libs`
+  on Fedora, RHEL, and Alpine, and built in on macOS.
+- `zsmbd-dev-VERSION-PLATFORM.tar.gz`: libsmbd, for embedding the server
+  in C programs (`lib/`, `include/smbd.h`); it needs only libc.
 
 ## Build
 
