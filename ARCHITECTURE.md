@@ -1297,9 +1297,22 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
   libsmbd's tests for Linux without linking, and builds `libsmbd.a` for it, so Linux-only code paths are verified from a macOS
   development machine.
 - CI (`.github/workflows/ci.yml`) builds and tests on Fedora and Alpine
-  (x86_64 and aarch64) and macOS, runs the type checks, and fuzzes for 500K
+  (x86_64 and aarch64) and macOS, runs the type checks, and fuzzes for 100K
   runs per push and 20M weekly, keeping crashing inputs as artifacts. The
   Linux jobs also run `test/interop/run.sh` in a privileged container.
+- Releases: a `vX.Y.Z` tag that passes those jobs is built into archives
+  (`zsmbd`, libsmbd static and shared, `smbd.h`, README, license, and
+  changelog; ReleaseSafe) on a runner of each platform's own: Fedora for
+  x86_64 and aarch64 glibc, Alpine for musl, and Apple silicon and Intel
+  macOS. Each archive is made by `.github/dist.sh` and smoke-tested with
+  `--version` where it was built. The release job checks that the tag
+  matches `build.zig.zon`, publishes the archives with a `SHA256SUMS` file,
+  and uses the version's CHANGELOG.md section as the notes. Building on
+  native runners keeps the system libsqlite3: the glibc builds target glibc
+  2.34 (RHEL 9, Ubuntu 22.04, Debian 12, and later; checked on all three),
+  and the macOS builds macOS 13. With an explicit target Zig searches no
+  system library paths, so `-Dsqlite-prefix` points at the SQLite to link.
+  The musl archives are for Alpine, whose `sqlite-libs` they need.
 - Interoperability testing uses the real clients. Linux (`smbclient` and the
   kernel's `mount -t cifs` with `vers=3.1.1`) is automated in
   [test/interop](test/interop/README.md); Windows 11 Explorer and `net use`

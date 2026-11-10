@@ -3,6 +3,8 @@
 # coverage-guided fuzz run. The Linux jobs also run the interoperability
 # tests (test/interop), which mount CIFS: each runs in a privileged
 # container on a host that has loaded the cifs module. See SECURITY.md.
+# A vX.Y.Z tag also builds release archives on each platform's own runner
+# and publishes them as a GitHub Release.
 name: CI
 
 on:
@@ -102,3 +104,90 @@ jobs:
           name: fuzz-crashes
           path: .zig-cache/f/
           if-no-files-found: ignore
+
+  # Release archives for a vX.Y.Z tag: each built on a runner of its own
+  # platform once every check above has passed (.github/dist.sh), then
+  # published as a GitHub Release with that version's CHANGELOG.md section.
+  dist-linux:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [fedora, alpine, macos, fuzz]
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: x86_64, libc: gnu, image: "fedora:latest" }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, libc: gnu, image: "fedora:latest" }
+          - { runner: ubuntu-latest, arch: x86_64, libc: musl, image: "alpine:latest" }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, libc: musl, image: "alpine:latest" }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the archive
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e ZIG_VERSION -e LIBC=${{ matrix.libc }} ${{ matrix.image }} sh -euc '
+            if [ "$LIBC" = gnu ]; then
+              dnf install -y -q --setopt=install_weak_deps=False sqlite-devel curl tar xz gzip
+              # Runs on glibc 2.34 or later (RHEL 9, Ubuntu 22.04, Debian 12).
+              # Given a target, zig finds libsqlite3 only where it is told.
+              mkdir -p /tmp/sqlite/lib && ln -s /usr/lib64/libsqlite3.so /tmp/sqlite/lib/
+              set -- -Dtarget="$(uname -m)-linux-gnu.2.34" -Dsqlite-prefix=/tmp/sqlite
+            else
+              apk add --no-cache sqlite-dev curl tar xz
+              set --
+            fi
+            curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /opt
+            export PATH="/opt/zig-$(uname -m)-linux-$ZIG_VERSION:$PATH"
+            sh .github/dist.sh "$(uname -m)-linux-$LIBC" "$@"
+            dist/zsmbd-*/bin/zsmbd --version'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}-linux-${{ matrix.libc }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  dist-macos:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [fedora, alpine, macos, fuzz]
+    strategy:
+      matrix:
+        include:
+          - { runner: macos-latest, arch: aarch64 }
+          - { runner: macos-15-intel, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      # Runs on macOS 13 or later, with the system libsqlite3.
+      - name: Build the archive
+        run: |
+          sh .github/dist.sh ${{ matrix.arch }}-macos -Dtarget=${{ matrix.arch }}-macos.13.0 -Dsqlite-prefix="$(xcrun --show-sdk-path)/usr"
+          dist/zsmbd-*/bin/zsmbd --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}-macos
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [dist-linux, dist-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          grep -q "^ *\.version = \"$v\"," build.zig.zon || { echo "tag $GITHUB_REF_NAME is not the version in build.zig.zon"; exit 1; }
+          awk -v h="## $v " 'index($0, h) == 1 { f = 1; next } /^## / { f = 0 } f' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no $v section"; exit 1; }
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "zsmbd $v" --notes-file notes.md
