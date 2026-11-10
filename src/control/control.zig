@@ -246,7 +246,11 @@ fn acceptLoop(l: *Listener) void {
             if (e != error.Canceled) std.log.warn("control accept: {s}", .{@errorName(e)});
             return;
         };
+        // Only `accept` may see `stop`'s cancel: one landing in serveOne
+        // would be swallowed there, and the next accept would block for good.
+        const old = l.io.swapCancelProtection(.blocked);
         serveOne(l, stream);
+        _ = l.io.swapCancelProtection(old);
     }
 }
 
