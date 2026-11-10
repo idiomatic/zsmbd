@@ -565,8 +565,8 @@ layer of `export` functions over `smbd.Server`, with a hand-written header,
   `Server.stop`), and `smbd_listen` after it is `SMBD_ESTOPPED`.
 
 The interface is unstable before 1.0; `smbd_version` reports the release.
-The shared library carries the package version (`libsmbd.0.1.1.dylib` and
-its links).
+The shared library carries the package version (for 0.2.0, `libsmbd.0.2.0.dylib`
+and its links).
 
 ### Open-file nodes
 

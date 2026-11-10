@@ -14,10 +14,11 @@ It has four settings, all with working defaults.
 >
 > Significant portions of this code have been authored by AI.
 
-> **Status:** early. macOS 15 mounts and reads a share. CI builds and tests
-> on Fedora and Alpine (x86_64 and aarch64) and macOS, and fuzzes the
-> parsers, but no Linux or Windows client has connected yet, and the web
-> console is minimal. See [ARCHITECTURE.md](ARCHITECTURE.md) section 13.
+> **Status:** early. Linux clients (`smbclient` and the kernel CIFS client)
+> pass automated interoperability tests, and macOS `mount_smbfs` mounts,
+> reads, and writes a share. CI builds and tests on Fedora and Alpine
+> (x86_64 and aarch64) and macOS, and fuzzes the parsers, but no Windows
+> client has connected yet, and the web console is minimal. See [ARCHITECTURE.md](ARCHITECTURE.md) section 13.
 
 ## Features
 

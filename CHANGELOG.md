@@ -3,6 +3,26 @@
 All notable changes to zsmbd. Versions follow [Semantic Versioning](https://semver.org/);
 the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
 
+## 0.2.0 (2026-11-10)
+
+### Added
+- Linux interoperability tests (`test/interop`): `smbclient` and the kernel CIFS client against a running server, run by the Fedora and Alpine CI jobs.
+- `share readwrite --kick` and `share guest --kick` (the control socket's `share-kick`, and a `kick` field in the console's share `PUT`) drop, once, the clients still acting on the old rules after a relaxing change; the console offers it.
+- A warning for each guest share while signing is required, since anonymous sessions can't sign.
+- libsmbd: the SMB server as an embeddable Zig module (`smbd`), with a `Host` interface for shares, NT hashes, and logging, and `start`, `adopt`, `stop`, and `wait`. It links no SQLite. zsmbd now uses it, and its tests run in a binary of their own. Guide: [src/smb/README.md](src/smb/README.md).
+- SIGTERM and SIGINT stop `serve` cleanly: SMB clients are dropped with their files closed, the web console stops, the control socket file is removed, and the exit status is 0. A second signal ends it at once.
+- libsmbd for C: `zig build lib` builds `libsmbd.a` and a shared library with the header `include/smbd.h` (servers, a callback host, listening and adopted sockets, stop, settings, kicks, stats, and the activity JSON), tested from C by `test/c/smoke.c` in `zig build test`. CI builds it on every platform.
+
+### Fixed
+- The control socket's accept thread outlived its listener, and a request arriving as the listener was freed could crash (seen in the unit tests). `Listener.stop` now cancels the loop before freeing the listener.
+- `ls -l` on a Linux kernel CIFS mount failed with an I/O error: a query for extended attributes now answers "none" (`STATUS_NO_EAS_ON_FILE`) instead of an invalid-class error.
+- A directory removed through the Linux kernel client could survive, and then block its parent's removal: the client's open, set-info, close compound leaked its handle when the directory was not empty. A related CLOSE after a failure now still releases the handle.
+
+### Changed
+- The specifications and their index moved to `docs/specifications/` (`REFERENCES.md` is now its `README.md`).
+- AES-128-GCM and the preauth hash chain moved into `shared/crypto.zig` as thin wrappers over `std`, so every SMB primitive lives in one module.
+- ARCHITECTURE.md's process overview is an SVG instead of ASCII art, and shows the control socket.
+
 ## 0.1.1 (2026-11-02)
 
 ### Fixed
