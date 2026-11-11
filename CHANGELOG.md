@@ -3,6 +3,11 @@
 All notable changes to zsmbd. Versions follow [Semantic Versioning](https://semver.org/);
 the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
 
+## 0.2.2 (2026-11-11)
+
+### Fixed
+- A filesystem mounted inside a share (such as a child ZFS dataset) could be missing from macOS directory listings: 64-bit file IDs were inode numbers alone, so its root collided with its parent's. IDs on other devices than the share root's are now a hash of device and inode with the top bit set; IDs on the root's device are unchanged.
+
 ## 0.2.1 (2026-11-11)
 
 ### Added

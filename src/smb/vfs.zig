@@ -106,10 +106,24 @@ pub const Info = struct {
         return a;
     }
 
-    pub fn fileId(i: Info) u64 {
-        return i.ino;
+    /// The 64-bit SMB file ID: the inode number on the share root's
+    /// device (`root_dev`), and for a filesystem mounted inside the share,
+    /// a fixed hash of device and inode with the top bit set, so that IDs
+    /// stay unique and stable across mounts.
+    pub fn fileId(i: Info, root_dev: u64) u64 {
+        if (i.dev == root_dev) return i.ino;
+        return (1 << 63) | (mix(i.dev ^ mix(i.ino)) >> 1);
     }
 };
+
+/// SplitMix64's finalizer; fixed here so that file IDs never change with
+/// the standard library's hashes.
+fn mix(x: u64) u64 {
+    var z = x +% 0x9E3779B97F4A7C15;
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+    return z ^ (z >> 31);
+}
 
 fn ts(sec: anytype, nsec: anytype) u64 {
     return proto.unixToNt(@intCast(sec), @intCast(nsec));
@@ -665,6 +679,21 @@ test "chmodPath changes a regular file's mode" {
     const gone = try std.fmt.allocPrintSentinel(gpa, "{s}/gone.txt", .{dir}, 0);
     defer gpa.free(gone);
     try std.testing.expectError(error.NotFound, chmodPath(gone, 0o644));
+}
+
+test "file IDs stay unique across nested mounts" {
+    var a = std.mem.zeroes(Info);
+    a.dev = 25;
+    a.ino = 34;
+    var b = a;
+    b.dev = 26;
+    try std.testing.expectEqual(@as(u64, 34), a.fileId(25));
+    try std.testing.expect(b.fileId(25) != a.fileId(25));
+    try std.testing.expect(b.fileId(25) >> 63 == 1);
+    try std.testing.expectEqual(b.fileId(25), b.fileId(25));
+    var d = b;
+    d.ino = 35;
+    try std.testing.expect(d.fileId(25) != b.fileId(25));
 }
 
 test "wildcards" {

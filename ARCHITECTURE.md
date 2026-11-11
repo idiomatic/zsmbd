@@ -975,7 +975,12 @@ The rest of `vfs.zig` is a thin errno-to-error layer over POSIX calls (open,
 error to the NTSTATUS clients expect. File times are converted between Unix
 and NT (100-nanosecond intervals since 1601) in `proto.zig`. Attributes are
 derived: directory, read-only (no owner write bit), hidden (name starts with
-a dot), and archive or normal for regular files. File IDs are inode numbers.
+a dot), and archive or normal for regular files. A 64-bit file ID is the
+inode number on the share root's device (kept in the tree at tree connect);
+on a filesystem mounted inside the share, it is a fixed hash of device and
+inode with the top bit set, so nested mounts (such as a child ZFS dataset,
+whose root has the same inode as its parent's) don't collide. The 128-bit
+ID of the `QFid` create context is device and inode.
 
 There is a known residual race: a local process on the host could swap a
 directory for a symlink between resolution and open. zsmbd assumes the

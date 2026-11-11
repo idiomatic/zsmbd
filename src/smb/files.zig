@@ -818,7 +818,7 @@ fn dirEntryFixed(class: u8) ?usize {
     };
 }
 
-fn dirEntry(out: *Buf, class: u8, name: []const u8, i: vfs.Info) !void {
+fn dirEntry(out: *Buf, class: u8, name: []const u8, i: vfs.Info, root_dev: u64) !void {
     const name_len: u32 = @intCast(wire.utf16Len(name));
     try out.u32_(0); // NextEntryOffset (patched)
     try out.u32_(0); // FileIndex
@@ -842,12 +842,12 @@ fn dirEntry(out: *Buf, class: u8, name: []const u8, i: vfs.Info) !void {
         FileInfo.id_both_directory => {
             try out.u32_(0);
             try out.zeros(28); // ShortNameLength, Reserved1, ShortName, Reserved2
-            try out.u64_(i.fileId());
+            try out.u64_(i.fileId(root_dev));
         },
         FileInfo.id_full_directory => {
             try out.u32_(0);
             try out.u32_(0);
-            try out.u64_(i.fileId());
+            try out.u64_(i.fileId(root_dev));
         },
         else => {},
     }
@@ -932,7 +932,7 @@ fn queryDirectory(ctx: *Ctx, msg: []const u8, b: []const u8, out: *Buf) !Reply {
         try out.zeros(pad);
         const at = out.len();
         if (last) |l| out.set32(l, @intCast(at - l));
-        try dirEntry(out, class, name, info);
+        try dirEntry(out, class, name, info, ctx.tree.dev);
         last = at;
         o.dir_pos += 1;
         o.dir_any = true;
@@ -1037,7 +1037,7 @@ fn queryFile(ctx: *Ctx, o: *Open, class: u8, out: *Buf) !?u32 {
             try out.u32_(0);
         },
         FileInfo.standard => try standardInfo(out, i, pending),
-        FileInfo.internal => try out.u64_(i.fileId()),
+        FileInfo.internal => try out.u64_(i.fileId(ctx.tree.dev)),
         FileInfo.ea, FileInfo.alignment => try out.u32_(0),
         FileInfo.access => try out.u32_(o.access),
         FileInfo.position => try out.u64_(o.position),
@@ -1047,7 +1047,7 @@ fn queryFile(ctx: *Ctx, o: *Open, class: u8, out: *Buf) !?u32 {
             try out.u32_(attrs);
             try out.u32_(0);
             try standardInfo(out, i, pending);
-            try out.u64_(i.fileId());
+            try out.u64_(i.fileId(ctx.tree.dev));
             try out.u32_(0); // EaSize
             try out.u32_(o.access);
             try out.u64_(o.position);
@@ -1473,6 +1473,8 @@ const Fixture = struct {
         errdefer f.tmp.cleanup();
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const n = try f.tmp.dir.realPath(testing.io, &buf);
+        const root = try gpa.dupeSentinel(u8, buf[0..n], 0);
+        errdefer gpa.free(root);
         f.host = .{ .gpa = gpa };
         f.srv = try .init(gpa, testing.io, f.host.host(), .{ .server_name = "" });
         f.conn = try gpa.create(Conn);
@@ -1482,7 +1484,8 @@ const Fixture = struct {
             .id = 3,
             .session_id = 7,
             .share = @constCast("data"),
-            .root = try gpa.dupeSentinel(u8, buf[0..n], 0),
+            .root = root,
+            .dev = (try vfs.statPath(root)).dev,
             .ipc = false,
             .read_only = false,
             .connected_ms = 0,

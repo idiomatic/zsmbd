@@ -55,6 +55,8 @@ pub const Tree = struct {
     session_id: u64,
     share: []u8,
     root: [:0]u8,
+    /// The device of `root`; file IDs on other devices are hashed.
+    dev: u64,
     ipc: bool,
     read_only: bool,
     connected_ms: i64,
@@ -921,6 +923,7 @@ pub const TestConn = struct {
             .session_id = 7,
             .share = try gpa.dupe(u8, "IPC$"),
             .root = try gpa.dupeSentinel(u8, "/", 0),
+            .dev = 0,
             .ipc = true,
             .read_only = true,
             .connected_ms = 0,

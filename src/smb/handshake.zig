@@ -421,6 +421,7 @@ pub fn treeConnect(c: *Conn, s: *Session, msg: []const u8, out: *Buf) !TreeOutco
     const ipc = vfs.eqlFold(name, "IPC$");
     var share_name: []u8 = undefined;
     var root: [:0]u8 = undefined;
+    var dev: u64 = 0;
     var read_only = true;
     // The share's configured path, kept for the activity view and for
     // noticing that the share has since changed.
@@ -449,6 +450,7 @@ pub fn treeConnect(c: *Conn, s: *Session, msg: []const u8, out: *Buf) !TreeOutco
         errdefer gpa.free(root);
         const info = vfs.statPath(root) catch return .{ .status = Status.bad_network_name };
         if (!info.isDir()) return .{ .status = Status.bad_network_name };
+        dev = info.dev;
         share_name = try gpa.dupe(u8, sh.name);
         errdefer gpa.free(share_name);
         configured = try gpa.dupe(u8, sh.path);
@@ -465,6 +467,7 @@ pub fn treeConnect(c: *Conn, s: *Session, msg: []const u8, out: *Buf) !TreeOutco
         .session_id = s.id,
         .share = share_name,
         .root = root,
+        .dev = dev,
         .ipc = ipc,
         .read_only = read_only,
         .connected_ms = c.srv.nowMs(),
