@@ -118,9 +118,10 @@ exercises all of it.
 Signing and encryption use AES, and Zig's `std.crypto` chooses hardware
 or software AES when it compiles, from the target CPU. A build for a
 generic CPU (`-Dtarget` without `-Dcpu`, so `generic` on aarch64 and
-`x86_64` on x86_64) uses software AES: in one test, a signed 64 MiB write
-from macOS ran at 2.3 MB/s on an aarch64 Linux guest, against 58 MB/s
-with `-Dcpu=apple_m1`. A native build (no `-Dtarget`) is fast. When
+`x86_64` on x86_64) uses software AES: in one test, signed writes to an
+aarch64 Linux (musl) guest ran at about 20 MB/s with a baseline-CPU
+ReleaseSafe build, against 290–356 MB/s with the 0.2.1 release archive.
+A native build (no `-Dtarget`) is fast. When
 cross-compiling, name a CPU with AES:
 
 | Architecture | `-Dcpu` |
