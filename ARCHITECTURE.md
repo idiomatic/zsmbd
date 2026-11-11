@@ -566,7 +566,7 @@ layer of `export` functions over `smbd.Server`, with a hand-written header,
 
 The interface is unstable before 1.0; `smbd_version` reports the release,
 and `smbd_hardware_aes` whether the build has hardware AES.
-The shared library carries the package version (for 0.2.0, `libsmbd.0.2.0.dylib`
+The shared library carries the package version (for 0.2.1, `libsmbd.0.2.1.dylib`
 and its links).
 
 ### Open-file nodes

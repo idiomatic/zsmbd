@@ -3,6 +3,15 @@
 All notable changes to zsmbd. Versions follow [Semantic Versioning](https://semver.org/);
 the version lives in `build.zig.zon`, and each release is tagged `vX.Y.Z`.
 
+## 0.2.1 (2026-11-11)
+
+### Added
+- `zsmbt` (`zig build torture`, `test/torture`): a protocol test client for SMB 3.1.1 servers, with its own encoders and the `negotiate`, `session`, and `tcon` suites; it starts a `zsmbd` or tests one given with `--target` and `--profile`.
+- `smbd.hardware_aes` and `smbd_hardware_aes()` tell an embedder whether libsmbd was built with AES instructions, and `serve` warns when zsmbd wasn't.
+
+### Fixed
+- Release archives are built for CPUs with AES instructions (`-Dcpu`): AES-NI and AVX on x86_64, the Crypto Extension on aarch64, and `apple_m1` on Apple silicon. The glibc and Intel macOS archives were built for generic CPUs, so SMB signing and encryption used software AES and ran about 25 times slower. The musl archives were built for the CI runner's own CPU.
+
 ## 0.2.0 (2026-11-10)
 
 ### Added
