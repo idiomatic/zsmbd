@@ -119,19 +119,23 @@ jobs:
   dist-linux:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [fedora, alpine, macos, fuzz]
+    # Each archive names a CPU with hardware AES, which SMB signing and
+    # encryption need to be fast (std.crypto picks its AES at compile time,
+    # and on x86_64 it uses AES-NI only with AVX): x86_64 from Sandy Bridge
+    # and Bulldozer on, and aarch64 with the Crypto Extension.
     strategy:
       matrix:
         include:
-          - { runner: ubuntu-latest, arch: x86_64, libc: gnu, image: "fedora:latest" }
-          - { runner: ubuntu-24.04-arm, arch: aarch64, libc: gnu, image: "fedora:latest" }
-          - { runner: ubuntu-latest, arch: x86_64, libc: musl, image: "alpine:latest" }
-          - { runner: ubuntu-24.04-arm, arch: aarch64, libc: musl, image: "alpine:latest" }
+          - { runner: ubuntu-latest, arch: x86_64, libc: gnu, image: "fedora:latest", cpu: "x86_64_v2+aes+avx+pclmul" }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, libc: gnu, image: "fedora:latest", cpu: "generic+aes+sha2" }
+          - { runner: ubuntu-latest, arch: x86_64, libc: musl, image: "alpine:latest", cpu: "x86_64_v2+aes+avx+pclmul" }
+          - { runner: ubuntu-24.04-arm, arch: aarch64, libc: musl, image: "alpine:latest", cpu: "generic+aes+sha2" }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - name: Build the archive
         run: |
-          docker run --rm -v "$PWD:/src" -w /src -e ZIG_VERSION -e LIBC=${{ matrix.libc }} ${{ matrix.image }} sh -euc '
+          docker run --rm -v "$PWD:/src" -w /src -e ZIG_VERSION -e LIBC=${{ matrix.libc }} -e CPU=${{ matrix.cpu }} ${{ matrix.image }} sh -euc '
             if [ "$LIBC" = gnu ]; then
               dnf install -y -q --setopt=install_weak_deps=False sqlite-devel curl tar xz gzip gcc
               # Runs on glibc 2.34 or later (RHEL 9, Ubuntu 22.04, Debian 12).
@@ -139,12 +143,13 @@ jobs:
               mkdir -p /tmp/sqlite/lib && ln -s /usr/lib64/libsqlite3.so /tmp/sqlite/lib/
               set -- -Dtarget="$(uname -m)-linux-gnu.2.34" -Dsqlite-prefix=/tmp/sqlite
             else
+              # The native OS and ABI, so zig finds libsqlite3 itself.
               apk add --no-cache sqlite-dev curl tar xz gcc musl-dev
               set --
             fi
             curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-$(uname -m)-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C /opt
             export PATH="/opt/zig-$(uname -m)-linux-$ZIG_VERSION:$PATH"
-            sh .github/dist.sh "$(uname -m)-linux-$LIBC" "$@"'
+            sh .github/dist.sh "$(uname -m)-linux-$LIBC" "$@" -Dcpu="$CPU"'
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.arch }}-linux-${{ matrix.libc }}
@@ -157,8 +162,10 @@ jobs:
     strategy:
       matrix:
         include:
-          - { runner: macos-latest, arch: aarch64 }
-          - { runner: macos-15-intel, arch: x86_64 }
+          # aarch64-macos defaults to apple_m1; x86_64-macos to core2,
+          # without AES-NI. Every Intel Mac macOS 13 runs on has AVX2.
+          - { runner: macos-latest, arch: aarch64, cpu: apple_m1 }
+          - { runner: macos-15-intel, arch: x86_64, cpu: "x86_64_v3+aes+pclmul" }
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -168,7 +175,7 @@ jobs:
       # Runs on macOS 13 or later, with the system libsqlite3.
       - name: Build the archive
         run: |
-          sh .github/dist.sh ${{ matrix.arch }}-macos -Dtarget=${{ matrix.arch }}-macos.13.0 -Dsqlite-prefix="$(xcrun --show-sdk-path)/usr"
+          sh .github/dist.sh ${{ matrix.arch }}-macos -Dtarget=${{ matrix.arch }}-macos.13.0 -Dcpu=${{ matrix.cpu }} -Dsqlite-prefix="$(xcrun --show-sdk-path)/usr"
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.arch }}-macos

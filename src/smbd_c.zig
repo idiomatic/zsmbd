@@ -165,6 +165,10 @@ export fn smbd_version() [*:0]const u8 {
     return @import("build_options").version ++ "";
 }
 
+export fn smbd_hardware_aes() c_int {
+    return @intFromBool(smbd.hardware_aes);
+}
+
 export fn smbd_strerror(err: c_int) [*:0]const u8 {
     return switch (err) {
         OK => "success",

@@ -455,6 +455,7 @@ fn serve(c: *Cli) !void {
     };
     defer listener.deinit(c.io);
     std.log.info("zsmbd: SMB on {f} as {s}", .{ saddr, srv.cfg.server_name });
+    if (!smbd.hardware_aes) std.log.warn("this build has no AES instructions (CPU {s}), so signing and encryption are slow; if this CPU has them, rebuild with -Dcpu=native", .{@import("builtin").cpu.model.name});
 
     var admin: web.Admin = undefined;
     var sv: Serving = .{ .c = c, .srv = &srv, .admin = &admin };

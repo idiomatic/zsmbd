@@ -20,6 +20,7 @@
 * Untrusted input and secrets are mapped in [SECURITY.md](SECURITY.md); every new parser of untrusted input gets a fuzz target (`src/shared/fuzz.zig`) and a row there; each fuzz target is in one test binary only (a `shared/` one goes in a file only `smbd.zig` imports, like `shared/wire_fuzz.zig`).
 * CI: `.github/workflows/ci.yml` (Fedora, Alpine, macOS; type checks; fuzzing; Linux interoperability tests, [test/interop/](test/interop/README.md); `zsmbt`; a `vX.Y.Z` tag also builds, on each platform's own runner (`.github/dist.sh`), a `zsmbd` archive (the server) and a `zsmbd-dev` archive (libsmbd and `smbd.h`) and publishes a GitHub Release with its CHANGELOG.md section).
 * Specifications used are copied to `docs/specifications/` and indexed in its [README.md](docs/specifications/README.md); add new ones there.
+* Release builds name a CPU with hardware AES (`-Dcpu`, per target in `ci.yml`); `serve` warns when a build has none.
 * Only external library: system libsqlite3, through hand-written `extern` declarations.
 
 ## Decisions

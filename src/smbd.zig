@@ -19,6 +19,10 @@ pub const Error = host.Error;
 pub const freeShares = host.freeShares;
 /// NT hash of a password, as `Host.ntHash` returns it.
 pub const ntHash = @import("shared/crypto.zig").ntHash;
+/// Whether this build uses AES instructions; without them (as for the
+/// generic aarch64 and x86_64 CPUs) signing and encryption are far slower.
+/// Build for a CPU with them (`-Dcpu`) where it has them.
+pub const hardware_aes = @import("std").crypto.core.aes.has_hardware_support;
 
 test {
     _ = @import("smb/rpc.zig");

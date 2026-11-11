@@ -113,6 +113,29 @@ server exists, libsmbd installs do-nothing SIGIO and SIGPIPE handlers. The
 C interface is unstable before 1.0. [test/c/smoke.c](../../test/c/smoke.c)
 exercises all of it.
 
+## Performance
+
+Signing and encryption use AES, and Zig's `std.crypto` chooses hardware
+or software AES when it compiles, from the target CPU. A build for a
+generic CPU (`-Dtarget` without `-Dcpu`, so `generic` on aarch64 and
+`x86_64` on x86_64) uses software AES: in one test, a signed 64 MiB write
+from macOS ran at 2.3 MB/s on an aarch64 Linux guest, against 58 MB/s
+with `-Dcpu=apple_m1`. A native build (no `-Dtarget`) is fast. When
+cross-compiling, name a CPU with AES:
+
+| Architecture | `-Dcpu` |
+|---|---|
+| aarch64 (Crypto Extension) | `generic+aes+sha2` |
+| x86_64 (AES-NI and AVX) | `x86_64_v2+aes+avx+pclmul` |
+
+On x86_64, `std.crypto` uses AES-NI only with AVX, so `+aes` alone is not
+enough, and `x86_64_v3` has no AES. Some CPUs have no AES instructions,
+such as the Raspberry Pi 4's, and a build that assumes them stops there
+with an illegal instruction; build for those with `-Dcpu=native`.
+`smbd.hardware_aes` (in C, `smbd_hardware_aes()`) reports whether a build
+has hardware AES. The release archives name the CPUs above (`apple_m1`
+and `x86_64_v3+aes+pclmul` on macOS).
+
 ## Limits
 
 Only POSIX directories on Linux and macOS can be served; there is no

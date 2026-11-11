@@ -102,6 +102,7 @@ int main(void) {
     CHECK(smbd_nt_hash("password", h) == SMBD_OK);
     CHECK(h[0] == 0x88 && h[1] == 0x46 && h[15] == 0x6c);
     CHECK(smbd_version()[0] != '\0');
+    CHECK(smbd_hardware_aes() == 0 || smbd_hardware_aes() == 1);
     CHECK(strcmp(smbd_strerror(SMBD_EINVAL),
                  "invalid argument") == 0);
 

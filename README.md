@@ -40,7 +40,10 @@ named streams; durable handles; and Windows ACLs.
 
 Each [release](https://github.com/idiomatic/zsmbd/releases) has archives
 for Linux (x86_64 and aarch64; glibc 2.34 or later, or musl for Alpine) and
-macOS 13 or later (Apple silicon and Intel), with `SHA256SUMS`:
+macOS 13 or later (Apple silicon and Intel), with `SHA256SUMS`. The Linux
+archives need AES instructions: AES-NI and AVX on x86_64 (Sandy Bridge,
+Bulldozer, or later), or the Crypto Extension on aarch64 (not the
+Raspberry Pi 4, for instance); on other CPUs, build from source.
 
 - `zsmbd-VERSION-PLATFORM.tar.gz`: the server, `bin/zsmbd`. It needs the
   system SQLite library: `libsqlite3-0` on Debian and Ubuntu, `sqlite-libs`
@@ -64,6 +67,11 @@ programs (`zig-out/lib`, `zig-out/include/smbd.h`). Run the unit tests with:
 ```bash
 zig build test
 ```
+
+A native build uses the CPU's AES instructions. When cross-compiling
+with `-Dtarget`, also give a CPU with them, or SMB signing and encryption
+run many times slower; `serve` warns about such a build. The CPUs to
+name are in the [libsmbd guide](src/smb/README.md#performance).
 
 ## Quick start
 

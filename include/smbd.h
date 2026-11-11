@@ -105,6 +105,10 @@ typedef struct smbd_stats {
 const char *smbd_version(void);
 const char *smbd_strerror(int err);
 
+/* 1 if this build uses AES instructions, else 0: signing and
+   encryption are then far slower (see the guide's Performance). */
+int smbd_hardware_aes(void);
+
 /* Defaults: name "SMBD", "WORKGROUP", signing required, no
    encryption. */
 void smbd_config_init(smbd_config *config);

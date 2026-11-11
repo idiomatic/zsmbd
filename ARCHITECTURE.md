@@ -564,7 +564,8 @@ layer of `export` functions over `smbd.Server`, with a hand-written header,
 - **Stopping** is idempotent in C (`smbd_stop` swaps a flag before calling
   `Server.stop`), and `smbd_listen` after it is `SMBD_ESTOPPED`.
 
-The interface is unstable before 1.0; `smbd_version` reports the release.
+The interface is unstable before 1.0; `smbd_version` reports the release,
+and `smbd_hardware_aes` whether the build has hardware AES.
 The shared library carries the package version (for 0.2.0, `libsmbd.0.2.0.dylib`
 and its links).
 
@@ -1319,6 +1320,14 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
   and the macOS builds macOS 13. With an explicit target Zig searches no
   system library paths, so `-Dsqlite-prefix` points at the SQLite to link.
   The musl archives are for Alpine, whose `sqlite-libs` they need.
+  Each release names a CPU (`-Dcpu`) with hardware AES, since `std.crypto`
+  picks hardware or software AES at compile time and software AES makes
+  signing about 25 times slower: `generic+aes+sha2` on aarch64 Linux,
+  `x86_64_v2+aes+avx+pclmul` on x86_64 Linux (AES-NI is used only with
+  AVX), `apple_m1`, and `x86_64_v3+aes+pclmul` on macOS (every Intel Mac
+  macOS 13 supports). The musl builds keep the native OS and ABI, so Zig
+  still finds libsqlite3. CPUs without AES instructions need a build from
+  source; `serve` warns when its build has no hardware AES.
 - `zsmbt` (`zig build torture`, [test/torture](test/torture/README.md)) is a
   protocol test client: it speaks SMB 3.1.1 over TCP, with its own encoders
   (it shares only `smb/proto.zig` and `shared/crypto.zig`), and checks the
