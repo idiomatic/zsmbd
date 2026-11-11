@@ -51,4 +51,4 @@
 * Any web login may be deleted or lose its password, the last included; the console then stops (after replying) and ends the user's sessions, whether the change came from the console or the control socket. `web start` brings it back, making `admin` first if no web login exists (its password is in the reply).
 
 ## Status
-* See [ARCHITECTURE.md](ARCHITECTURE.md) section 13. Next: interoperability tests with Windows and macOS clients, then the browser UI.
+* See [ARCHITECTURE.md](ARCHITECTURE.md) section 13. Next: interoperability tests with a macOS client VM (Windows 11 tried by hand), then the browser UI.

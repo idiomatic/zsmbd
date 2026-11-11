@@ -17,8 +17,9 @@ It has four settings, all with working defaults.
 > **Status:** early. Linux clients (`smbclient` and the kernel CIFS client)
 > pass automated interoperability tests, and macOS `mount_smbfs` mounts,
 > reads, and writes a share. CI builds and tests on Fedora and Alpine
-> (x86_64 and aarch64) and macOS, and fuzzes the parsers, but no Windows
-> client has connected yet, and the web console is minimal. See [ARCHITECTURE.md](ARCHITECTURE.md) section 13.
+> (x86_64 and aarch64) and macOS, and fuzzes the parsers. Windows 11
+> (build 26300) maps, browses, and edits shares, tried by hand; the web
+> console is minimal. See [ARCHITECTURE.md](ARCHITECTURE.md) section 13.
 
 ## Features
 
