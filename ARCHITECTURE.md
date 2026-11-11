@@ -1319,6 +1319,12 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
   and the macOS builds macOS 13. With an explicit target Zig searches no
   system library paths, so `-Dsqlite-prefix` points at the SQLite to link.
   The musl archives are for Alpine, whose `sqlite-libs` they need.
+- `zsmbt` (`zig build torture`, [test/torture](test/torture/README.md)) is a
+  protocol test client: it speaks SMB 3.1.1 over TCP, with its own encoders
+  (it shares only `smb/proto.zig` and `shared/crypto.zig`), and checks the
+  replies of a `zsmbd` it starts or of a server given with `--target` and a
+  `--profile`. Suites: `negotiate`, `session`, and `tcon`. CI runs it on
+  every job.
 - Interoperability testing uses the real clients. Linux (`smbclient` and the
   kernel's `mount -t cifs` with `vers=3.1.1`) is automated in
   [test/interop](test/interop/README.md); Windows 11 Explorer and `net use`
@@ -1344,6 +1350,7 @@ Supported build targets are macOS and Linux on x86_64 and aarch64.
 | `web.Live` over `server.Server` | Written: activity, kick, and settings reload, with unit tests and a live run (a raw TCP client listed, kicked, and gone; a settings save reloaded), and a macOS `mount_smbfs` session and tree appeared and vanished on unmount. |
 | `web/index.html` | Sign-in and SMB password form; the rest is still to come. |
 | Linux interop | `test/interop/run.sh` passes on Fedora and Alpine (aarch64, checked locally): `smbclient` and the kernel CIFS client, with signing, encryption, guests, and the control socket. It found, and now guards, two kernel-client bugs. |
+| `zsmbt` | `test/torture`: the client, runner, and the `negotiate`, `session`, and `tcon` suites (26 tests, passing); a changed server status fails the matching test. File operations, raw mode, encryption, and hostile input are still to come. |
 | CI | Build, unit tests, Linux type checks, a coverage-guided fuzz run, and the Linux interop tests, on Fedora and Alpine (x86_64 and aarch64) and macOS. The interop tests have not yet run on the GitHub runners. Windows clients are untested. |
 
 Planned order of work:

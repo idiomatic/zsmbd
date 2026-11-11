@@ -93,12 +93,27 @@ pub fn build(b: *std.Build) void {
     c_test.root_module.addIncludePath(b.path("include"));
     c_test.root_module.linkLibrary(lib_static);
 
+    // zsmbt, the protocol test tool (test/torture). It shares only the
+    // protocol constants and the crypto primitives with the server.
+    const torture_mod = b.createModule(.{
+        .root_source_file = b.path("test/torture/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    torture_mod.addImport("proto", b.createModule(.{ .root_source_file = b.path("src/smb/proto.zig") }));
+    torture_mod.addImport("crypto", b.createModule(.{ .root_source_file = b.path("src/shared/crypto.zig") }));
+    const zsmbt = b.addExecutable(.{ .name = "zsmbt", .root_module = torture_mod });
+    const torture_step = b.step("torture", "Build zsmbt, the protocol test tool");
+    torture_step.dependOn(&b.addInstallArtifact(zsmbt, .{}).step);
+
     const tests = b.addTest(.{ .root_module = mod });
     tests.linker_allow_shlib_undefined = true;
     const smbd_tests = b.addTest(.{ .root_module = smbd });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
     test_step.dependOn(&b.addRunArtifact(smbd_tests).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = torture_mod })).step);
     test_step.dependOn(&b.addRunArtifact(c_test).step);
 
     // Compile-only check for other targets (no linking, so no sqlite needed):
@@ -117,5 +132,6 @@ pub fn build(b: *std.Build) void {
     const check_tests = b.addTest(.{ .root_module = check_mod });
     check_step.dependOn(&check_tests.step);
     check_step.dependOn(&b.addTest(.{ .root_module = smbd }).step);
+    check_step.dependOn(&zsmbt.step);
     check_step.dependOn(&lib_static.step);
 }

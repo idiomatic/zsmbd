@@ -38,6 +38,8 @@ jobs:
             zig build test --summary all
             zig build
             zig build lib
+            zig build torture
+            zig-out/bin/zsmbt --server zig-out/bin/zsmbd
             INTEROP_REQUIRE_KERNEL=1 sh test/interop/run.sh'
 
   alpine:
@@ -60,6 +62,8 @@ jobs:
             zig build test --summary all
             zig build
             zig build lib
+            zig build torture
+            zig-out/bin/zsmbt --server zig-out/bin/zsmbd
             INTEROP_REQUIRE_KERNEL=1 sh test/interop/run.sh'
 
   macos:
@@ -72,6 +76,8 @@ jobs:
       - run: zig build test --summary all
       - run: zig build
       - run: zig build lib
+      - run: zig build torture
+      - run: zig-out/bin/zsmbt --server zig-out/bin/zsmbd
       - name: Linux type checks
         run: |
           zig build check -Dtarget=x86_64-linux-gnu

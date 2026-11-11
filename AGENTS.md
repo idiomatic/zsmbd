@@ -12,12 +12,13 @@
 
 ## Build
 * `zig build` makes `zsmbd`; `zig build lib` makes libsmbd for C (`libsmbd.a`, the shared library, `smbd.h`); `zig build test` runs the unit tests (zsmbd's, and libsmbd's in a binary without SQLite) and the C test, `test/c/smoke.c`.
+* `zig build torture` makes `zsmbt`, the protocol test client ([test/torture/](test/torture/README.md)); it imports only `smb/proto.zig` and `shared/crypto.zig`, its self-tests run in `zig build test`, and `zsmbt --server zig-out/bin/zsmbd` runs it against a `zsmbd` of its own. `--target` requires `--profile` (zsmbd, samba, windows), so results say what they were judged against.
 * Local databases, logs, and test shares go in `var/` (git-ignored), e.g. `--db var/zsmbd.db`.
 * Version: semantic, in `build.zig.zon` only (code reads `build_options.version`); releases get a CHANGELOG.md section and a `vX.Y.Z` tag.
 * `zig build check -Dtarget=x86_64-linux-gnu` (and `aarch64-linux-gnu`) type-checks main and both test binaries for Linux.
 * Components (`src/` folders) depend one way: main → cli → web, control, policy, smbd; web → policy → store → shared; smbd (`smb/`) → shared only; `web/`, `control/`, and `policy/` never import `smb/`.
 * Untrusted input and secrets are mapped in [SECURITY.md](SECURITY.md); every new parser of untrusted input gets a fuzz target (`src/shared/fuzz.zig`) and a row there; each fuzz target is in one test binary only (a `shared/` one goes in a file only `smbd.zig` imports, like `shared/wire_fuzz.zig`).
-* CI: `.github/workflows/ci.yml` (Fedora, Alpine, macOS; type checks; fuzzing; Linux interoperability tests, [test/interop/](test/interop/README.md); a `vX.Y.Z` tag also builds, on each platform's own runner (`.github/dist.sh`), a `zsmbd` archive (the server) and a `zsmbd-dev` archive (libsmbd and `smbd.h`) and publishes a GitHub Release with its CHANGELOG.md section).
+* CI: `.github/workflows/ci.yml` (Fedora, Alpine, macOS; type checks; fuzzing; Linux interoperability tests, [test/interop/](test/interop/README.md); `zsmbt`; a `vX.Y.Z` tag also builds, on each platform's own runner (`.github/dist.sh`), a `zsmbd` archive (the server) and a `zsmbd-dev` archive (libsmbd and `smbd.h`) and publishes a GitHub Release with its CHANGELOG.md section).
 * Specifications used are copied to `docs/specifications/` and indexed in its [README.md](docs/specifications/README.md); add new ones there.
 * Only external library: system libsqlite3, through hand-written `extern` declarations.
 
